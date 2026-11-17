@@ -613,6 +613,16 @@ struct State {
     // L2 schedule (FHERMA_L2G=g): after a full-prime P1, P2+P3 run per group of g primes through a fixed
     // per-chain C workspace wsG (g*8*N words) that is rewritten every group, so C stays in L2.
     CUdeviceptr wsG[4]{},wsG2[4]{};u32 l2g=0;bool l2on=false;bool p23db_now=false;CUstream side_streams[4]{};std::vector<CUevent> cap_events;
+    // Chain pipeline (large parts, P1 prime groups; FHERMA_PIPE=0 off, =1 on): each chain runs P1 on its own stream X
+    // and P2/P3/CRT on the chain stream Y, so P1 of the next prime group (or next product) overlaps P3 + CRT of the
+    // current one. P3 residues go to a per-chain buffer wsR (CRT input) instead of A, so P1 only has to wait for the
+    // P2 that last read its A,B slots. Lookahead FHERMA_PIPE_LAG (1 default, <= groups/product): P1 of group t waits
+    // for P2 of group t-lag, bounding the L2 working set to one extra P1 group per chain.
+    CUdeviceptr wsR[4]{};CUstream pipe_x[4]{};std::vector<CUevent> pipe_p2[4];bool pipe_now=false;u32 pipe_S=1;
+    CUevent cap_event(){static auto ecreate=cuda->driver.get<decltype(&::cuEventCreate)>("cuEventCreate");CUevent e=nullptr;cuda->check(ecreate(&e,CU_EVENT_DISABLE_TIMING));cap_events.push_back(e);return e;}
+    void stream_after(CUstream waiter,CUstream src){static auto erecord=cuda->driver.get<decltype(&::cuEventRecord)>("cuEventRecord");static auto swait=cuda->driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
+        CUevent e=cap_event();cuda->check(erecord(e,src));cuda->check(swait(waiter,e,0));}
+    bool pipe_env()const{const char* e=std::getenv("FHERMA_PIPE");return e?*e=='1':true;}
     // FHERMA_L2F feature bits (L2 schedule only): 1 P2 evict-first A/B loads, 2 P2 discards A/B lines,
     // 4 P3 discards C lines, 8 CRT discards residue lines, 16 CRT streaming output stores, 32 P1 evict-first input loads
     u32 l2f=std::getenv("FHERMA_L2F")?u32(std::strtoul(std::getenv("FHERMA_L2F"),nullptr,0)):31u;   // per-chain workspaces (chain 0 = A,B,C)
@@ -635,7 +645,13 @@ struct State {
         mark(0);const u32 sm=stage_mask();
         const u32 p3h=std::getenv("FHERMA_EXTRA_DEFINES")&&std::strstr(std::getenv("FHERMA_EXTRA_DEFINES"),"BPO_P3_H 1")?1u:2u;
         CUfunction p1k=nullptr;const u32 g2=(l2on&&wsG[cur_ws]&&l2g<k)?l2g:k;
+        const bool pipe=pipe_now&&pg<k&&pipe_x[cur_ws]&&wsR[cur_ws]&&!p23db_now&&!p1split();
+        const CUdeviceptr R=pipe?wsR[cur_ws]:A;   // P3 residues / CRT input
+        const CUstream Y=d.stream,X=pipe?pipe_x[cur_ws]:d.stream;const int kpc=d.kp.chain;
+        static auto erecord=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");static auto swait=d.driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
+        u32 lag=1;if(const char* e=std::getenv("FHERMA_PIPE_LAG")){lag=u32(std::atoi(e));}lag=std::max(1u,std::min(lag,k/pg));
         for(u32 r0=0;r0<k;r0+=pg){
+            if(pipe){auto& h=pipe_p2[cur_ws];d.stream=X;d.kp.chain=kpc+int(pipe_S);if(h.size()>=lag)d.check(swait(X,h[h.size()-lag],0));}
             const CUdeviceptr Ag=A+size_t(r0)*J*n*4,Bg=B+size_t(r0)*J*n*4,Cg=C+size_t(r0)*J*n*4;
             const CUdeviceptr pg_=p+size_t(r0)*4,mug=mu+size_t(r0)*8,twg=tw+size_t(r0)*root_stride_host*8,itwg=itw+size_t(r0)*root_stride_host*8,invg=invn+size_t(r0)*J*8;
             if(!(sm&2)){}else if(p1split()&&r0==0&&pg==k){   // split P1: per (column group, prime-quad group) TC+J-DIF then R-DIF via L2
@@ -647,15 +663,16 @@ struct State {
             else if(pox&&std::getenv("FHERMA_P1P")&&d.bpo_first_tcp&&tc_bpt&&r0%4==0&&pg%4==0)d.launch3(d.bpo_first_tcp,p1_grid,1u,1u,256u,a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,r0+pg,p1_grid,2u*cols);
             else if(d.bpo_first_tc&&tc_bpt&&r0%4==0&&pg%4==0&&!std::getenv("FHERMA_PO_NOTC"))d.launch_ntt(pox&&!off(64)&&std::getenv("FHERMA_TC3")&&d.bpo_first_tc3?d.bpo_first_tc3:pox&&!off(32)&&!off(512)&&d.bpo_first_tc2n?d.bpo_first_tc2n:pox&&!off(32)&&d.bpo_first_tc2?d.bpo_first_tc2:d.bpo_first_tc,cols*2u,1u,256u,p1_pad(),a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,r0+pg,u32(pox&&!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0));
             else d.launch3(d.bpo_first,cols,2u,1u,256u,a,b,A,B,tw,stage_tw,n,logrows,r0,r0+pg);mark(1);
+            if(pipe){d.stream=Y;d.kp.chain=kpc;stream_after(Y,X);}
             // Montgomery pointwise only on the smr P2 + cm3 P3 pair (default on; FHERMA_P2_NOMONT off; V7 twin FHERMA_V7_P2MONT)
             const bool mont=t2nM&&po==2&&p3v2()&&pox&&!off(128)&&(p1x==2?(std::getenv("FHERMA_V7_P2MONT")?std::atoi(std::getenv("FHERMA_V7_P2MONT"))!=0:!std::getenv("FHERMA_P2_NOMONT")):!std::getenv("FHERMA_P2_NOMONT"))&&(p1x==2?(d.bpo_middle_smrv&&d.bpo_last_cm3v):(d.bpo_middle_smr&&!off(256)&&d.bpo_last_cm3))&&!(pox&&std::getenv("FHERMA_P2DB"));
-            auto p23=[&](u32 s0,u32 gg,CUdeviceptr Cg,u32 which=3u){const CUdeviceptr Ag=A+size_t(s0)*J*n*4,Bg=B+size_t(s0)*J*n*4;
+            auto p23=[&](u32 s0,u32 gg,CUdeviceptr Cg,u32 which=3u){const CUdeviceptr Ag=A+size_t(s0)*J*n*4,Bg=B+size_t(s0)*J*n*4,Dg=R+size_t(s0)*J*n*4;
             const CUdeviceptr pgs_=p+size_t(s0)*4,mug=mu+size_t(s0)*8,itwg=itw+size_t(s0)*root_stride_host*8,invg=invn+size_t(s0)*J*8;
             if(!(which&1)||!(sm&8)){}else if(pox&&!off(16)&&d.bpo_middle_db&&std::getenv("FHERMA_P2DB"))d.launch3(d.bpo_middle_db,32u,J/2,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u));
             else d.launch3(p1x==2&&d.bpo_middle_smrv?d.bpo_middle_smrv:pox&&!off(128)&&d.bpo_middle_smr?d.bpo_middle_smr:d.bpo_middle,32u,J,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u)|(mont?16u:0u));mark(3);
-            if(!(which&2)||!(sm&16)){}else if(po==2&&p3v2())d.launch3(p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u));
-            else if(po==2)d.launch3(d.bpo_last_cm,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);
-            else d.launch3(d.bpo_last,64u/p3h,gg,1u,256u*p3h,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);mark(4);};
+            if(!(which&2)||!(sm&16)){}else if(po==2&&p3v2())d.launch3(p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2,cols,gg,1u,256u,Cg,Dg,pgs_,itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u));
+            else if(po==2)d.launch3(d.bpo_last_cm,cols,gg,1u,256u,Cg,Dg,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);
+            else d.launch3(d.bpo_last,64u/p3h,gg,1u,256u*p3h,Cg,Dg,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);mark(4);};
             if(g2<pg&&p23db_now&&wsG2[cur_ws]&&side_streams[cur_ws]){   // P3(g) on a side stream overlaps P2(g+1); C double-buffered
                 static auto ecreate=d.driver.get<decltype(&::cuEventCreate)>("cuEventCreate");static auto erecord=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");static auto swait=d.driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
                 const CUstream s=d.stream,s2=side_streams[cur_ws];const CUdeviceptr buf[2]={wsG[cur_ws],wsG2[cur_ws]};std::vector<CUevent> e3;u32 i=0;
@@ -667,12 +684,16 @@ struct State {
                     d.stream=s2;p23(s0,g2,buf[i&1],2u);
                     CUevent e=ev();d.check(erecord(e,s2));e3.push_back(e);}
                 d.stream=s;d.check(swait(s,e3.back(),0));}
+            else if(pipe){   // record "A,B of this group consumed" right after its (last) P2
+                if(g2<pg){for(u32 s0=r0;s0<r0+pg;s0+=g2){p23(s0,g2,wsG[cur_ws],1u);if(s0+g2>=r0+pg){CUevent e=cap_event();d.check(erecord(e,Y));pipe_p2[cur_ws].push_back(e);}p23(s0,g2,wsG[cur_ws],2u);}}
+                else{p23(r0,pg,Cg,1u);CUevent e=cap_event();d.check(erecord(e,Y));pipe_p2[cur_ws].push_back(e);p23(r0,pg,Cg,2u);}}
             else if(g2<pg){for(u32 s0=r0;s0<r0+pg;s0+=g2)p23(s0,g2,wsG[cur_ws]);}else p23(r0,pg,Cg);
         }
-        if(!(sm&32)){}else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&std::getenv("FHERMA_CRTPF");d.launch(d.bpo_crt_tc_cm,n/128,1,A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(p1_grid,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}
-        else if(po==2)d.launch(d.bpo_crt_cm,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));
-        else if(d.batched_crt_tc&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT"))d.launch(d.batched_crt_tc,n/128,1,A,out,tc_bfrag,n,delta);
-        else d.launch(d.batched_crt,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));mark(5);
+        if(!(sm&32)){}else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&std::getenv("FHERMA_CRTPF");d.launch(d.bpo_crt_tc_cm,n/128,1,R,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(p1_grid,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}
+        else if(po==2)d.launch(d.bpo_crt_cm,n/128,1,R,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));
+        else if(d.batched_crt_tc&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT"))d.launch(d.batched_crt_tc,n/128,1,R,out,tc_bfrag,n,delta);
+        else d.launch(d.batched_crt,n/128,1,R,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));mark(5);
+        d.stream=Y;d.kp.chain=kpc;
     }
     void compute_one(CUdeviceptr a,CUdeviceptr b,CUdeviceptr out){
         if(po){compute_po(a,b,out);return;}
@@ -798,11 +819,14 @@ struct State {
             CUstream cs[4]{graph_stream};CUevent fork=nullptr,join[4]{};
             for(u32 c=1;c<S;++c){if(!chain_streams[c])d.check(screate(&chain_streams[c],CU_STREAM_NON_BLOCKING));cs[c]=chain_streams[c];}
             if(p23db_now)for(u32 c=0;c<S;++c)if(!side_streams[c])d.check(screate(&side_streams[c],CU_STREAM_NON_BLOCKING));
+            pipe_now=pox&&big_part()&&pipe_env()&&!p23db_now;pipe_S=S;
+            if(pipe_now)for(u32 c=0;c<S;++c){if(!pipe_x[c])d.check(screate(&pipe_x[c],CU_STREAM_NON_BLOCKING));if(!wsR[c])wsR[c]=d.alloc(size_t(k)*8*n*4);pipe_p2[c].clear();}
             d.check(begin(graph_stream,CU_STREAM_CAPTURE_MODE_RELAXED));d.kp.begin_variant(variant);
-            if(S>1){d.check(ecreate(&fork,CU_EVENT_DISABLE_TIMING));d.check(erecord(fork,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],fork,0));}
+            if(S>1||pipe_now){d.check(ecreate(&fork,CU_EVENT_DISABLE_TIMING));d.check(erecord(fork,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],fork,0));if(pipe_now)for(u32 c=0;c<S;++c)d.check(swait(pipe_x[c],fork,0));}
             for(u32 i=0;i<bcount;++i){d.stream=cs[i%S];cur_ws=i%S;d.kp.product=int(i);d.kp.chain=int(i%S);next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);}
             d.stream=graph_stream;cur_ws=0;next_a=next_b=0;
             for(u32 c=1;c<S;++c){d.check(ecreate(&join[c],CU_EVENT_DISABLE_TIMING));d.check(erecord(join[c],cs[c]));d.check(swait(graph_stream,join[c],0));}
+            if(pipe_now){for(u32 c=0;c<S;++c)stream_after(graph_stream,pipe_x[c]);pipe_now=false;}
             d.kp.end_variant();CUgraph g=nullptr;d.check(endc(graph_stream,&g));
             d.check(inst(&graph_execs[variant],g,0));d.check(gdestroy(g));
         }
