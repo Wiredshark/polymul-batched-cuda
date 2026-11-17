@@ -7,6 +7,7 @@
 #include "kernel_source.h"
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
+#include "kprof.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -108,11 +109,11 @@ struct Cuda {
     CUfunction prepare,forward,pointwise,inverse,finish,reconstruct,transpose_inputs,transpose_output,reconstruct_explicit,middle_local,inverse_finish,fourstep_forward,fourstep_middle,fourstep_inverse;
     CUfunction weighted_prepare,weighted_forward,weighted_middle,weighted_inverse,reconstruct_weighted8,reconstruct_weighted8_subwarp16;
     CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
-    void getfn(CUfunction* f,CUmodule m,const char* name){CUresult r=cuModuleGetFunction(f,m,name);if(r==CUDA_ERROR_NOT_FOUND){*f=nullptr;return;}check(r);}
+    void getfn(CUfunction* f,CUmodule m,const char* name){CUresult r=cuModuleGetFunction(f,m,name);if(r==CUDA_ERROR_NOT_FOUND){*f=nullptr;return;}check(r);kp.add_name(*f,name);}
     void check(CUresult r){if(r!=CUDA_SUCCESS){const char* message=nullptr;cuGetErrorString(r,&message);throw std::runtime_error(message?message:"CUDA error");}}
     void rcheck(nvrtcResult r){if(r!=NVRTC_SUCCESS)throw std::runtime_error("NVRTC error "+std::to_string(int(r)));}
     Cuda(){try{
-        check(cuInit(0));CUdevice device;check(cuDeviceGet(&device,0));check(cuCtxCreate(&context,0,device));
+        check(cuInit(0));CUdevice device;check(cuDeviceGet(&device,0));check(cuCtxCreate(&context,0,device));kp.init(driver);
         if(const char* dump=std::getenv("FHERMA_DUMP_SOURCE")){FILE* f=std::fopen(dump,"wb");if(f){std::string all=g_kernel_prefix+KERNEL_SOURCE;std::fwrite(all.data(),1,all.size(),f);std::fclose(f);}}
         // NVRTC target: compute_90 on cc >= 9.0 (P1 TMA stores), compute_80 otherwise or as fallback; FHERMA_ARCH overrides.
         int ccmaj=0;{auto attr=driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");if(attr)attr(&ccmaj,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,device);}
@@ -160,10 +161,14 @@ struct Cuda {
         CUdevice dev;check(cuDeviceGet(&dev,0));
         root_cache=std::make_unique<L2RootCachePolicy>(a,dev,base,extent);
     }
-    template<class...Args>void launch(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};check(cuLaunchKernel(fn,gx,gy,1,128,1,1,0,stream,params,nullptr));}
-    template<class...Args>void launch_ntt(CUfunction fn,u32 gx,u32 gy,u32 threads,u32 shared_bytes,Args...args){void* params[]={static_cast<void*>(&args)...};check(cuLaunchKernel(fn,gx,gy,1,threads,1,1,shared_bytes,stream,params,nullptr));}
-    template<class...Args>void launch3(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 threads,Args...args){void* params[]={static_cast<void*>(&args)...};check(cuLaunchKernel(fn,gx,gy,gz,threads,1,1,0,stream,params,nullptr));}
-    template<class...Args>void launch256(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};check(cuLaunchKernel(fn,gx,gy,1,256,1,1,0,stream,params,nullptr));}
+    KProf kp;
+    void klaunch(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 bx,u32 smem,void** params){
+        if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream);}
+        else check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));}
+    template<class...Args>void launch(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,128,0,params);}
+    template<class...Args>void launch_ntt(CUfunction fn,u32 gx,u32 gy,u32 threads,u32 shared_bytes,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,threads,shared_bytes,params);}
+    template<class...Args>void launch3(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 threads,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,gz,threads,0,params);}
+    template<class...Args>void launch256(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,256,0,params);}
 };
 // Give a vector whose capacity already holds n elements size n without
 // value-initialising them (the D2H writes every element). libstdc++ only:
@@ -194,6 +199,7 @@ struct State {
         return driver.cuMemHostUnregister&&driver.cuMemHostUnregister(address)==CUDA_SUCCESS;
     }
     ~State(){
+        if(cuda)cuda->kp.report();
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -381,7 +387,11 @@ struct State {
             const u64 corrupt_root=0;
             device.check(device.cuMemcpyHtoD(tw+1064u,&corrupt_root,sizeof(corrupt_root)));
 #endif
-            device.enable_root_cache(tw,2*half);
+            // L2R1 (legacy single-product policy) off for the batched path: it set a CU_LIMIT_PERSISTING_L2_CACHE_SIZE
+            // set-aside (164096 B requested, rounded up by the driver: 3 MB on the 5070) plus a persisting access-policy
+            // window on the legacy default stream for the root tables; the batched graphs run on their own streams, so the
+            // window never applied, only the set-aside carved L2. FHERMA_L2R1=1 restores it (A/B).
+            if(const char* e=std::getenv("FHERMA_L2R1");e&&*e=='1')device.enable_root_cache(tw,2*half);
         }else{tw=device.upload(twists);itw=device.upload(untwists);}
         if(n==65536){   // pass-order kernels: 256-point stage twiddles, entry (len,j) at 256-len+j
             std::vector<u64> st(size_t(k)*256),sit(size_t(k)*256);
@@ -512,7 +522,7 @@ struct State {
         d.check(d.cuMemcpyHtoD(a_all,in.a.data.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,in.b.data.data(),bytes));
     }
     fherma::Outputs d2h(fherma::Outputs answer){
-        auto& d=*cuda;const size_t bytes=size_t(bcount)*n*l*4;
+        auto& d=*cuda;d.kp.collect();const size_t bytes=size_t(bcount)*n*l*4;
         if(answer.c.data.size()!=size_t(bcount)*n*l)throw std::runtime_error("d2h: output not sized by run");
         d.check(d.cuMemcpyDtoH(answer.c.data.data(),out_all,bytes));
         return answer;
@@ -785,12 +795,12 @@ struct State {
             CUstream cs[4]{graph_stream};CUevent fork=nullptr,join[4]{};
             for(u32 c=1;c<S;++c){if(!chain_streams[c])d.check(screate(&chain_streams[c],CU_STREAM_NON_BLOCKING));cs[c]=chain_streams[c];}
             if(p23db_now)for(u32 c=0;c<S;++c)if(!side_streams[c])d.check(screate(&side_streams[c],CU_STREAM_NON_BLOCKING));
-            d.check(begin(graph_stream,CU_STREAM_CAPTURE_MODE_RELAXED));
+            d.check(begin(graph_stream,CU_STREAM_CAPTURE_MODE_RELAXED));d.kp.begin_variant(variant);
             if(S>1){d.check(ecreate(&fork,CU_EVENT_DISABLE_TIMING));d.check(erecord(fork,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],fork,0));}
-            for(u32 i=0;i<bcount;++i){d.stream=cs[i%S];cur_ws=i%S;next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);}
+            for(u32 i=0;i<bcount;++i){d.stream=cs[i%S];cur_ws=i%S;d.kp.product=int(i);d.kp.chain=int(i%S);next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);}
             d.stream=graph_stream;cur_ws=0;next_a=next_b=0;
             for(u32 c=1;c<S;++c){d.check(ecreate(&join[c],CU_EVENT_DISABLE_TIMING));d.check(erecord(join[c],cs[c]));d.check(swait(graph_stream,join[c],0));}
-            CUgraph g=nullptr;d.check(endc(graph_stream,&g));
+            d.kp.end_variant();CUgraph g=nullptr;d.check(endc(graph_stream,&g));
             d.check(inst(&graph_execs[variant],g,0));d.check(gdestroy(g));
         }
         l2g=l2g6;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;l2on=false;graph_exec=graph_execs[0]?graph_execs[0]:graph_execs[4]?graph_execs[4]:graph_execs[6];
@@ -803,9 +813,10 @@ struct State {
     fherma::Outputs run(const fherma::Inputs& in){
         (void)in;  // inputs already on the device (h2d)
         auto& d=*cuda;const size_t stride=size_t(n)*l*4,count=size_t(bcount)*n*l;
+        d.kp.collect();  // previous call not yet read (no d2h in between)
         if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
             static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));
+            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));d.kp.run_launched(graph_stream);
         }else for(u32 i=0;i<bcount;++i){po=po_available()?std::min(want_po(),2):0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);if(prof){d.check(d.cuCtxSynchronize());prof_collect();}}
         if(prof)pcalls+=0;
         fherma::Outputs result;result.c.shape={int64_t(bcount),int64_t(n),int64_t(l)};
@@ -816,6 +827,7 @@ struct State {
         advise_unused_output_thp(output_thp_stats,result.c.data.data(),result.c.data.size(),count,result.c.data.capacity(),host_page_size);
         set_size_no_init(result.c.data,count);  // filled by d2h
         d.check(d.cuCtxSynchronize());
+        d.kp.run_end();
         return result;
     }
     // Bench-only helpers (not part of the official entry points).
