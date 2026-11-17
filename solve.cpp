@@ -726,11 +726,14 @@ struct State {
     // P3/P2 overlap through a double-buffered C workspace (FHERMA_P23DB=1; A/B twin FHERMA_V7_P23DB)
     static bool p23db_env(bool v7){const char* e=std::getenv(v7?"FHERMA_V7_P23DB":"FHERMA_P23DB");return v7&&!e?p23db_env(false):e&&*e=='1';}
     // Large parts (>=128 SMs or >=96 MB L2, e.g. RTX PRO 6000 Blackwell: 188 SMs, 128 MB L2; FHERMA_BIG=0/1 forces):
+    // BIG_CHAINS=1 (was 2): official kprof 4ed8fd4 shows the GPU never idle and 22.9 ms ~= 322 MB/product at 1.8 TB/s,
+    // i.e. the all-intermediates-to-DRAM traffic (P1 57.6+64, P2 96, P3 64, CRT 46 = 328 MB): 2 chains x (A,B 32 MB +
+    // C 16 MB + residues) thrash the 128 MB L2. One chain keeps the hot set (~64 MB) L2-resident.
     // BIG_CHAINS product chains, P1 per BIG_GROUP primes (P2 consumes each group's A,B from L2), group flags BIG_GFLAGS
     // (FHERMA_GFLAGS overrides): 1 plain P1 stores (no evict_first), 2 P1 stores evict_last, 4 P1 input loads normal on
     // all but the last group (input kept in L2 for the re-read), 8 P3 residues of all but the last group stored evict_first
     // (the CRT reads them only after the last group; the last group's residues stay normal so the CRT can hit them in L2).
-    static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|8;
+    static constexpr u32 BIG_CHAINS=1,BIG_GROUP=8,BIG_GFLAGS=1;   // 1 chain: no evict_first on group-0 residues (they fit in L2 with the last group)
     int big_cache=-1;
     bool big_part(){if(big_cache>=0)return big_cache!=0;if(const char* e=std::getenv("FHERMA_BIG")){big_cache=*e=='1';return big_cache!=0;}
         int sms=0,l2=0;CUdevice dev=0;auto& d=*cuda;auto attr=d.driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");
