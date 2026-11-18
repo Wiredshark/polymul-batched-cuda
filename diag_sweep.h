@@ -20,6 +20,7 @@
 #include <memory>
 #include <cmath>
 
+#define BPO_XW_SMEM (4u*8u*320u*4u)   // one P1 X buffer (bytes), = BPO_X_SMEM(BPO_XF)
 inline bool sweep_env(){const char* e=std::getenv("FHERMA_SWEEP");return !e||*e!='0';}
 
 template<class C> struct Sweep {
@@ -27,7 +28,7 @@ template<class C> struct Sweep {
     std::chrono::steady_clock::time_point t0=std::chrono::steady_clock::now();double budget=60.0;
     struct Prog { std::string name,arch,src; std::vector<std::string> kn; std::vector<bool> expr; CUmodule mod=nullptr; std::vector<CUfunction> fn; std::string err; double t_rtc=0,t_jit=0; bool done=false; };
     std::vector<Prog> progs; std::vector<std::thread> th; std::string arch,native;
-    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; };
+    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0,sm=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; };
     std::vector<V> vs[4];   // per stage (KProf::P1..CRT)
     CUevent ea=nullptr,eb=nullptr,e0=nullptr,e1=nullptr,ej=nullptr;CUdeviceptr ref=0,bad=0;size_t ref_n=0;CUfunction cmp=nullptr;
     decltype(&::cuMemcpyDtoDAsync) dtod=nullptr; decltype(&::cuMemsetD32Async) memset32=nullptr;
@@ -62,6 +63,8 @@ template<class C> struct Sweep {
         const bool has_crt_hlld=has_crt&&twin(crt_head,"template<int SWMB> __global__ void __launch_bounds__(128,SWMB) sw_crt_hlld(",{crt_hl[0],crt_hl[1],crt_ld});
         {const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
         s+="\n#define SWP1(NAME,F,MB) extern \"C\" __global__ void __launch_bounds__((((F)&8u)?512:256),MB) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){__shared__ __align__(128) u32 X[BPO_X_SMEM(F)/4];bpo_first_xb<(F)>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}\n"
+           "#define SWP1S(NAME,F,MB) extern \"C\" __global__ void __launch_bounds__(256,MB) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){__shared__ __align__(128) u32 X[BPO_X_SMEM(F)/4];bpo_first_xs<(F)>(a,b,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}\n"
+           "#define SWP1W(NAME,F,MB) extern \"C\" __global__ void __launch_bounds__(512,1) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){extern __shared__ __align__(128) u32 XW[];bpo_first_xw<(F)>(a,b,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,XW);}\n"
            "#define SWP3(NAME,T,LB) extern \"C\" __global__ void __launch_bounds__ LB NAME(const u32* C,u32* D,const u32* primes,const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){__shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;bpo_p3_body<(T)>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);}\n";
         const std::string base=s;
         auto prog=[&](const char* name,const std::string& a)->int{Prog P;P.name=name;P.arch=a;P.src=base;progs.push_back(std::move(P));return int(progs.size())-1;};
@@ -72,21 +75,28 @@ template<class C> struct Sweep {
             "extern \"C\" __global__ void sw_cmp(const uint4* a,const uint4* b,u64 n,u32* bad){u32 c=0;for(u64 i=u64(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=u64(gridDim.x)*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n";
          addk(c,"sw_cmp",false);}
         // P1: name, F (relative to the production BPO_XF), launch-bounds min blocks (production: BPO_TC_MINB = 2), ablation
-        struct P1V{const char* n;const char* f;int mb;bool abl;};
-        // Round 2 (sweep2, production = 4113c51: BPO_XF includes 131072 pbq). pv33/pv34 measured on target and dropped here:
-        // every old flag / NC / unroll / min-blocks knob, pfq, ctsm, r1c1, native cubin (FHERMA_SWEEP_NATIVE=1 restores it).
-        // New bits (batched_p1x.cuh XCPQ/XTWH/XMNV/XQ4): cpq quarter-pipelined input cp.async, twh phase-A twiddles hoisted
-        // before the MMA loop, mnv non-volatile MMA asm, q4 layout-2 on 4 columns at once; 4 = f4 stage twiddles in smem,
-        // 1024 = r1 layout-1 rolled (both previously only measured without / with other pbq bits).
+        struct P1V{const char* n;const char* f;int mb;bool abl;char k;};   // k: 'b' bpo_first_xb (SWP1), 's' bpo_first_xs (SWP1S), 'w' bpo_first_xw (SWP1W)
+        // Round 3 (sweep3, production = 4113c51). Round-2 knobs measured on target (pv37) and dropped: cpq, twh, mnv, q4, f4 and
+        // their combinations (all >= 1.0); kept: ctrl, abl_noA, co_prod (compute-only reference).
+        // New (batched_p1x.cuh bpo_first_xs / bpo_first_xw): sp = same-warp software pipelining (next quad's MMA conversion in
+        // 4 hooks inside phase B); noh = the bpo_first_xs body without hooks (control for sp: phase-A math before the quad
+        // barrier, else production order); ovl = noh + input half 1 in flight during quad 0's m-tile-0 conversion (bit 27);
+        // sp_ovl = both; ws = warp specialised 512 threads, 1 block/SM, 2 X buffers (80 KB dynamic smem), producers MMA +
+        // phase A, consumers phase B; ws_l1 = producers also phase-B layout 1 (bit 18); nfw = production without the final
+        // bulk wait_group 0 (bit 26). co_* = compute-only twins (column-0 input from L2, no stores: compare against co_prod).
+        // Local (RTX 5070, pre-commit): all exact; co_sp 1.04-1.05x co_prod, co_ws 1.15x, co_ws_l1 1.27x; sp_l1 (hooks in
+        // layout 1 only) spills 112 B under the sm_120 JIT and is dropped.
         static const P1V p1g[][4]={
-            {{"ctrl","BPO_XF",2,false},{"cpq","(BPO_XF|(1u<<28))",2,false},{"twh","(BPO_XF|(1u<<29))",2,false},{"mnv","(BPO_XF|(1u<<30))",2,false}},
-            {{"q4","(BPO_XF|(1u<<31))",2,false},{"f4","(BPO_XF|4u)",2,false},{"cpq_twh","(BPO_XF|(1u<<28)|(1u<<29))",2,false},{"cpq_mnv","(BPO_XF|(1u<<28)|(1u<<30))",2,false}},
-            {{"twh_mnv","(BPO_XF|(1u<<29)|(1u<<30))",2,false},{"cpq_twh_mnv","(BPO_XF|(7u<<28))",2,false},{"cpq_f4","(BPO_XF|(1u<<28)|4u)",2,false},{"abl_noA","(BPO_XF|(4u<<20))",2,true}},
-            {{"twh_f4","(BPO_XF|(1u<<29)|4u)",2,false},{"cpq_twh_f4","(BPO_XF|(3u<<28)|4u)",2,false},{"co_prod","(BPO_XF|(8u<<20)|(1u<<24))",2,true},{"co_twh_mnv","(BPO_XF|(3u<<29)|(8u<<20)|(1u<<24))",2,true}}};
+            {{"ctrl","BPO_XF",2,false,'b'},{"sp","BPO_XF",2,false,'s'},{"ovl","(BPO_XF|(1u<<27)|(1u<<25))",2,false,'s'},{"ws","BPO_XF",1,false,'w'}},
+            {{"ws_l1","(BPO_XF|(1u<<18))",1,false,'w'},{"noh","(BPO_XF|(1u<<25))",2,false,'s'},{"nfw","(BPO_XF|(1u<<26))",2,false,'b'},{"ovl_nfw","(BPO_XF|(1u<<27)|(1u<<26)|(1u<<25))",2,false,'s'}},
+            {{"abl_noA","(BPO_XF|(4u<<20))",2,true,'b'},{"co_prod","(BPO_XF|(8u<<20)|(1u<<24))",2,true,'b'},{"co_sp","(BPO_XF|(8u<<20)|(1u<<24))",2,true,'s'},{"co_ovl","(BPO_XF|(1u<<27)|(1u<<25)|(8u<<20)|(1u<<24))",2,true,'s'}},
+            {{"co_ws","(BPO_XF|(8u<<20)|(1u<<24))",1,true,'w'},{"co_ws_l1","(BPO_XF|(1u<<18)|(8u<<20)|(1u<<24))",1,true,'w'},{"co_noh","(BPO_XF|(1u<<25)|(8u<<20)|(1u<<24))",2,true,'s'},{"sp_ovl","(BPO_XF|(1u<<27))",2,false,'s'}}};
         int kc=0;
         auto p1grp=[&](int g){const int pi=prog(("p1"+std::string(1,char('a'+g))).c_str(),arch);
-            for(const auto& x:p1g[g]){const std::string kn="sw_p1_"+std::to_string(kc++);progs[size_t(pi)].src+="SWP1("+kn+","+x.f+","+std::to_string(x.mb)+")\n";
-                addv(KProf::P1,x.n,pi,addk(pi,kn,false),-1,0,0,x.abl,std::strstr(x.f,"|8u)")?512u:0u);}};
+            for(const auto& x:p1g[g]){if(!x.n)continue;const std::string kn="sw_p1_"+std::to_string(kc++);
+                progs[size_t(pi)].src+=std::string(x.k=='s'?"SWP1S(":x.k=='w'?"SWP1W(":"SWP1(")+kn+","+x.f+","+std::to_string(x.mb)+")\n";
+                addv(KProf::P1,x.n,pi,addk(pi,kn,false),-1,0,0,x.abl,x.k=='w'?512u:std::strstr(x.f,"|8u)")?512u:0u);
+                if(x.k=='w')vs[KProf::P1].back().sm=2u*BPO_XW_SMEM;}};   // two X buffers (dynamic smem, opt-in above 48 KB)
         p1grp(0);
         {const int pi=prog("p3",arch);   // P3: template flags T / launch bounds
             addv(KProf::P3,"ctrl",pi,addk(pi,"bpo_last_cm3<0>",true));
@@ -151,7 +161,7 @@ template<class C> struct Sweep {
         std::vector<unsigned char> b=t.pb;void* pp[64];
         if(v&&v->pidx>=0&&size_t(v->pidx)<t.po.size()){unsigned x=0;std::memcpy(&x,b.data()+t.po[size_t(v->pidx)],4);x=(x^v->pxor)|v->por;std::memcpy(b.data()+t.po[size_t(v->pidx)],&x,4);}
         for(size_t i=0;i<t.po.size();++i)pp[i]=b.data()+t.po[i];
-        d.check(d.cuLaunchKernel(v&&v->fn?v->fn:t.fn,t.gx,t.gy,t.gz,v&&v->bx?v->bx:t.bx,1,1,t.smem,st,pp,nullptr));(void)g;}
+        d.check(d.cuLaunchKernel(v&&v->fn?v->fn:t.fn,t.gx,t.gy,t.gz,v&&v->bx?v->bx:t.bx,1,1,v&&v->sm?v->sm:t.smem,st,pp,nullptr));(void)g;}
     // one timed sample: flush + predecessors (untimed), then k0 on s0 (and k1 on s1), ms between ev0 and the join
     template<class D> float sample(D& g,const KProf::Trace* k0,const KProf::Trace* k1,const KProf::Trace* q0,const KProf::Trace* q1,const V* v){
         CUstream a=g.s[0],b=g.s[1];g.do_flush(a);if(q0)g.replay(*q0,a);
@@ -208,6 +218,8 @@ template<class C> struct Sweep {
         d.check(d.cuMemAlloc(&bad,16));
         for(auto& P:progs)if(P.name=="cmp"&&!P.fn.empty())cmp=P.fn[0];
         for(int st=0;st<4;++st)for(auto& v:vs[st]){if(v.prog<0){v.ok=true;continue;}const auto& P=progs[size_t(v.prog)];if(v.ki>=0&&size_t(v.ki)<P.fn.size()&&P.fn[size_t(v.ki)]){v.fn=P.fn[size_t(v.ki)];v.ok=true;}}
+        {auto fsa=d.driver.template get<decltype(&::cuFuncSetAttribute)>("cuFuncSetAttribute");   // dynamic smem above 48 KB (ws)
+         for(int st=0;st<4;++st)for(auto& v:vs[st])if(v.ok&&v.fn&&v.sm>48u*1024u&&(!fsa||fsa(v.fn,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(v.sm))!=CUDA_SUCCESS))v.ok=false;}
         // first trace of a stage for products 0 / 1 and the trace just before it in the same product (predecessor)
         auto first=[&](int prod,int st,size_t* pi)->const KProf::Trace*{for(size_t i=0;i<tr.size();++i)if(tr[i].product==prod&&tr[i].stage==st&&!tr[i].pb.empty()){if(pi)*pi=i;return &tr[i];}return nullptr;};
         auto pred=[&](int prod,size_t i)->const KProf::Trace*{for(size_t j=i;j-->0;)if(tr[j].product==prod&&!tr[j].pb.empty())return &tr[j];return nullptr;};
@@ -244,7 +256,7 @@ template<class C> struct Sweep {
         addc(best(0,0),best(1,0),best(2,0),best(3,0));addc(best(0,0),nullptr,nullptr,nullptr);addc(best(0,1),best(1,0),best(2,0),best(3,0));
         addc(best(0,2),nullptr,nullptr,nullptr);addc(nullptr,best(1,0),best(2,0),best(3,0));
         {const std::string nn="native_"+native;addc(byname(0,nn.c_str()),byname(1,nn.c_str()),byname(2,nn.c_str()),byname(3,nn.c_str()));}
-        for(const char* n:{"cpq","twh","mnv","cpq_twh","f4","twh_f4"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each new P1 variant alone
+        for(const char* n:{"sp","ovl","ws","ws_l1","nfw","ovl_nfw"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each new P1 variant alone
         // P3 store policy / CRT input path only show their effect on the CRT in a chain (residues L2-resident or not)
         addc(nullptr,nullptr,byname(2,"evict_last"),nullptr);addc(nullptr,nullptr,byname(2,"dfl_evfirst_flip"),nullptr);
         addc(nullptr,nullptr,nullptr,byname(3,"hl_mb3"));addc(nullptr,nullptr,byname(2,"evict_last"),byname(3,"hlld_mb3"));

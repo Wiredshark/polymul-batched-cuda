@@ -45,6 +45,7 @@
 #define XTWH(F) (((F)>>29)&1u)
 #define XMNV(F) (((F)>>30)&1u)
 #define XQ4(F) (((F)>>31)&1u)
+#define XNFW(F) (((F)>>26)&1u)   // sweep round 3 bit 26: no final cp.async.bulk.wait_group 0 (see bpo_first_xs below)
 #if defined(__CUDA_ARCH__)&&__CUDA_ARCH__>=900
 #define BPO_X_HAS_TMA 1
 #else
@@ -703,9 +704,316 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
 #endif
     }
 #if BPO_X_HAS_TMA
-    if((F&2)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
+    if((F&2)&&!XNFW(F)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
 #endif
 }
+// ---- Sweep-only P1 restructurings (exit-time sweep round 3; production bpo_first_x never instantiates these) -------------
+// Both are restricted to the production flag set (TMA, S6, cp.async halves, lean conversion, pbq phase B) and compute the
+// same values as bpo_first_xb<F>:
+//  * bpo_first_xs<F> ("sp", same-warp software pipelining): the MMA base conversion + reduction of quad u+1 is issued in
+//    four 2-digit hooks inside quad u's phase B (after each column pair's smem loads, layout-2 pair loop unrolled), so the
+//    tensor / reduction work fills the dependency stalls of the butterflies; the last quad runs the plain phase B. Phase-A
+//    math of a quad runs before the quad barrier (only its X stores wait). Bit 19 (XSPL1): hooks only in the two layout-1
+//    groups (digits 0-3), digits 4-7 after phase B (fewer live registers).
+//  * bpo_first_xw<F> ("ws", warp specialised, 512 threads, 80 KB dynamic smem = two X buffers, 1 block/SM): warps 0-7
+//    (producers: own the A fragments) load + build, then per quad MMA + phase A into X[k], k = quad parity; warps 8-15
+//    (consumers) run phase B + TMA of X[k]. Hand-off with named barriers: full[k] = bar 2+k (producers arrive, consumers
+//    sync), empty[k] = bar 4+k (consumers arrive after their TMA reads, producers sync before reusing X[k]); producer-only
+//    bar 1 (256 threads) replaces __syncthreads in the input staging. Bit 18 (XWL1): producers also run the phase-B
+//    layout-1 stages (len 64/32/16) before the hand-off (rebalances the two roles).
+//    Bit 25 (XNOH): no hooks (plain phase B, next quad's conversion after it, i.e. production order apart from the phase-A
+//    math before the quad barrier). Bit 27 (XOVL): input half 1 loads while quad u0's m-tile-0 conversion runs (the
+//    production waits for each half before any MMA).
+//  * bit 26 (XNFW, both): no final cp.async.bulk.wait_group 0 (the per-quad wait_group.read 0 already frees smem).
+#define XWL1(F) (((F)>>18)&1u)
+#define XSPL1(F) (((F)>>19)&1u)
+#define XNOH(F) (((F)>>25)&1u)
+#define XOVL(F) (((F)>>27)&1u)
+__device__ __forceinline__ void xbar_sync(u32 id,u32 n){asm volatile("bar.sync %0,%1;"::"r"(id),"r"(n):"memory");}
+__device__ __forceinline__ void xbar_arrive(u32 id,u32 n){asm volatile("bar.arrive %0,%1;"::"r"(id),"r"(n):"memory");}
+// input staging (flag 256|512|4096 production path; non-16 B-aligned bases: plain loads into the same 60-word rows) and the
+// A fragments, per 128-row half: xs_issue (cp.async, committed; plain loads complete), xs_build (fragments of m-tile mt
+// from X). xs_load = the production order (issue, wait, barrier, build per half); PB: producer-only barrier (bar 1, 256
+// threads) instead of __syncthreads.
+template<bool PB> __device__ __forceinline__ void xs_bar(){if(PB)xbar_sync(1,256);else __syncthreads();}
+template<u32 F>
+__device__ __forceinline__ void xs_issue(const u32* src,u32* X,u32 h,u32 xoff,bool ca,bool ldn,u32 mt){
+    constexpr u32 L=BCRT_L;constexpr u32 XRS=60;
+    const u32* hs=src+u64(mt*128u*256u)*L;
+    if(ca){const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
+        u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+        if(q<nch){const u32 sa0=u32(__cvta_generic_to_shared(X+(h>>4)*XRS+4u*q));const u32* const gq=g0+u64((h>>4)*256u)*L;
+            #pragma unroll
+            for(u32 i=0;i<8;++i){const u32 sa=sa0+i*(16u*XRS*4u);const u32* g=gq+i*(16u*256u*L);
+                if(ldn)asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(g):"memory");
+                else asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"::"r"(sa),"l"(g),"l"(pol):"memory");}}
+        asm volatile("cp.async.commit_group;":::"memory");
+    }else{
+        #pragma unroll 4
+        for(u32 x=h;x<128u*L;x+=256u){const u32 rr=x/L,w=x-rr*L;X[rr*XRS+xoff+w]=ldn?__ldg(hs+u64(rr*256u)*L+w):__ldcs(hs+u64(rr*256u)*L+w);}}
+}
+template<u32 F>
+__device__ __forceinline__ void xs_build(const u32* X,u32 warp,u32 gid,u32 tig,u32 xoff,u32 mt,u32 (&af)[8][2][4]){
+    constexpr u32 POS[9]={BCRT_POS,BCRT_W};constexpr u32 XRS=60;
+    const u32* const rpt=X+(8*warp+gid)*XRS+xoff+tig;
+    #pragma unroll
+    for(u32 j=0;j<8;++j){
+        const u32 wb=POS[j]/32,sh=POS[j]%32;const int D=int(POS[j+1])-int(POS[j]);const u32 mk=bpr_fmask.v[j][0][tig],mk1=bpr_fmask.v[j][1][tig];
+        #pragma unroll
+        for(u32 x=0;x<4;++x){const u32* rp=rpt+64*(x&1)*XRS+wb+4*(x>>1);const u32 v=__funnelshift_r(rp[0],rp[1],sh);
+            if(D-32*(3+4*int(x>>1))>=32)af[j][mt][x]=v;else af[j][mt][x]=v&((x>>1)?mk1:mk);}
+    }
+}
+template<u32 F,bool PB>
+__device__ __forceinline__ void xs_load(const u32* src,u32* X,u32 h,u32 warp,u32 gid,u32 tig,u32 xoff,bool ca,bool ldn,u32 (&af)[8][2][4]){
+    #pragma unroll
+    for(u32 mt=0;mt<2;++mt){
+        if(mt)xs_bar<PB>();
+        xs_issue<F>(src,X,h,xoff,ca,ldn,mt);
+        if(ca)asm volatile("cp.async.wait_group 0;":::"memory");
+        xs_bar<PB>();
+        xs_build<F>(X,warp,gid,tig,xoff,mt,af);
+    }
+}
+// MMA base conversion + reduction of digit J (both m-tiles) of quad u into res[2mt+hf][J]
+template<u32 F,u32 J,u32 M0=0,u32 M1=2>
+__device__ __forceinline__ void xs_mma(const u32 (&af)[8][2][4],const u32* __restrict__ bpt,u32 lane,u32 u,u32 m62,u32 np,u32 (&res)[4][8]){
+    const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(J)*32+lane)*16)+u);
+    #pragma unroll
+    for(u32 mt=M0;mt<M1;++mt){u32 c0[4]={0,0,0,0},c1[4]={0,0,0,0};
+        pimma16832nv(c0,af[J][mt][0],af[J][mt][1],af[J][mt][2],af[J][mt][3],bv.x,bv.y);
+        pimma16832nv(c1,af[J][mt][0],af[J][mt][1],af[J][mt][2],af[J][mt][3],bv.z,bv.w);
+        #pragma unroll
+        for(u32 hf=0;hf<2;++hf){const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];
+            const u32 w=y0+(y1<<8),z=y2+(y3<<8);const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
+            const u32 q=__umulhi(hi,m62)>>16;res[2*mt+hf][J]=lo+q*np;}}
+}
+template<u32 F,u32 J0,u32 J1,u32 M0=0,u32 M1=2>
+__device__ __forceinline__ void xs_mmar(const u32 (&af)[8][2][4],const u32* __restrict__ bpt,u32 lane,u32 u,u32 m62,u32 np,u32 (&res)[4][8]){
+    if constexpr(J0<J1){xs_mma<F,J0,M0,M1>(af,bpt,lane,u,m62,np,res);xs_mmar<F,J0+1,J1,M0,M1>(af,bpt,lane,u,m62,np,res);}
+}
+// phase A after the conversion: twist, J-DIF, R-DIF len 256/128 (rows 64rr+8w+gid, prime r = 4u+tig), in registers
+template<u32 F>
+__device__ __forceinline__ void xs_resta(u32 (&res)[4][8],const u64* tw,const u64* st,u32 p,u32 c,u32 rl){
+    #pragma unroll
+    for(u32 rr=0;rr<4;++rr){const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+        #pragma unroll
+        for(u32 j=0;j<8;++j)res[rr][j]=xmsh(res[rr][j],t2,p);
+        xjdif<F>(res[rr],st,p);}
+    const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
+    #pragma unroll
+    for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
+}
+__device__ __forceinline__ void xs_store(u32* X,const u32 (&res)[4][8],u32 tig,u32 rl){
+    constexpr u32 XD=320u,XS=8*320u;
+    u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);
+    #pragma unroll
+    for(u32 rr=0;rr<4;++rr)
+        #pragma unroll
+        for(u32 j=0;j<8;++j)xa[j*XD+72*rr]=res[rr][j];
+}
+struct XNoHook{template<u32 K> __device__ __forceinline__ void at(){}};
+// xrdif6q split in its layout-1 part (both column pairs; hook<0>/<1> after each pair's smem loads; the caller adds the
+// trailing __syncwarp) and its layout-2 + cross-twiddle + staging + TMA part (UNR: pair loop unrolled, hook<2>/<3> after
+// each pair's loads; else rolled as in xrdif6q, no hooks). Same values as xrdif6q.
+template<u32 F,class H>
+__device__ __forceinline__ void xq_l1(u32* const base0,const u32 so,const u64* st,const u32 p,u32 lane,H& hk){
+    constexpr u32 XD=320u,Q=2u;
+    const u32 l7=lane&7u;
+    u64 w64[4],w32[2];
+    #pragma unroll
+    for(u32 m=0;m<4;++m)w64[m]=st[192u+l7+8u*m];
+    #pragma unroll
+    for(u32 qq=0;qq<2;++qq)w32[qq]=st[224u+l7+8u*qq];
+    const u64 w16=st[240u+l7];
+    u32* const pb=base0+so+l7+72u*(lane>>3);
+    auto l1=[&](const u32 pr){u32 v[Q][8];
+        #pragma unroll
+        for(u32 n=0;n<Q;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;++m)v[n][m]=pb[(Q*pr+n)*XD+8*m+4*(m>>2)];
+        if(pr==0)hk.template at<0>();else hk.template at<1>();
+        #pragma unroll
+        for(u32 m=0;m<4;++m)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)xbf(v[n][m],v[n][m+4],w64[m],p);
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 hh=0;hh<2;++hh)xbf(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p);
+        #pragma unroll
+        for(u32 n=0;n<Q;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;m+=2)xbf(v[n][m],v[n][m+1],w16,p);
+        #pragma unroll
+        for(u32 n=0;n<Q;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;++m)pb[(Q*pr+n)*XD+8*m+4*(m>>2)]=v[n][m];
+    };
+    l1(0);__syncwarp();l1(1);
+}
+template<u32 F,bool UNR,class H>
+__device__ __forceinline__ void xq_l2(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm,H& hk){
+    constexpr bool T=(F&1)!=0;
+    constexpr u32 XD=320u,Q=2u;
+    u64 w8[4];
+    #pragma unroll
+    for(u32 lo=0;lo<4;++lo)w8[lo]=st[248u+lo];
+    const u64 w253=st[253u],w252=st[252u],w254=st[254u];
+    const u32* const pr0=base0+so+8*lane+4*(lane>>2);
+    const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);
+    auto l2=[&](const u32 pr){u32 v[Q][8];
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr0+(Q*pr+n)*XD);const uint4 x0=p4[0],x1=p4[1];
+            v[n][0]=x0.x;v[n][1]=x0.y;v[n][2]=x0.z;v[n][3]=x0.w;v[n][4]=x1.x;v[n][5]=x1.y;v[n][6]=x1.z;v[n][7]=x1.w;}
+        if(UNR){if(pr==0)hk.template at<2>();else hk.template at<3>();}
+        #pragma unroll
+        for(u32 lo=0;lo<4;++lo)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}
+        #pragma unroll
+        for(u32 k=0;k<4;++k)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+        if(!T){
+            #pragma unroll
+            for(u32 lo=0;lo<8;lo+=2)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}
+        #pragma unroll
+        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=xct_ldv(ct,lane,m2);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}
+                else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}
+        __syncwarp();   // layout-2 reads of this pair's regions done
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){
+            const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
+            uint4* const d=sd+(Q*pr+n)*(XD/4);
+            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}
+    };
+    if(UNR){l2(0);l2(1);}else{
+        #pragma unroll 1
+        for(u32 pr=0;pr<2;++pr)l2(pr);}
+    asm volatile("fence.proxy.async.shared::cta;":::"memory");
+    __syncwarp();
+    if(lane==0&&XABL(F)!=8&&XABL(F)!=11){
+        u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
+        if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
+        #pragma unroll
+        for(u32 n=0;n<4;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
+            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
+            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa):"memory");}
+        asm volatile("cp.async.bulk.commit_group;":::"memory");}
+}
+template<u32 F> struct XSHook {   // sp: MMA + reduction of the next quad, 2 digits per hook (XSPL1: hooks 0/1 only, digits 0-3)
+    const u32 (&af)[8][2][4];const u32* bpt;u32 lane,u,m62,np;u32 (&res)[4][8];
+    template<u32 K> __device__ __forceinline__ void at(){if constexpr(!XSPL1(F)||K<2)xs_mmar<F,2*K,2*K+2>(af,bpt,lane,u,m62,np,res);}
+};
+#if BPO_X_HAS_TMA
+#define XS_PROLOG \
+    static_assert((F&(64|256|512|2048|4096|8192|131072|2))==(64|256|512|2048|4096|8192|131072|2)&&!(F&(4|8|16|32|16384|32768)),"production flag set only"); \
+    const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu; \
+    const u32 id=blockIdx.x,c=id&255u,op=id>>8; \
+    const u32* src=(op?b:a)+u64(XABL(F)==11?0u:c)*BCRT_L;if(XDIN(F))src=a; \
+    const u32 xoff=XDIN(F)?0u:((XABL(F)==11?0u:c)*BCRT_L)&3u; \
+    const bool ca=((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0); \
+    const u32 stride=weighted_root_stride(N);
+#define XS_PREFETCH \
+    if(pfstep&&id+pfstep<512u){const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*BCRT_L+u64(h*256u)*BCRT_L; \
+        asm volatile("prefetch.global.L2 [%0];"::"l"(ps));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+BCRT_L-1));}
+template<u32 F>
+__device__ __forceinline__ void bpo_first_xs(const u32* a,const u32* b,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const XTMap* tmA,const XTMap* tmB,u32* X){
+    constexpr u32 XD=320u,XS=8*320u;
+    XS_PROLOG
+    const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3,rl=8*warp+gid;
+    u32 af[8][2][4];
+    const u32 u0=r0/4,ue=r1/4;
+    u32 res[4][8];
+    if(XOVL(F)&&u0<ue){   // half 1 in flight during quad u0's m-tile-0 conversion
+        const u32 r=4*u0+tig,m62=u32(bpr_mu[r]>>2),np=bpr_np.v[r];
+        xs_issue<F>(src,X,h,xoff,ca,ldn,0);if(ca)asm volatile("cp.async.wait_group 0;":::"memory");__syncthreads();
+        xs_build<F>(X,warp,gid,tig,xoff,0,af);__syncthreads();
+        xs_issue<F>(src,X,h,xoff,ca,ldn,1);
+        XS_PREFETCH
+        xs_mmar<F,0,8,0,1>(af,bpt,lane,u0,m62,np,res);
+        if(ca)asm volatile("cp.async.wait_group 0;":::"memory");__syncthreads();
+        xs_build<F>(X,warp,gid,tig,xoff,1,af);
+        xs_mmar<F,0,8,1,2>(af,bpt,lane,u0,m62,np,res);
+    }else{
+        xs_load<F,false>(src,X,h,warp,gid,tig,xoff,ca,ldn,af);
+        XS_PREFETCH
+        if(u0<ue){const u32 r=4*u0+tig;xs_mmar<F,0,8>(af,bpt,lane,u0,u32(bpr_mu[r]>>2),bpr_np.v[r],res);}}
+    if(u0<ue){
+        const u32 q=warp>>1,jo=4*(warp&1u);const XTMap* const tm=op?tmB:tmA;
+        u32* const xb=X+q*XS+jo*XD;
+        #pragma unroll 1
+        for(u32 u=u0;;++u){
+            {const u32 r=4*u+tig;xs_resta<F>(res,twist+size_t(r)*stride,stage_tw+size_t(r)*256,bpr_pr[r],c,rl);}
+            __syncthreads();   // previous quad's phase-B / TMA reads of X done
+            xs_store(X,res,tig,rl);
+            __syncthreads();
+            const u32 r=4*u+q,p=bpr_pr[r];const u64* const st=stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            if(XNOH(F)||u+1>=ue){XNoHook nh;xq_l1<F>(xb,8*q,st,p,lane,nh);__syncwarp();xq_l2<F,false>(xb,8*q,st,ct,p,lane,tm,c,r*8+jo,stm,nh);
+                if(lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");
+                if(u+1>=ue)break;
+                {const u32 rn=4*(u+1)+tig;xs_mmar<F,0,8>(af,bpt,lane,u+1,u32(bpr_mu[rn]>>2),bpr_np.v[rn],res);}
+                continue;}
+            const u32 un=u+1,rn=4*un+tig;const u32 m62n=u32(bpr_mu[rn]>>2),npn=bpr_np.v[rn];
+            XSHook<F> hk{af,bpt,lane,un,m62n,npn,res};   // res of quad u is dead (stored): refilled with quad u+1
+            xq_l1<F>(xb,8*q,st,p,lane,hk);__syncwarp();xq_l2<F,true>(xb,8*q,st,ct,p,lane,tm,c,r*8+jo,stm,hk);
+            if constexpr(XSPL1(F)!=0)xs_mmar<F,4,8>(af,bpt,lane,un,m62n,npn,res);
+            if(lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");
+        }
+    }
+    if(!XNFW(F)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
+}
+template<u32 F>
+__device__ __forceinline__ void bpo_first_xw(const u32* a,const u32* b,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const XTMap* tmA,const XTMap* tmB,u32* X){   // blockDim 512, X = 2 x 4*XS words
+    constexpr u32 XD=320u,XS=8*320u;
+    XS_PROLOG
+    const u32 h=threadIdx.x,lane=h&31u,warp=h>>5;
+    const u32 u0=r0/4,ue=r1/4;
+    if(h<256u){   // producers
+        const u32 gid=lane>>2,tig=lane&3,rl=8*warp+gid;
+        u32 af[8][2][4];
+        xs_load<F,true>(src,X,h,warp,gid,tig,xoff,ca,ldn,af);
+        XS_PREFETCH
+        if(u0<ue)xbar_sync(1,256);   // all fragments built before X[0] (the staging area) is overwritten
+        #pragma unroll 1
+        for(u32 u=u0;u<ue;++u){const u32 k=(u-u0)&1u;u32* const Xk=X+k*(4*XS);
+            u32 res[4][8];
+            {const u32 r=4*u+tig;xs_mmar<F,0,8>(af,bpt,lane,u,u32(bpr_mu[r]>>2),bpr_np.v[r],res);
+             xs_resta<F>(res,twist+size_t(r)*stride,stage_tw+size_t(r)*256,bpr_pr[r],c,rl);}
+            if(u>=u0+2)xbar_sync(4+k,512);   // empty[k]: consumers done with quad u-2
+            xs_store(Xk,res,tig,rl);
+            if(XWL1(F)){xbar_sync(1,256);const u32 q=warp>>1,r=4*u+q;XNoHook nh;xq_l1<F>(Xk+q*XS+4*(warp&1u)*XD,8*q,stage_tw+size_t(r)*256,bpr_pr[r],lane,nh);}
+            xbar_arrive(2+k,512);   // full[k]
+        }
+    }else{   // consumers: phase B
+        const u32 cw=warp-8u,q=cw>>1,jo=4*(cw&1u);const XTMap* const tm=op?tmB:tmA;
+        #pragma unroll 1
+        for(u32 u=u0;u<ue;++u){const u32 k=(u-u0)&1u;u32* const xb=X+k*(4*XS)+q*XS+jo*XD;
+            const u32 r=4*u+q,p=bpr_pr[r];const u64* const st=stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            xbar_sync(2+k,512);
+            XNoHook nh;
+            if(!XWL1(F)){xq_l1<F>(xb,8*q,st,p,lane,nh);__syncwarp();}
+            xq_l2<F,false>(xb,8*q,st,ct,p,lane,tm,c,r*8+jo,stm,nh);
+            if(lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");
+            __syncwarp();
+            if(u+2<ue)xbar_arrive(4+k,512);
+        }
+        if(!XNFW(F)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
+    }
+}
+#undef XS_PROLOG
+#undef XS_PREFETCH
+#endif
 #define BPO_X_SMEM(F) (4*(((F)&96)?8*320:8*288+32)*4+(((F)&4)?4*256*8:0))
 #if !defined(BPO_LEAN)||BPO_LEAN_P1X
 extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_x(const u32* a,const u32* b,u32* A,u32* B,
