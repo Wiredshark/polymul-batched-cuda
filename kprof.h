@@ -2,7 +2,7 @@
 // On-target kernel profile: every kernel captured into the batched graphs gets a timing event before and after it
 // (event record nodes on the kernel's own stream: no new cross-stream dependencies). Each fherma_run's events are read
 // after the run (in d2h, or at the next run / free when no d2h follows) and the last 4 calls are printed once at free as
-// compact JSON lines on stdout ("kprof" key). FHERMA_KPROF=0 disables the capture-time event nodes.
+// compact JSON lines on stdout ("kprof" key). FHERMA_KPROF=1 enables (default off, KPROF_DEFAULT), =0 disables the capture-time event nodes.
 #include <cuda.h>
 #include <dlfcn.h>
 #include <algorithm>
@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+// Compiled default OFF (FHERMA_KPROF=1 enables): the 2 event nodes per kernel cost ~2.3 ms of 61 ms locally (B=128, ~900 kernels).
+#ifndef KPROF_DEFAULT
+#define KPROF_DEFAULT false
+#endif
 struct KProf {
     enum {P1,P2,P3,CRT,OTHER,NS};
     static constexpr const char* sname[NS]={"P1","P2","P3","CRT","other"};
@@ -26,7 +30,7 @@ struct KProf {
     decltype(&::cuEventRecordWithFlags) erecordf=nullptr; decltype(&::cuEventElapsedTime) elapsed=nullptr;
     decltype(&::cuEventDestroy) edestroy=nullptr; decltype(&::cuOccupancyMaxActiveBlocksPerMultiprocessor) occ=nullptr;
     decltype(&::cuFuncGetAttribute) fattr=nullptr; decltype(&::cuDeviceGetAttribute) dattr=nullptr; decltype(&::cuDeviceGetName) dname=nullptr;
-    bool enabled=true,capturing=false,pending=false,reported=false;int variant=-1,product=-1,chain=-1,last_err=0;
+    bool enabled=KPROF_DEFAULT,capturing=false,pending=false,reported=false;int variant=-1,product=-1,chain=-1,last_err=0;
     std::vector<Name> names; std::vector<Trace> traces[8]; std::vector<int> seen;
     CUevent ref0=nullptr,ref1=nullptr; int pending_variant=-1; double pending_wall=0; unsigned long long calls=0;
     std::chrono::steady_clock::time_point t0;

@@ -7,6 +7,21 @@
 //                  out layout W2[r*8+j][c][slot]
 //   P3 bpo_last  : J-DIT + R-DIT + untwist + normalization (block per (8 columns, r))
 //                  out layout natural [r*8+j][i] for batched_crt.
+// Programmatic dependent launch (host launches the chain kernels with PROGRAMMATIC_STREAM_SERIALIZATION):
+// bpo_pdl_entry() lets this grid's dependent launch early (BPO_PDL_TRIG, default on) and waits until the
+// preceding grid in the stream has completed and its memory is visible. Both are no-ops without the attribute.
+#ifndef BPO_PDL_TRIG
+#define BPO_PDL_TRIG 1
+#endif
+// Multi-product launches (host BPO slice of KP products, workspaces contiguous): product stride of the A/B/C/D
+// workspaces (all k primes x 8 digits x N words) and of the input/output tensors (N x L words).
+#define BPO_WS_STRIDE(N) (u64(BCRT_K)*8u*(N))
+__device__ __forceinline__ void bpo_pdl_entry(){
+#if defined(__CUDA_ARCH__)&&__CUDA_ARCH__>=900
+    if(BPO_PDL_TRIG)asm volatile("griddepcontrol.launch_dependents;":::"memory");
+    asm volatile("griddepcontrol.wait;":::"memory");
+#endif
+}
 #ifdef BPR_DT
 // Stage twiddle tables (host-built, per prime, 256 u64): entry (len,j) = psi^(2j*N/len) at 256-len+j.
 #define BPO_RDIF(v,st)                                                                    \
@@ -893,7 +908,10 @@ __device__ __forceinline__ constexpr u32 r16_brev4(u32 i){return ((i&1u)<<3)|((i
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
-    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    bpo_pdl_entry();
+    const u32 KP=(untw>>24)?(untw>>24):1u,gg=gridDim.z/KP,prod=blockIdx.z/gg;   // untw bits 24+: products per launch
+    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z-prod*gg,p=primes[prime];
+    if(prod){const u64 o=prod*BPO_WS_STRIDE(N);A+=o;B+=o;C+=o;}
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
     const u64 base=u64(prime*8+j)*N;
@@ -1324,7 +1342,9 @@ __device__ __forceinline__ void bpo_bar_wait(u64* bar,u32 parity){
 template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     constexpr u32 T=BPO_HAS_BULK?T0:0u;   // T0&16: ablation, no arithmetic (wrong values)
-    const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
+    const u32 KP=(dfl>>24)?(dfl>>24):1u,gg=gridDim.y/KP,prod=blockIdx.y/gg;   // dfl bits 24+: products per launch
+    const u32 c=blockIdx.x,prime=blockIdx.y-prod*gg,p=primes[prime];
+    if(prod){const u64 o=prod*BPO_WS_STRIDE(N);C+=o;D+=o;}
     const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
     const u64* sit=stage_itw+prime*256u;
@@ -1426,6 +1446,7 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
+    bpo_pdl_entry();
     bpo_p3_body<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);
 }
 #if !defined(BPO_LEAN)
@@ -1529,6 +1550,8 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_cm(const u32* residu
 #ifdef BTC_F
 extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_tc_cm(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
+    bpo_pdl_entry();
+    if(blockIdx.y){residues+=blockIdx.y*BPO_WS_STRIDE(N);output+=u64(blockIdx.y)*N*BCRT_L;}   // product blockIdx.y of the slice
     if(pfitems){   // L2 prefetch of the input columns of this chain's next product's first P1 wave
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
