@@ -8,6 +8,7 @@
 //        128 (with 64) phase B processes its columns in interleaved pairs (ILP).
 //        256 (with 64) input rows loaded coalesced (__ldcs, 128-row halves) into X, A fragments built from smem
 //            (the 2.3x redundant per-thread LDGs of the funnel-shift windows missed L1).
+//        512 (with 256) input halves staged with cp.async 16 B chunks (row stride 60 words, all chunks in flight).
 //        2048 (with 64) TMA output stores with an L2 evict_first policy (P2 re-reads them only after all primes are written).
 //  * corrections as unsigned min (s-p wraps above s when s<p): add = IADD3+IADD3+IMNMX, no ISETP/SEL;
 //  * DIF butterfly y' = shoup(x+p-y, w): Shoup accepts any 32-bit input, so the difference needs no reduction;
@@ -27,7 +28,7 @@
 #define BPO_X_HAS_TMA 0
 #endif
 #ifndef BPO_XF
-#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|2048):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
+#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|512|2048):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
 #endif
 #ifndef BPO_XV
 #define BPO_XV BPO_XF
@@ -224,11 +225,26 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     }
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
+    constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
+    const u32 xoff=(c*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
+    const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
         #pragma unroll
         for(u32 mt=0;mt<MT;++mt){
             if(mt)__syncthreads();
             const u32* hs=src+u64(mt*128u*256u)*L;
+            if(ca){   // flag 512: all 16 B chunks of the half in flight at once (cp.async, one DRAM/L2 round trip)
+                const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
+                u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+                if(q<nch){
+                    #pragma unroll
+                    for(u32 i=0;i<8;++i){const u32 rr=(h>>4)+16u*i;
+                        const u32 sa=u32(__cvta_generic_to_shared(X+rr*XRS+4u*q));const u32* g=g0+u64(rr*256u)*L;
+                        if(ldn)asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(g):"memory");
+                        else asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"::"r"(sa),"l"(g),"l"(pol):"memory");}}
+                asm volatile("cp.async.commit_group;":::"memory");
+                asm volatile("cp.async.wait_group 0;":::"memory");
+            }else
             #pragma unroll 4
             for(u32 x=h;x<128u*L;x+=256u){const u32 rr=x/L,w=x-rr*L;X[x]=ldn?__ldg(hs+u64(rr*256u)*L+w):__ldcs(hs+u64(rr*256u)*L+w);}
             __syncthreads();
@@ -238,7 +254,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 #pragma unroll
                 for(u32 x=0;x<4;++x){
                     const u32 lrow=64*(x&1)+8*warp+gid,t=tig+4*(x>>1);
-                    const u32* rp=X+lrow*L;
+                    const u32* rp=ca?X+lrow*XRS+xoff:X+lrow*L;
                     const u32 w0=wb+t,w1=min(wb+t+1,L-1);
                     const u32 v=__funnelshift_r(rp[min(w0,L-1)],rp[w1],sh);
                     const int width=int(POS[j+1])-int(POS[j]+32*t);
