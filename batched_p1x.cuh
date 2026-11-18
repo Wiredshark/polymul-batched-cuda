@@ -43,7 +43,12 @@
 struct __align__(64) XTMap{u64 w[16];};
 struct XNegP{u32 v[BCRT_K];};
 __host__ __device__ constexpr XNegP xnegp_make(){XNegP a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=0u-P[i];return a;}
-__constant__ XNegP bpr_np=xnegp_make();   // -p mod 2^32 as an opaque constant: r = lo + q(-p) is one IMAD (ptxas re-derives -q from 0-p)
+__constant__ XNegP bpr_np=xnegp_make();
+struct XFMask{u32 v[8][2][4];};   // fragment word masks [digit j][x>>1][tig]: width POS[j+1]-POS[j]-32(tig+4(x>>1)) clamped to [0,32]
+__host__ __device__ constexpr XFMask xfmask_make(){XFMask a{};constexpr u32 P[9]={BCRT_POS,BCRT_W};
+    for(u32 j=0;j<8;++j)for(u32 xh=0;xh<2;++xh)for(u32 t=0;t<4;++t){const int wd=int(P[j+1])-int(P[j])-32*int(t+4*xh);
+        a.v[j][xh][t]=wd>=32?~0u:(wd<=0?0u:((1u<<wd)-1u));}return a;}
+__constant__ XFMask bpr_fmask=xfmask_make();   // -p mod 2^32 as an opaque constant: r = lo + q(-p) is one IMAD (ptxas re-derives -q from 0-p)
    // CUtensorMap (128 B) passed as __grid_constant__
 __device__ __forceinline__ u32 xadd(u32 a,u32 b,u32 p){const u32 s=a+b;return min(s,s-p);}
 __device__ __forceinline__ u32 xsub(u32 a,u32 b,u32 p){const u32 d=a-b;return min(d,d+p);}
@@ -268,15 +273,18 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         for(u32 k=0;k<4;++k)
             #pragma unroll
             for(u32 n=0;n<NC;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+        if(!T){
         #pragma unroll
         for(u32 lo=0;lo<8;lo+=2)
             #pragma unroll
-            for(u32 n=0;n<NC;++n)xbft<T>(v[n][lo],v[n][lo+1],w254,p);}
+            for(u32 n=0;n<NC;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}}
     {const ulonglong2* c2=reinterpret_cast<const ulonglong2*>(ct+8*lane);
         #pragma unroll
         for(u32 m2=0;m2<4;++m2){const ulonglong2 w=__ldg(c2+m2);
             #pragma unroll
-            for(u32 n=0;n<NC;++n){v[n][2*m2]=xmsh(v[n][2*m2],u64(w.x),p);v[n][2*m2+1]=xmsh(v[n][2*m2+1],u64(w.y),p);}}}
+            for(u32 n=0;n<NC;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}   // len-2 psi^0 stage fused into the cross twiddle
+                else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}}
 #if BPO_X_HAS_TMA
     __syncwarp();
     {const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);   // conflict-free quarter-warp phases
@@ -324,6 +332,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 xoff=(c*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
     const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
+        u32 mk[8][2];   // flag 4096: per-thread masks of the partial fragment words (clamped funnel shift: 2^wd-1, 0 or ~0)
+        #pragma unroll
+        for(u32 j=0;j<8;++j)
+            #pragma unroll
+            for(u32 xh=0;xh<2;++xh){const int wd=int(POS[j+1])-int(POS[j])-32*int(tig+4*xh);
+                (void)wd;mk[j][xh]=bpr_fmask.v[j][xh][tig];}   // opaque constants: ptxas otherwise rebuilds per-fragment SELs
         #pragma unroll
         for(u32 mt=0;mt<MT;++mt){
             if(mt)__syncthreads();
@@ -332,9 +346,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
                 u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
                 if(q<nch){
+                    const u32 sa0=u32(__cvta_generic_to_shared(X+(h>>4)*XRS+4u*q));const u32* const gq=g0+u64((h>>4)*256u)*L;
                     #pragma unroll
-                    for(u32 i=0;i<8;++i){const u32 rr=(h>>4)+16u*i;
-                        const u32 sa=u32(__cvta_generic_to_shared(X+rr*XRS+4u*q));const u32* g=g0+u64(rr*256u)*L;
+                    for(u32 i=0;i<8;++i){
+                        const u32 sa=(F&4096)?sa0+i*(16u*XRS*4u):u32(__cvta_generic_to_shared(X+((h>>4)+16u*i)*XRS+4u*q));
+                        const u32* g=(F&4096)?gq+i*(16u*256u*L):g0+u64(((h>>4)+16u*i)*256u)*L;
                         if(ldn)asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(g):"memory");
                         else asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"::"r"(sa),"l"(g),"l"(pol):"memory");}}
                 asm volatile("cp.async.commit_group;":::"memory");
@@ -343,6 +359,22 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll 4
             for(u32 x=h;x<128u*L;x+=256u){const u32 rr=x/L,w=x-rr*L;X[x]=ldn?__ldg(hs+u64(rr*256u)*L+w):__ldcs(hs+u64(rr*256u)*L+w);}
             __syncthreads();
+            if((F&4096)&&ca){
+                static_assert(3u+POS[7]/32u+8u<XRS,"flag 4096: unclamped fragment windows stay inside the 60-word row");
+                const u32* const rpt=X+(8*warp+gid)*XRS+xoff+tig;
+                #pragma unroll
+                for(u32 j=0;j<8;++j){
+                    const u32 wb=POS[j]/32,sh=POS[j]%32;
+                    const int D=int(POS[j+1])-int(POS[j]);
+                    #pragma unroll
+                    for(u32 x=0;x<4;++x){
+                        const u32* rp=rpt+64*(x&1)*XRS+wb+4*(x>>1);
+                        const u32 v=__funnelshift_r(rp[0],rp[1],sh);
+                        if(D-32*(3+4*int(x>>1))>=32)af[j][mt][x]=v;   // full word for every tig
+                        else af[j][mt][x]=v&mk[j][x>>1];
+                    }
+                }
+            }else
             #pragma unroll
             for(u32 j=0;j<8;++j){
                 const u32 wb=POS[j]/32,sh=POS[j]%32;
