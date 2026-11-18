@@ -1,0 +1,2 @@
+#pragma once
+static const char FUSE_SWEEP_SOURCE[] = R"FUSESWEEP(@FUSE_SWEEP_SOURCE@)FUSESWEEP";
