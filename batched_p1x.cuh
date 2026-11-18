@@ -229,10 +229,22 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
         asm volatile("cp.async.bulk.commit_group;":::"memory");}
 #endif
 }
+#define XCTSM(F) ((((F)&262144u)!=0)&&(((F)&8192u)!=0)&&(((F)&32768u)==0))
+__device__ __forceinline__ ulonglong2 xct_ld(const u64* ctg,const u64* cts,u32 lane,u32 m2,bool sm){   // cross twiddles 2 m2, 2 m2+1 of a lane
+    if(sm)return reinterpret_cast<const ulonglong2*>(cts)[lane*4u+(m2^((lane>>1)&3u))];
+    return __ldg(reinterpret_cast<const ulonglong2*>(ctg+8*lane)+m2);
+}
+__device__ __forceinline__ ulonglong2 xct_ldv(const u64* ctg,const u64* cts,u32 lane,u32 m2,bool sm){   // same, never CSE'd across pairs (registers)
+    ulonglong2 w;
+    if(sm){const u32 sa=u32(__cvta_generic_to_shared(cts+2u*(lane*4u+(m2^((lane>>1)&3u)))));
+        asm volatile("ld.shared.v2.u64 {%0,%1},[%2];":"=l"(w.x),"=l"(w.y):"r"(sa));}
+    else asm volatile("ld.global.nc.v2.u64 {%0,%1},[%2];":"=l"(w.x),"=l"(w.y):"l"(ctg+8*lane+2*m2));
+    return w;
+}
 // Flag 8192 phase B: NC columns of ONE prime (digits j..j+NC-1): stage twiddles and cross twiddles are loaded once and
 // shared by the NC columns; smem addresses as one hoisted pointer + immediates. Same values as xrdif6.
 template<u32 F,u32 NC>
-__device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm=0,u32* dsto=nullptr){
+__device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm=0,u32* dsto=nullptr,const u64* cts=nullptr){
     constexpr bool T=(F&1)!=0;
     constexpr u32 XD=320u;
     u32 v[NC][8];
@@ -291,7 +303,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
             for(u32 n=0;n<NC;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}}
     {const ulonglong2* c2=reinterpret_cast<const ulonglong2*>(ct+8*lane);
         #pragma unroll
-        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=__ldg(c2+m2);
+        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=XCTSM(F)?xct_ld(ct,cts,lane,m2,true):__ldg(c2+m2);
             #pragma unroll
             for(u32 n=0;n<NC;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
                 if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}   // len-2 psi^0 stage fused into the cross twiddle
@@ -323,6 +335,124 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         asm volatile("cp.async.bulk.commit_group;":::"memory");}
 #endif
 }
+// Sweep-only phase-B restructurings (opt-in; production BPO_XF sets none of these bits):
+//   131072 (with 8192) xrdif6q (with 1024: its layout-1 pair loop rolled too; the layout-2 loop is always rolled): the warp's 4 columns in ONE pass: layout-1 stages of both column pairs, one __syncwarp,
+//          layout-2 stages + cross twiddle per pair, one proxy fence and one lane-0 TMA burst (4 boxes, 1 commit) per quad
+//          instead of 2 x (fence, syncwarp, TMA section); stage and cross twiddles loaded once per quad, not per pair.
+//   262144 (with 8192, without 32768) cross twiddles of the quad (4 primes x 256 u64 = 8 KB) staged in smem with cp.async at
+//          the quad start (in flight during phase A), 16 B chunks XOR-swizzled (conflict-free LDS.128): phase B has no L2 loads
+//          at the end of its dependency chain.
+//   524288 L1 prefetch one quad ahead (quad r0/4 at kernel start, under the input load) of every twiddle the next quad
+//          reads from global: phase-A twist / stage entries, phase-B stage entries 192..255 and the cross-twiddle row.
+template<u32 F>
+__device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u64* cts,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm){
+    constexpr bool T=(F&1)!=0;
+    constexpr u32 XD=320u;
+    constexpr bool SM=XCTSM(F);
+    constexpr u32 Q=((F>>31)&1u)?1u:2u,NI=4u/Q;   // bit 31: one column per iteration (half the code), else pairs
+    const u32 l7=lane&7u;
+    {u64 w64[4],w32[2];
+        #pragma unroll
+        for(u32 m=0;m<4;++m)w64[m]=st[192u+l7+8u*m];
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq)w32[qq]=st[224u+l7+8u*qq];
+        const u64 w16=st[240u+l7];
+        u32* const pb=base0+so+l7+72u*(lane>>3);
+        auto l1=[&](const u32 pr){u32 v[Q][8];
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;++m)v[n][m]=pb[(Q*pr+n)*XD+8*m+4*(m>>2)];
+            #pragma unroll
+            for(u32 m=0;m<4;++m)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)xbf(v[n][m],v[n][m+4],w64[m],p);
+            #pragma unroll
+            for(u32 qq=0;qq<2;++qq)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)
+                    #pragma unroll
+                    for(u32 hh=0;hh<2;++hh)xbf(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;m+=2)xbf(v[n][m],v[n][m+1],w16,p);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;++m)pb[(Q*pr+n)*XD+8*m+4*(m>>2)]=v[n][m];
+        };
+        if(F&1024u){   // flag 1024 (with 131072): layout-1 pair loop rolled (smaller code)
+            #pragma unroll 1
+            for(u32 pr=0;pr<NI;++pr)l1(pr);
+        }else{
+            #pragma unroll
+            for(u32 pr=0;pr<NI;++pr){l1(pr);if(pr+1<NI)__syncwarp();}}   // groups kept sequential (8Q live values)
+    }
+    __syncwarp();
+    u64 w8[4];
+    #pragma unroll
+    for(u32 lo=0;lo<4;++lo)w8[lo]=st[248u+lo];
+    const u64 w253=st[253u],w252=st[252u],w254=st[254u];
+    const u32* const pr0=base0+so+8*lane+4*(lane>>2);
+    const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);
+    #pragma unroll 1
+    for(u32 pr=0;pr<NI;++pr){u32 v[Q][8];
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr0+(Q*pr+n)*XD);const uint4 x0=p4[0],x1=p4[1];
+            v[n][0]=x0.x;v[n][1]=x0.y;v[n][2]=x0.z;v[n][3]=x0.w;v[n][4]=x1.x;v[n][5]=x1.y;v[n][6]=x1.z;v[n][7]=x1.w;}
+        #pragma unroll
+        for(u32 lo=0;lo<4;++lo)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}
+        #pragma unroll
+        for(u32 k=0;k<4;++k)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+        if(!T){
+            #pragma unroll
+            for(u32 lo=0;lo<8;lo+=2)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}
+        #pragma unroll
+        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=xct_ldv(ct,cts,lane,m2,SM);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}
+                else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}
+#if BPO_X_HAS_TMA
+        __syncwarp();   // layout-2 reads of this pair's regions done (the other pair's regions are disjoint)
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){
+            const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
+            uint4* const d=sd+(Q*pr+n)*(XD/4);
+            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}
+#endif
+    }
+#if BPO_X_HAS_TMA
+    asm volatile("fence.proxy.async.shared::cta;":::"memory");
+    __syncwarp();
+    if(lane==0&&XABL(F)!=8){
+        u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
+        if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
+        #pragma unroll
+        for(u32 n=0;n<4;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
+            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
+            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa):"memory");}
+        asm volatile("cp.async.bulk.commit_group;":::"memory");}
+#endif
+}
+// flag 524288: L1 prefetch of the global twiddles quad uq reads (phase A: twist, stage entries; phase B: stage 192..255, ct row)
+__device__ __forceinline__ void xpfq(const u64* twist,const u64* stage_tw,const u64* ctab,u32 N,u32 c,u32 lane,u32 warp,u32 uq){
+    const u32 rA=4*uq+(lane&3u),rl=8*warp+(lane>>2);const u64* tw=twist+size_t(rA)*weighted_root_stride(N);const u64* sa=stage_tw+size_t(rA)*256;
+    #pragma unroll
+    for(u32 rr=0;rr<4;++rr)asm volatile("prefetch.global.L1 [%0];"::"l"(tw+1+128u+(((64*rr+rl)*256u+c)>>7)));
+    asm volatile("prefetch.global.L1 [%0];"::"l"(sa+rl));asm volatile("prefetch.global.L1 [%0];"::"l"(sa+64u+rl));asm volatile("prefetch.global.L1 [%0];"::"l"(sa+128u+rl));
+    asm volatile("prefetch.global.L1 [%0];"::"l"(sa+32u*(lane&3u)));
+    const u32 rB=4*uq+(warp>>1);
+    asm volatile("prefetch.global.L1 [%0];"::"l"(stage_tw+size_t(rB)*256+192u+16u*(lane&3u)));
+    asm volatile("prefetch.global.L1 [%0];"::"l"(ctab+(size_t(rB)*256u+c)*256u+8u*lane));
+}
 template<u32 F>
 __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
@@ -344,6 +474,8 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         for(u32 x=h;x<8192u;x+=256)o[x]=make_uint4(acc,x,acc^x,id);
         return;
     }
+    constexpr bool PFQ=(F&524288u)&&(F&64)&&!(F&8);   // flag 524288: L1 prefetch of quad uq's global twiddles
+    if(PFQ)xpfq(twist,stage_tw,ctab,N,c,lane,warp,r0/4);
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
@@ -438,6 +570,15 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     #pragma unroll QUN
     for(u32 u=r0/4;u<r1/4;++u){
         if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
+        if(PFQ&&u+1<r1/4)xpfq(twist,stage_tw,ctab,N,c,lane,warp,u+1);
+        if(XCTSM(F)&&S6&&NW==8){   // flag 262144: the quad's cross twiddles -> CTS (swizzled 16 B chunks), waited before phase B
+            u64* const CTS=reinterpret_cast<u64*>(X+4*XS+((F&4)?2048u:0u));
+            #pragma unroll
+            for(u32 k2=0;k2<2;++k2){const u32 k=h+256u*k2,q=k>>7,kk=k&127u,ln=kk>>2,m2=kk&3u;
+                const u32 sa=u32(__cvta_generic_to_shared(CTS+q*256u+2u*(ln*4u+(m2^((ln>>1)&3u)))));
+                asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(ctab+(size_t(4*u+q)*256u+c)*256u+2u*kk):"memory");}
+            asm volatile("cp.async.commit_group;":::"memory");
+        }
         if(F&4){
             #pragma unroll
             for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t(4*u+q)*256+h];
@@ -510,14 +651,18 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 for(u32 j=0;j<8;++j)X[tig*XS+j*XD+((F&32)?8*tig:0)+row+4*(row>>5)]=res[rr][j];
             }
         }
+        if(XCTSM(F)&&S6&&NW==8)asm volatile("cp.async.wait_group 0;":::"memory");   // flag 262144: CTS landed (visible after the barrier)
         __syncthreads();
         if((F&8192)&&S6&&NW==8&&XABL(F)!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
             constexpr u32 NC=((F>>28)&3u)?(1u<<(((F>>28)&3u)-1u)):u32(BPO_X_NC);   // bits 28-29: sweep override
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            const u64* const cts=XCTSM(F)?reinterpret_cast<const u64*>(X+4*XS+((F&4)?2048u:0u))+q*256u:nullptr;
+            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,cts,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
+            else{
             #pragma unroll
             for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;
-                xrdif6s<F,NC>(X+q*XS+j*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+j,stm,dst);}
+                xrdif6s<F,NC>(X+q*XS+j*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+j,stm,dst,cts);}}
         }else
         #pragma unroll 1
         for(u32 n=0;n<(XABL(F)==3?0u:32/NW);++n){   // (prime q, digit j) columns of the quad (ablation 3: none)
@@ -541,7 +686,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     if((F&2)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
 #endif
 }
-#define BPO_X_SMEM(F) (4*(((F)&96)?8*320:8*288+32)*4+(((F)&4)?4*256*8:0))
+#define BPO_X_SMEM(F) (4*(((F)&96)?8*320:8*288+32)*4+(((F)&4)?4*256*8:0)+(XCTSM(F)?4*256*8:0))
 #if !defined(BPO_LEAN)||BPO_LEAN_P1X
 extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_x(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,

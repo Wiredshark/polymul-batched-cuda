@@ -58,12 +58,17 @@ template<class C> struct Sweep {
          addk(c,"sw_cmp",false);}
         // P1: name, F (relative to the production BPO_XF), launch-bounds min blocks (production: BPO_TC_MINB = 2), ablation
         struct P1V{const char* n;const char* f;int mb;bool abl;};
+        // (11-18: the pv33 target sweep measured every flag / NC / unroll / min-blocks knob >= production; those lines are gone.)
+        // New phase-B restructurings (batched_p1x.cuh): 131072 pbq one-pass phase B per warp (1 fence + 1 TMA burst per quad,
+        // rolled layout-2 pair loop), +1024 r1 layout-1 pair loop rolled too, +bit 31 c1 one column per iteration (half the
+        // phase-B code), 262144 ctsm cross twiddles cp.async'ed to smem during phase A, 524288 pfq L1 prefetch of the next
+        // quad's twiddles, 4 f4 stage twiddles in smem.
+        // co_* = compute only (no output stores, L2-resident input; wrong values by design): co_X / co_prod isolates the math.
         static const P1V p1g[][4]={
-            {{"ctrl","BPO_XF",2,false},{"mb1","BPO_XF",1,false},{"no8192","(BPO_XF&~8192u)",2,false},{"f65536","(BPO_XF|65536u)",2,false}},
-            {{"p1c_32768_65536","(BPO_XF|32768u|65536u)",2,false},{"f32768","(BPO_XF|32768u)",2,false},{"unroll2","(BPO_XF|(1u<<30))",2,false},{"nc1","(BPO_XF|(1u<<28))",2,false}},
-            {{"no4096","(BPO_XF&~4096u)",2,false},{"no2048","(BPO_XF&~2048u)",2,false},{"no512","(BPO_XF&~512u)",2,false},{"no1","(BPO_XF&~1u)",2,false}},
-            {{"mb3","BPO_XF",3,false},{"nc4","(BPO_XF|(3u<<28))",2,false},{"f4_sts","(BPO_XF|4u)",2,false},{"f16384","(BPO_XF|16384u)",2,false}},
-            {{"no256_512","(BPO_XF&~768u)",2,false},{"no8192_128","(BPO_XF&~(8192u|128u))",2,false},{"abl_noA","(BPO_XF|(4u<<20))",2,true},{"abl_noB","(BPO_XF|(3u<<20))",2,true}}};
+            {{"ctrl","BPO_XF",2,false},{"pbq","(BPO_XF|131072u)",2,false},{"pbq_r1","(BPO_XF|131072u|1024u)",2,false},{"pbq_r1c1","(BPO_XF|131072u|1024u|(1u<<31))",2,false}},
+            {{"pfq","(BPO_XF|524288u)",2,false},{"pbq_r1_pfq","(BPO_XF|131072u|1024u|524288u)",2,false},{"pbq_r1_ctsm","(BPO_XF|131072u|1024u|262144u)",2,false},{"ctsm","(BPO_XF|262144u)",2,false}},
+            {{"pbq_ctsm","(BPO_XF|131072u|262144u)",2,false},{"pbq_r1_f4","(BPO_XF|131072u|1024u|4u)",2,false},{"abl_noA","(BPO_XF|(4u<<20))",2,true},{"abl_noB","(BPO_XF|(3u<<20))",2,true}},
+            {{"co_prod","(BPO_XF|(8u<<20)|(1u<<24))",2,true},{"co_pbq_r1","(BPO_XF|131072u|1024u|(8u<<20)|(1u<<24))",2,true},{"co_pbq_r1c1","(BPO_XF|131072u|1024u|(1u<<31)|(8u<<20)|(1u<<24))",2,true},{"co_pbq_r1_ctsm_pfq","(BPO_XF|131072u|1024u|262144u|524288u|(8u<<20)|(1u<<24))",2,true}}};
         int kc=0;
         auto p1grp=[&](int g){const int pi=prog(("p1"+std::string(1,char('a'+g))).c_str(),arch);
             for(const auto& x:p1g[g]){const std::string kn="sw_p1_"+std::to_string(kc++);progs[size_t(pi)].src+="SWP1("+kn+","+x.f+","+std::to_string(x.mb)+")\n";
@@ -84,13 +89,13 @@ template<class C> struct Sweep {
             addv(KProf::P2,"ctrl",pi,addk(pi,"bpo_middle_r16<0>",true));
             for(int mb:{6,8})addv(KProf::P2,"mb"+std::to_string(mb),pi,addk(pi,"sw_p2r16<"+std::to_string(mb)+">",true));
             if(has_p2d)addv(KProf::P2,"discard",pi,addk(pi,"sw_p2d<0>",true),6,0u,8u);}   // untw bit 8 (sweep build only): discard of the dead A/B lines (bytes bed0fde)
-        p1grp(1);p1grp(2);
+        p1grp(1);
         if(!std::getenv("FHERMA_SWEEP_NONATIVE")){const int pi=prog("native",native);progs[size_t(pi)].src+="SWP1(sw_n_p1,BPO_XF,BPO_TC_MINB)\n";
             addv(KProf::P1,"native_"+native,pi,addk(pi,"sw_n_p1",false));
             if(has_p2)addv(KProf::P2,"native_"+native,pi,addk(pi,"bpo_middle_r16<0>",true));
             addv(KProf::P3,"native_"+native,pi,addk(pi,"bpo_last_cm3<0>",true));
             if(has_crt)addv(KProf::CRT,"native_"+native,pi,addk(pi,"bpo_crt_tc_cm<0>",true));}
-        p1grp(3);p1grp(4);
+        p1grp(2);p1grp(3);
         for(auto& P:progs)P.fn.assign(P.kn.size(),nullptr);
         // worker threads: NVRTC compile + module load (driver JIT for PTX), in program order, until the compile deadline
         const unsigned hw=std::max(2u,std::thread::hardware_concurrency());const size_t nth=std::min<size_t>(progs.size(),std::max(1u,std::min(8u,hw-1)));
@@ -214,7 +219,7 @@ template<class C> struct Sweep {
         }
         // product chains (products 0 and 1 on two streams from a cold flush) for the best exact combinations
         auto score=[](const V* v){return std::sqrt(v->vs*v->c1vs);};   // rank by the geometric mean of the c2 and c1 ratios
-        auto best=[&](int st,size_t rank)->const V*{std::vector<const V*> c;for(auto& v:vs[st])if(v.ok&&v.ex==1&&!v.abl&&v.vs>0&&v.c1vs>0&&score(&v)<0.995)c.push_back(&v);
+        auto best=[&](int st,size_t rank)->const V*{std::vector<const V*> c;for(auto& v:vs[st])if(v.ok&&v.ex==1&&!v.abl&&v.v!="ctrl"&&v.vs>0&&v.c1vs>0&&score(&v)<0.995)c.push_back(&v);
             std::sort(c.begin(),c.end(),[&](const V* a,const V* b){return score(a)<score(b);});return rank<c.size()?c[rank]:nullptr;};
         auto byname=[&](int st,const char* n)->const V*{for(auto& v:vs[st])if(v.ok&&v.v==n)return &v;return nullptr;};
         struct Combo{std::string name;const V* v[4];};std::vector<Combo> cs;
@@ -224,8 +229,9 @@ template<class C> struct Sweep {
         addc(best(0,0),best(1,0),best(2,0),best(3,0));addc(best(0,0),nullptr,nullptr,nullptr);addc(best(0,1),best(1,0),best(2,0),best(3,0));
         addc(best(0,2),nullptr,nullptr,nullptr);addc(nullptr,best(1,0),best(2,0),best(3,0));
         {const std::string nn="native_"+native;addc(byname(0,nn.c_str()),byname(1,nn.c_str()),byname(2,nn.c_str()),byname(3,nn.c_str()));}
-        addc(byname(0,"p1c_32768_65536"),nullptr,nullptr,nullptr);
-        if(cs.size()>7)cs.resize(7);
+        for(const char* n:{"pbq","pbq_r1","pbq_r1c1","pfq","pbq_r1_pfq","pbq_r1_ctsm"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each new P1 variant alone
+        addc(byname(0,"pbq_r1"),best(1,0),best(2,0),best(3,0));
+        if(cs.size()>14)cs.resize(14);
         const int nprod=[&]{int n=0;for(const auto& t:tr)n=std::max(n,t.product+1);return n;}();
         const KProf::Trace* crt0=k0s[KProf::CRT];
         auto chain=[&](int prod,CUstream a,const Combo* c){for(const auto& t:tr)if(t.product==prod&&!t.pb.empty()){const V* v=nullptr;if(c&&t.stage<4&&k0s[t.stage]&&t.fn==k0s[t.stage]->fn)v=c->v[t.stage];launch(g,t,a,v);}};
