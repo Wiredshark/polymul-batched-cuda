@@ -18,7 +18,7 @@ struct KProf {
     enum {P1,P2,P3,CRT,OTHER,NS};
     static constexpr const char* sname[NS]={"P1","P2","P3","CRT","other"};
     struct Name { CUfunction fn; const char* name; };
-    struct Trace { CUfunction fn; unsigned gx,gy,gz,bx,smem; CUstream s; int product,chain,stage,gidx; CUevent e0,e1; };
+    struct Trace { CUfunction fn; unsigned gx,gy,gz,bx,smem; CUstream s; int product,chain,stage,gidx; CUevent e0,e1; std::vector<unsigned char> pb; std::vector<size_t> po; };   // pb/po: kernel parameter bytes (exit-time diag replay)
     struct ChainStat { double busy=0,gaps=0,gap_max=0,first=0,last=0; int kernels=0,gaps10=0; };
     struct Call { unsigned long long index; int variant; double wall_ms,span_ms,union_ms,sum_ms,lead_ms,tail_ms,stage_ms[NS]; std::vector<ChainStat> chains; int sm_mhz,mem_mhz; };
     struct KStat { double sum=0; unsigned long long n=0; };
@@ -26,6 +26,7 @@ struct KProf {
     decltype(&::cuEventRecordWithFlags) erecordf=nullptr; decltype(&::cuEventElapsedTime) elapsed=nullptr;
     decltype(&::cuEventDestroy) edestroy=nullptr; decltype(&::cuOccupancyMaxActiveBlocksPerMultiprocessor) occ=nullptr;
     decltype(&::cuFuncGetAttribute) fattr=nullptr; decltype(&::cuDeviceGetAttribute) dattr=nullptr; decltype(&::cuDeviceGetName) dname=nullptr;
+    CUresult (*pinfo)(CUfunction,size_t,size_t*,size_t*)=nullptr;   // cuFuncGetParamInfo (12.4+, optional)
     bool enabled=true,capturing=false,pending=false,reported=false;int variant=-1,product=-1,chain=-1,last_err=0;
     std::vector<Name> names; std::vector<Trace> traces[8]; std::vector<int> seen;
     CUevent ref0=nullptr,ref1=nullptr; int pending_variant=-1; double pending_wall=0; unsigned long long calls=0;
@@ -42,6 +43,7 @@ struct KProf {
         edestroy=driver.template get<decltype(edestroy)>("cuEventDestroy_v2");occ=driver.template get<decltype(occ)>("cuOccupancyMaxActiveBlocksPerMultiprocessor");
         fattr=driver.template get<decltype(fattr)>("cuFuncGetAttribute");dattr=driver.template get<decltype(dattr)>("cuDeviceGetAttribute");
         dname=driver.template get<decltype(dname)>("cuDeviceGetName");
+        try{pinfo=driver.template get<decltype(pinfo)>("cuFuncGetParamInfo");}catch(...){pinfo=nullptr;}
         if(!ecreate||!erecord||!erecordf||!elapsed)enabled=false;
         if(enabled){ecreate(&ref0,CU_EVENT_DEFAULT);ecreate(&ref1,CU_EVENT_DEFAULT);
             nvml=dlopen("libnvidia-ml.so.1",RTLD_NOW|RTLD_LOCAL);
@@ -59,11 +61,13 @@ struct KProf {
     void end_variant(){capturing=false;variant=-1;product=chain=-1;}
     bool tracing(CUstream s)const{return capturing&&s;}
     CUevent pre(CUstream s){CUevent e=nullptr;ecreate(&e,CU_EVENT_DEFAULT);erecordf(e,s,CU_EVENT_RECORD_EXTERNAL);return e;}
-    void post(CUevent e0,CUfunction fn,unsigned gx,unsigned gy,unsigned gz,unsigned bx,unsigned smem,CUstream s){
+    void post(CUevent e0,CUfunction fn,unsigned gx,unsigned gy,unsigned gz,unsigned bx,unsigned smem,CUstream s,void** params=nullptr){
         CUevent e1=nullptr;ecreate(&e1,CU_EVENT_DEFAULT);erecordf(e1,s,CU_EVENT_RECORD_EXTERNAL);
         const int st=stage_of(name_of(fn));int gi=0;
         if(product>=0&&product<4096)gi=seen[size_t(product)*NS+st]++;
-        traces[variant].push_back({fn,gx,gy,gz,bx,smem,s,product,chain,st,gi,e0,e1});}
+        traces[variant].push_back({fn,gx,gy,gz,bx,smem,s,product,chain,st,gi,e0,e1,{},{}});
+        if(pinfo&&params){auto& t=traces[variant].back();size_t off=0,sz=0;   // copy of the launch parameters (layout from cuFuncGetParamInfo)
+            for(size_t i=0;i<64&&pinfo(fn,i,&off,&sz)==CUDA_SUCCESS;++i){t.po.push_back(off);if(t.pb.size()<off+sz)t.pb.resize(off+sz);std::memcpy(t.pb.data()+off,params[i],sz);}}}
     // run(): around the graph launch (ref events are outside the graph, on the launch stream)
     void run_begin(CUstream s,int v){if(!enabled||v<0||v>=8||traces[v].empty()){pending_variant=-1;return;}t0=std::chrono::steady_clock::now();erecord(ref0,s);pending_variant=v;}
     int run_sm=0,run_mem=0;   // clocks sampled right after the graph launch (GPU busy)
