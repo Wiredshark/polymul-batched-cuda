@@ -1002,6 +1002,254 @@ extern "C" __global__ void __launch_bounds__(128) bpo_last_r16(const u32* C,u32*
     #pragma unroll
     for(u32 h1=0;h1<16;++h1)out[16u*h1]=pxmsh(v[h1],tn[16u*h1],p);
 }
+// ---- Fused inverse tail (FHERMA_P3CRT_X=1): P2 bpo_middle_r16x + bpo_p3crt_x replace P2 + P3 + CRT ----
+// Inverse R-transform of 256 = 32 (k_lo) x 8 (k_hi), k = k_lo + 32 k_hi; slot 8g+b holds k = 32 brev3(b) + brev5(g).
+// P2x (block = 4 slot octets g = 4G..4G+3, i.e. 4 k_lo values, all 8 k_hi) does, per octet, the r16 S transforms, then
+// F (P3's cross untwiddle ipsi^(2 c k + (c & 127)) as two Shoup factors TH[k_hi][c] TL[k_lo][c]), the 8-point DIT over
+// k_hi (-> h2 < 8) and the twiddle w^-(h2 k_lo); out C'[ch][G][c][h2][q] (g = 4G + q; block = 512 threads, one
+// thread group per octet, 32 KB contiguous out).
+// Status: exact but slower locally (sequential profile P2x 26.3 vs P2 14.2 + P3 12.8 ms; P3CRT 38.9 vs CRT 9.0 ms): the
+// smem residue tile (16.5 KB per 32 coefficients) caps the CRT at 4 warps/SM vs 12 from L2. Opt-in only.
+// P3CRT (block = (c, h2), 128 threads = 128 channels): 32-point DIT over k_lo (g order = bit-reversed k_lo) -> h1,
+// J-DIT + t2n (as bpo_last_cm3), canonical residues of the 32 coefficients i = (h2 + 8 h1) 256 + c in smem, then the
+// tensor CRT of bpo_crt_tc_cm (warp 0 of 2) reading them from smem: no D round trip, no separate CRT launch.
+// fxt: per prime [TH 8 x 256][TL 32 x 256] Shoup words.
+extern "C" __global__ void __launch_bounds__(512) bpo_middle_r16x(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,const u64* fxt,u32 N,u32 untw){
+    __shared__ __align__(16) u32 TA[4*8*292];   // one r16 tile per octet q (thread group tid/128)
+    const u32 G=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    const u32 tid=threadIdx.x,q=tid>>7,lane=tid&31u,warp=(tid>>5)&3u,s=lane&7u,c2=4u*warp+(lane>>3);
+    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
+    const u64* TH=fxt+u64(prime)*(40u*256u);const u64* TL=TH+8u*256u;
+    const u64 base=u64(prime*8+j)*N;
+    u32* const TQ=TA+q*(8u*292u);u32* const ta=TQ+s*292u;
+    const u32 pinv=pxinv32(p);
+    {
+        const u32 g=4u*G+q,klo=r16_brev4(g&15u)*2u+(g>>4);   // brev5(g)
+        u32 a[16],b[16];
+        {   const u32* a0=A+base+g*2048u+c2*8u+s;const u32* b0=B+base+g*2048u+c2*8u+s;
+            #pragma unroll
+            for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
+        }
+        r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+        #pragma unroll
+        for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+        #pragma unroll
+        for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
+        __syncthreads();
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=ta[17*c2+i];
+        __syncthreads();
+        #pragma unroll
+        for(u32 i=0;i<16;++i)ta[17*i+c2]=b[i];
+        __syncthreads();
+        #pragma unroll
+        for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
+        r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);
+        r16_dit16<true>(a,ti,p);
+        {const u32 k1=r16_brev4(c2);
+            #pragma unroll
+            for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],__ldg(ti+((i*k1)&255u)),p);
+            a[0]=pzred(a[0],p);}
+        __syncthreads();
+        #pragma unroll
+        for(u32 i=0;i<16;++i)ta[17*c2+i]=a[i];
+        __syncthreads();
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=ta[17*i+c2];
+        r16_dit16<true>(a,ti,p);   // a[c1] = 256 x_s[16 c1 + c2] in [0,2p)
+        {   const u32 khi=((s&1u)<<2)|(s&2u)|((s&4u)>>2);   // brev3(s)
+            const u64* th=TH+khi*256u+c2;const u64* tl=TL+klo*256u+c2;
+            #pragma unroll
+            for(u32 c1=0;c1<16;++c1)a[c1]=pxmsh(pxmsh(a[c1],__ldg(th+16u*c1),p),__ldg(tl+16u*c1),p);   // canonical
+        }
+        __syncthreads();   // transpose reads done
+        #pragma unroll
+        for(u32 c1=0;c1<16;++c1)TQ[(16u*c1+c2)*8u+s]=a[c1];
+    }
+    __syncthreads();
+    {   // 8-point DIT over k_hi (slot b, k_hi = brev3(b): bit-reversed input) -> natural h2, then w^-(h2 k_lo); in place
+        const u32 c=tid&255u;
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq){
+            const u32 qo=2u*(tid>>8)+qq,g=4u*G+qo,klo=r16_brev4(g&15u)*2u+(g>>4);
+            u32* const cell=TA+qo*(8u*292u)+c*8u;u32 v[8];
+            {const uint4 x0=*reinterpret_cast<const uint4*>(cell),x1=*reinterpret_cast<const uint4*>(cell+4);
+             v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
+            #pragma unroll
+            for(u32 h=0;h<8;h+=2)pzdit1c(v[h],v[h+1],p);
+            #pragma unroll
+            for(u32 h=0;h<8;h+=4){pzdit1(v[h],v[h+2],0,p);pzdit(v[h+1],v[h+3],ti[64],p);}
+            pzdit1(v[0],v[4],0,p);
+            #pragma unroll
+            for(u32 jj=1;jj<4;++jj)pzdit(v[jj],v[jj+4],ti[32u*jj],p);
+            #pragma unroll
+            for(u32 h2=1;h2<8;++h2)v[h2]=pxmsh(v[h2],__ldg(ti+h2*klo),p);
+            *reinterpret_cast<uint4*>(cell)=make_uint4(v[0],v[1],v[2],v[3]);*reinterpret_cast<uint4*>(cell+4)=make_uint4(v[4],v[5],v[6],v[7]);
+        }
+    }
+    __syncthreads();
+    {   // out C'[ch][G][c][h2][q]: the block's 32 KB are contiguous
+        #pragma unroll
+        for(u32 i=0;i<4;++i){const u32 x=tid+512u*i;   // = c*8 + h2
+            *reinterpret_cast<uint4*>(C+base+G*8192u+4u*x)=make_uint4(TA[x],TA[8u*292u+x],TA[16u*292u+x],TA[24u*292u+x]);}
+    }
+}
+// fxt init (once): per prime row r < 8: TH[r][c] = ipsi^(64 c r); row 8 + kl: TL[kl][c] = ipsi^(2 c kl + (c & 127)) (Shoup words)
+extern "C" __global__ void __launch_bounds__(256) bpo_fxt_init(const u64* untwist,const u32* primes,u64* fxt,u32 N){
+    const u32 row=blockIdx.x,prime=blockIdx.y,c=threadIdx.x,p=primes[prime];
+    const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
+    const u32 wv=row<8u?u32(bm_root(itw,64u*c*row,N,p)):mul_shoup(u32(bm_root(itw,2u*c*(row-8u),N,p)),itw[1+(c&127u)],p);
+    const u64 m0=itw[0];u32 q=wv*u32(m0>>32)+__umulhi(wv,u32(m0));
+    const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
+    fxt[(u64(prime)*40u+row)*256u+c]=u64(wv)|(u64(q)<<32);
+}
+#ifdef BTC_F
+#define FX_RS 33u
+extern "C" __global__ void __launch_bounds__(64) bpo_p3crt_x(const u32* __restrict__ Cx,u32* __restrict__ output,
+    const u32* __restrict__ bfrag,const u64* r16,const u64* t2n,u32 N,u32 d){
+    __shared__ __align__(16) u32 R[128*FX_RS];
+    __shared__ __align__(16) u32 stage_all[32*36];   // IMMA staging; the output staging reuses R
+    const u32 cc=blockIdx.y,h2=blockIdx.x,tid=threadIdx.x,warp=tid>>5;
+    const u32* const bsh=bfrag;   // B fragments via L1
+    {   // phase D: thread = channel ch (prime ch/8, digit ch%8): 32-point DIT over k_lo -> h1
+      #pragma unroll 1
+      for(u32 ch=tid;ch<128u;ch+=64u){
+        const u32 pr=ch>>3,p=bpr_pr[pr];const u64* ti=r16+u64(pr)*512u+256u;
+        u32 v[32];
+        const uint4* src=reinterpret_cast<const uint4*>(Cx+u64(ch)*N+cc*32u+h2*4u);
+        #pragma unroll
+        for(u32 x=0;x<8;++x){const uint4 t=src[x*2048u];v[4*x]=t.x;v[4*x+1]=t.y;v[4*x+2]=t.z;v[4*x+3]=t.w;}
+        #pragma unroll
+        for(u32 len=2;len<=32;len<<=1){const u32 half=len/2;
+            #pragma unroll
+            for(u32 b0=0;b0<32;b0+=len){
+                #pragma unroll
+                for(u32 jj=0;jj<half;++jj){if(jj==0)pzdit1(v[b0],v[b0+half],0,p);else pzdit(v[b0+jj],v[b0+jj+half],ti[jj*(256u/len)],p);}}}
+        #pragma unroll
+        for(u32 h1=0;h1<32;++h1)R[ch*FX_RS+h1]=v[h1];
+      }
+    }
+    __syncthreads();
+    {   // phase J: thread (h1 = lane, primes 4 warp..4 warp+3): lazy J-DIT over the 8 digits, t2n -> canonical residues
+        const u32 h1=tid&31u,h=h2+8u*h1;
+        #pragma unroll 1
+        for(u32 pq=0;pq<8;++pq){const u32 pr=8u*warp+pq,p=bpr_pr[pr];const u64* ti=r16+u64(pr)*512u+256u;
+            u32 yv[8];
+            #pragma unroll
+            for(u32 jd=0;jd<8;++jd)yv[jd]=R[(pr*8u+jd)*FX_RS+h1];
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=2)pzdit1(yv[d0],yv[d0+1],0,p);
+            #pragma unroll
+            for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+                #pragma unroll
+                for(u32 d0=0;d0<8;d0+=len){
+                    #pragma unroll
+                    for(u32 jj=0;jj<half;++jj){if(jj==0)pzdit1(yv[d0],yv[d0+half],0,p);else pzdit(yv[d0+jj],yv[d0+jj+half],ti[jj*(256u/len)],p);}}}
+            #pragma unroll
+            for(u32 jd=0;jd<8;++jd)R[(pr*8u+jd)*FX_RS+h1]=pxmsh(yv[jd],__ldg(t2n+u64(pr*8u+jd)*512u+(cc>>7)*256u+h),p);
+        }
+    }
+    __syncthreads();
+    if(warp!=0)return;
+    constexpr u32 K=BCRT_K,SW=BCRT_SW,W=BCRT_W,L=BCRT_L,NW=64,NT=9,SST=36,F=BTC_F;
+    static_assert(K==16&&SW==16,"tensor CRT geometry");
+    constexpr u32 POS[8]={BCRT_POS};
+    constexpr u32 QW[L]={BCRT_Q},BW[L]={BCRT_BIAS};
+    constexpr u32 NPW[SW]={BTC_NP},OFW[SW]={BTC_OFF};
+    const u32 lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
+    u32* st=stage_all;
+    u32 acc[NW];
+    #pragma unroll
+    for(u32 w=0;w<NW;++w)acc[w]=0;
+    u32 pend=0;
+    #pragma unroll
+    for(u32 j=0;j<8;++j){
+        u32 a[2][2][4];
+        #pragma unroll
+        for(u32 m=0;m<2;++m)
+            #pragma unroll
+            for(u32 s=0;s<2;++s){
+                const u32 r=8*s+tig;const u32* base=R+(r*8u+j)*FX_RS+16*m+gid;
+                a[m][s][0]=base[0];a[m][s][1]=base[8];
+                a[m][s][2]=base[4u*8u*FX_RS];a[m][s][3]=base[4u*8u*FX_RS+8];
+            }
+        #pragma unroll
+        for(u32 T=0;T<NT;++T){
+            const uint2 b0=*reinterpret_cast<const uint2*>(bsh+((T*2+0)*32+lane)*2);
+            const uint2 b1=*reinterpret_cast<const uint2*>(bsh+((T*2+1)*32+lane)*2);
+            #pragma unroll
+            for(u32 m=0;m<2;++m){
+                u32 c[4]={0,0,0,0};
+                imma16832(c,a[m][0][0],a[m][0][1],a[m][0][2],a[m][0][3],b0.x,b0.y);
+                imma16832(c,a[m][1][0],a[m][1][1],a[m][1][2],a[m][1][3],b1.x,b1.y);
+                st[(16*m+gid)*SST+4*T+tig]=c[0]+(c[1]<<8);
+                st[(16*m+gid+8)*SST+4*T+tig]=c[2]+(c[3]<<8);
+            }
+        }
+        __syncwarp();
+        u32 h[SST];
+        #pragma unroll
+        for(u32 q=0;q<SST/4;++q){const uint4 v=*reinterpret_cast<const uint4*>(st+lane*SST+4*q);h[4*q]=v.x;h[4*q+1]=v.y;h[4*q+2]=v.z;h[4*q+3]=v.w;}
+        __syncwarp();
+        const u64 S=u64(h[32])+(u64(h[33])<<16)+(u64(h[34])<<32);
+        const u32 alpha=u32((S+(u64(1)<<(F-1)))>>F);
+        const u32 o=POS[j]/32,sh=POS[j]%32;
+        constexpr u32 dummy=0;(void)dummy;
+        const u32 inj=j?(POS[j-1]/32+SW+1-o):0xffffffffu;
+        u64 zc=0,c=0;u32 prevZ=0;
+        #pragma unroll
+        for(u32 w=0;w<=SW;++w){
+            u32 z=0;
+            if(w<SW){const u64 v=u64(h[2*w])+(u64(h[2*w+1])<<16)+u64(alpha)*NPW[w]+OFW[w]+zc;z=u32(v);zc=v>>32;}
+            const u32 part=sh?((z<<sh)|(prevZ>>(32-sh))):z;
+            prevZ=z;
+            if(o+w<NW){const u64 s=u64(acc[o+w])+part+c+(w==inj?pend:0u);acc[o+w]=u32(s);c=s>>32;}
+        }
+        pend=u32(c);
+    }
+    {   // final pending carry enters word POS[7]/32+SW+1
+        constexpr u32 start=POS[7]/32+SW+1;u64 c=pend;
+        #pragma unroll
+        for(u32 w=0;w<NW;++w)if(w>=start){const u64 s=u64(acc[w])+c;acc[w]=u32(s);c=s>>32;}
+    }
+    constexpr u32 WO=W/32,WS=W%32;
+    #pragma unroll
+    for(u32 f=0;f<2;++f){
+        u64 c=0;
+        #pragma unroll
+        for(u32 w=0;w<NW;++w){
+            const u32 a_=w+WO<NW?acc[w+WO]:0,b_=w+WO+1<NW?acc[w+WO+1]:0;
+            const u32 hw=WS?((a_>>WS)|(b_<<(32-WS))):a_;
+            const u32 low=w<WO?acc[w]:(w==WO&&WS?(acc[w]&((1u<<WS)-1)):0);
+            const u64 s=u64(low)+u64(hw)*d+c;acc[w]=u32(s);c=s>>32;
+        }
+    }
+    u32 borrow=0;
+    #pragma unroll
+    for(u32 w=0;w<L;++w){const u64 s=u64(acc[w])-QW[w]-borrow;borrow=u32(s>>63);}
+    if(!borrow){
+        borrow=0;
+        #pragma unroll
+        for(u32 w=0;w<L;++w){const u64 s=u64(acc[w])-QW[w]-borrow;acc[w]=u32(s);borrow=u32(s>>63);}
+    }
+    borrow=0;
+    #pragma unroll
+    for(u32 w=0;w<L;++w){const u64 s=u64(acc[w])-BW[w]-borrow;acc[w]=u32(s);borrow=u32(s>>63);}
+    if(borrow){
+        u64 c=0;
+        #pragma unroll
+        for(u32 w=0;w<L;++w){const u64 s=u64(acc[w])+QW[w]+c;acc[w]=u32(s);c=s>>32;}
+    }
+    st=R;   // all residue reads of this (only) CRT warp are done
+    #pragma unroll
+    for(u32 w=0;w<L;++w)st[lane*L+w]=acc[w];
+    __syncwarp();
+    for(u32 x=lane;x<32*L;x+=32){const u32 rr=x/L,w=x-rr*L;__stcs(output+u64((h2+8u*rr)*256u+cc)*L+w,st[x]);}
+}
+#endif
 #if !defined(BPO_LEAN)
 extern "C" __global__ void __launch_bounds__(256) bpo_middle_smrv(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* ratios,const u64* untwist,const u64* stage_tw,const u64* stage_itw,u32 N,u32 logR,u32 untw){

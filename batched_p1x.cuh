@@ -10,6 +10,10 @@
 //            (the 2.3x redundant per-thread LDGs of the funnel-shift windows missed L1).
 //        512 (with 256) input halves staged with cp.async 16 B chunks (row stride 60 words, all chunks in flight).
 //        2048 (with 64) TMA output stores with an L2 evict_first policy (P2 re-reads them only after all primes are written).
+//        4096 lean base conversion (x = w + 2^16 z, hi = floor(x/2^14) exact, r = lo + q(-p) with -p from a constant table)
+//             and phase-A stores / cp.async / fragment reads through hoisted pointers with immediate offsets.
+//        8192 (with 64) phase B: warp w owns prime w>>1, digits 4(w&1)..+3 in groups of BPO_X_NC columns that share
+//             the stage and cross twiddles (xrdif6s); len-2 psi^0 stage fused into the cross twiddle (with 1).
 //  * corrections as unsigned min (s-p wraps above s when s<p): add = IADD3+IADD3+IMNMX, no ISETP/SEL;
 //  * DIF butterfly y' = shoup(x+p-y, w): Shoup accepts any 32-bit input, so the difference needs no reduction;
 //  * base-conversion reduction of x = Y0+Y1 2^8+Y2 2^16+Y3 2^24 (< 2^46) with a 32-bit Barrett step on
@@ -28,12 +32,19 @@
 #define BPO_X_HAS_TMA 0
 #endif
 #ifndef BPO_XF
-#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|512|2048):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
+#ifndef BPO_X_NC
+#define BPO_X_NC 2
+#endif
+#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|512|2048|4096|8192):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
 #endif
 #ifndef BPO_XV
 #define BPO_XV BPO_XF
 #endif
-struct __align__(64) XTMap{u64 w[16];};   // CUtensorMap (128 B) passed as __grid_constant__
+struct __align__(64) XTMap{u64 w[16];};
+struct XNegP{u32 v[BCRT_K];};
+__host__ __device__ constexpr XNegP xnegp_make(){XNegP a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=0u-P[i];return a;}
+__constant__ XNegP bpr_np=xnegp_make();   // -p mod 2^32 as an opaque constant: r = lo + q(-p) is one IMAD (ptxas re-derives -q from 0-p)
+   // CUtensorMap (128 B) passed as __grid_constant__
 __device__ __forceinline__ u32 xadd(u32 a,u32 b,u32 p){const u32 s=a+b;return min(s,s-p);}
 __device__ __forceinline__ u32 xsub(u32 a,u32 b,u32 p){const u32 d=a-b;return min(d,d+p);}
 __device__ __forceinline__ u32 xmsh(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u32(c>>32));const u32 r=x*u32(c)-q*p;return min(r,r-p);}
@@ -202,6 +213,90 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
         asm volatile("cp.async.bulk.commit_group;":::"memory");}
 #endif
 }
+// Flag 8192 phase B: NC columns of ONE prime (digits j..j+NC-1): stage twiddles and cross twiddles are loaded once and
+// shared by the NC columns; smem addresses as one hoisted pointer + immediates. Same values as xrdif6.
+template<u32 F,u32 NC>
+__device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm=0){
+    constexpr bool T=(F&1)!=0;
+    constexpr u32 XD=320u;
+    u32 v[NC][8];
+    const u32 l7=lane&7u;
+    {u32* const pb=base0+so+l7+72u*(lane>>3);   // skew(l7+64g) = l7+72g; +8m (m<4) / +8m+4 (m>=4)
+        #pragma unroll
+        for(u32 n=0;n<NC;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;++m)v[n][m]=pb[n*XD+8*m+4*(m>>2)];
+        u64 w64[4],w32[2];
+        #pragma unroll
+        for(u32 m=0;m<4;++m)w64[m]=st[192u+l7+8u*m];
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq)w32[qq]=st[224u+l7+8u*qq];
+        const u64 w16=st[240u+l7];
+        #pragma unroll
+        for(u32 m=0;m<4;++m)
+            #pragma unroll
+            for(u32 n=0;n<NC;++n)xbf(v[n][m],v[n][m+4],w64[m],p);   // len 64: j = row&31
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq)
+            #pragma unroll
+            for(u32 n=0;n<NC;++n)
+                #pragma unroll
+                for(u32 hh=0;hh<2;++hh)xbf(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p);   // len 32: j = row&15
+        #pragma unroll
+        for(u32 n=0;n<NC;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;m+=2)xbf(v[n][m],v[n][m+1],w16,p);   // len 16: j = row&7
+        #pragma unroll
+        for(u32 n=0;n<NC;++n)
+            #pragma unroll
+            for(u32 m=0;m<8;++m)pb[n*XD+8*m+4*(m>>2)]=v[n][m];
+    }
+    __syncwarp();
+    {const u32* const pr=base0+so+8*lane+4*(lane>>2);
+        #pragma unroll
+        for(u32 n=0;n<NC;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr+n*XD);const uint4 x0=p4[0],x1=p4[1];
+            v[n][0]=x0.x;v[n][1]=x0.y;v[n][2]=x0.z;v[n][3]=x0.w;v[n][4]=x1.x;v[n][5]=x1.y;v[n][6]=x1.z;v[n][7]=x1.w;}}
+    {u64 w8[4];
+        #pragma unroll
+        for(u32 lo=0;lo<4;++lo)w8[lo]=st[248u+lo];
+        const u64 w253=st[253u],w252=st[252u],w254=st[254u];
+        #pragma unroll
+        for(u32 lo=0;lo<4;++lo)
+            #pragma unroll
+            for(u32 n=0;n<NC;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}   // len 8 (st[248]=psi^0)
+        #pragma unroll
+        for(u32 k=0;k<4;++k)
+            #pragma unroll
+            for(u32 n=0;n<NC;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2)
+            #pragma unroll
+            for(u32 n=0;n<NC;++n)xbft<T>(v[n][lo],v[n][lo+1],w254,p);}
+    {const ulonglong2* c2=reinterpret_cast<const ulonglong2*>(ct+8*lane);
+        #pragma unroll
+        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=__ldg(c2+m2);
+            #pragma unroll
+            for(u32 n=0;n<NC;++n){v[n][2*m2]=xmsh(v[n][2*m2],u64(w.x),p);v[n][2*m2+1]=xmsh(v[n][2*m2+1],u64(w.y),p);}}}
+#if BPO_X_HAS_TMA
+    __syncwarp();
+    {const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);   // conflict-free quarter-warp phases
+        #pragma unroll
+        for(u32 n=0;n<NC;++n){
+            const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
+            uint4* const d=sd+n*(XD/4);
+            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}
+    asm volatile("fence.proxy.async.shared::cta;":::"memory");
+    __syncwarp();
+    if(lane==0&&BPO_XA!=8){
+        u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
+        if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
+        #pragma unroll
+        for(u32 n=0;n<NC;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
+            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
+            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa):"memory");}
+        asm volatile("cp.async.bulk.commit_group;":::"memory");}
+#endif
+}
 template<u32 F>
 __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
@@ -295,6 +390,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
             const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
+            const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
             const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
             #pragma unroll
@@ -308,10 +404,16 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                     #pragma unroll
                     for(u32 hf=0;hf<2;++hf){
                         const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];   // each < 2^21
+                        if(F&4096){   // x = w + 2^16 z (w, z < 2^30): hi = floor(x/2^14) exactly, r = lo + q(-p)
+                            const u32 w=y0+(y1<<8),z=y2+(y3<<8);
+                            const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
+                            const u32 q=__umulhi(hi,m62)>>16;
+                            res[2*mt+hf][j]=lo+q*np;
+                        }else{
                         const u32 lo=y0+(y1<<8)+(y2<<16)+(y3<<24);
                         const u32 hi=(y0>>14)+(y1>>6)+(y2<<2)+(y3<<10);
                         const u32 q=__umulhi(hi,m62)>>16;
-                        res[2*mt+hf][j]=lo-q*p;
+                        res[2*mt+hf][j]=lo-q*p;}
                     }
                 }
             }
@@ -328,6 +430,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
+                if(F&4096){u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // row 64rr+rl -> skewed 72rr+rl+4(rl>>5): immediate offsets
+                    #pragma unroll
+                    for(u32 rr=0;rr<4;++rr)
+                        #pragma unroll
+                        for(u32 j=0;j<8;++j)xa[j*XD+72*rr]=res[rr][j];
+                }else
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){const u32 row=64*rr+rl;
                     #pragma unroll
@@ -344,6 +452,14 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             }
         }
         __syncthreads();
+        if((F&8192)&&S6&&NW==8&&BPO_XA!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
+            constexpr u32 NC=BPO_X_NC;
+            const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
+            const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            #pragma unroll
+            for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;
+                xrdif6s<F,NC>(X+q*XS+j*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+j,stm);}
+        }else
         #pragma unroll 1
         for(u32 n=0;n<(BPO_XA==3?0u:32/NW);++n){   // (prime q, digit j) columns of the quad (ablation 3: none)
             const u32 ci=warp+NW*n,j=ci&7u,q=ci>>3,r=4*u+q;
