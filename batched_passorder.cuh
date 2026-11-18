@@ -890,33 +890,116 @@ template<bool CI>__device__ __forceinline__ void r16_dit16(u32 (&v)[16],const u6
     for(u32 j=0;j<8;++j){if(j)pzdit(v[j],v[j+8],t[16*j],p);else pzdit1(v[0],v[8],0,p);}
 }
 __device__ __forceinline__ constexpr u32 r16_brev4(u32 i){return ((i&1u)<<3)|((i&2u)<<1)|((i&4u)>>1)|((i&8u)>>3);}
-extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
+// Opt-in segment clocks (FHERMA_EXTRA_DEFINES="#define BPO_CLK 1"): per-warp clock64 deltas between code points,
+// summed over all warps of a launch; the last block of every 64th launch prints mean cycles per segment.
+// BPO_CLK_FENCE(x): branch on a value so the following clock read waits for it (load / arithmetic completion).
+#ifdef BPO_CLK
+__device__ unsigned long long bpo_clk_acc[2][16];__device__ unsigned int bpo_clk_done[2],bpo_clk_launch[2];
+#define BPO_CLK_DECL long long bpo_ck[12];u32 bpo_cn=0;
+#define BPO_CLK_FENCE(x) {if((x)==0x9e3779b9u)asm volatile("trap;");}
+#define BPO_CLK_MARK() {bpo_ck[bpo_cn++]=clock64();}
+__device__ __forceinline__ void bpo_clk_flush(u32 id,const long long* ck,u32 n){
+    if((threadIdx.x&31u)==0){for(u32 i=1;i<n;++i)atomicAdd(&bpo_clk_acc[id][i-1],(unsigned long long)(ck[i]-ck[i-1]));atomicAdd(&bpo_clk_acc[id][15],1ull);}
+    __syncthreads();
+    if(threadIdx.x==0){__threadfence();const u32 nb=gridDim.x*gridDim.y*gridDim.z;
+        if(atomicAdd(&bpo_clk_done[id],1u)==nb-1){const u32 L=atomicAdd(&bpo_clk_launch[id],1u);
+            if((L&63u)==7u){const double w=double(bpo_clk_acc[id][15]);printf("BPO_CLK k%u L%u warps %.0f seg:",id,L,w);
+                for(u32 i=0;i+1<n;++i)printf(" %.0f",double(bpo_clk_acc[id][i])/w);printf("\n");}
+            for(u32 i=0;i<16;++i)bpo_clk_acc[id][i]=0;__threadfence();bpo_clk_done[id]=0;}}
+}
+#define BPO_CLK_FLUSH(id) bpo_clk_flush(id,bpo_ck,bpo_cn);
+#else
+#define BPO_CLK_DECL
+#define BPO_CLK_FENCE(x)
+#define BPO_CLK_MARK()
+#define BPO_CLK_FLUSH(id)
+#endif
+__device__ __forceinline__ u32 bpo_xr16(const u32 (&v)[16]){u32 x=0;
+    #pragma unroll
+    for(u32 i=0;i<16;++i)x^=v[i];return x;}
+__device__ __forceinline__ u32 bpo_xr8(const u32 (&v)[8]){u32 x=0;
+    #pragma unroll
+    for(u32 i=0;i<8;++i)x^=v[i];return x;}
+#ifndef BPO_R16ABL
+#define BPO_R16ABL 0   // ablations (wrong values): 1 synthetic loads, 2 no stores, 4 no barriers, 8 no smem exchange, 16 fixed twiddles
+#endif
+#define BPO_R16SYNC() {if(!(BPO_R16ABL&12))__syncthreads();}
+#define BPO_R16ST if(!(BPO_R16ABL&8))
+#define BPO_R16LD(x,keep) ((BPO_R16ABL&8)?(keep):(x))
+#ifndef BPO_R16T
+#define BPO_R16T 1   // P2 r16 tiles (8-slot groups) per block, processed sequentially (grid x = 32/BPO_R16T)
+#endif
+#ifndef BPO_R16PF
+#define BPO_R16PF 0   // 1: L2 bulk prefetch of the next tile while the current one computes
+#endif
+__device__ __forceinline__ void bpo_prefetch_l2(const void* g,u32 bytes){
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__>=900
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0],%1;"::"l"(g),"r"(bytes):"memory");
+#endif
+}
+#ifndef BPO_R16V
+#define BPO_R16V 0   // P2 r16 transposes with 128-bit row accesses: rows of 16 words, 4-word chunks XOR-swizzled by row&3,
+#endif               // slot stride 260 (= 4 mod 32); scalar column accesses and LDS.128/STS.128 row accesses both conflict-free
+// element (row r, column c) of a slot tile: 16 r + 4 ((c>>2) ^ (r&3)) + (c&3). Hoisted pointers (constant offsets per element):
+// pc[k] = t + 4((c>>2)^k) + (c&3) (column c, rows r = k mod 4 at +16 r), pr[q] = t + 16 c + 4 (q ^ (c&3)) (row c, chunk q).
+struct R16V{u32* pc[4];u32* pr[4];
+    __device__ __forceinline__ R16V(u32* t,u32 c){
+        #pragma unroll
+        for(u32 k=0;k<4;++k){pc[k]=t+4u*((c>>2)^k)+(c&3u);pr[k]=t+16u*c+4u*(k^(c&3u));}}
+    __device__ __forceinline__ void cst(u32 x,u32 r)const{pc[r&3u][16u*r]=x;}
+    __device__ __forceinline__ u32 cld(u32 r)const{return pc[r&3u][16u*r];}
+    __device__ __forceinline__ void rld(u32 (&v)[16])const{
+        #pragma unroll
+        for(u32 q=0;q<4;++q){const uint4 x=*reinterpret_cast<const uint4*>(pr[q]);v[4*q]=x.x;v[4*q+1]=x.y;v[4*q+2]=x.z;v[4*q+3]=x.w;}}
+    __device__ __forceinline__ void rst(const u32 (&v)[16])const{
+        #pragma unroll
+        for(u32 q=0;q<4;++q)*reinterpret_cast<uint4*>(pr[q])=make_uint4(v[4*q],v[4*q+1],v[4*q+2],v[4*q+3]);}
+};
+#ifndef BPO_P2MINB
+#define BPO_P2MINB 8   // 8: 64 regs, 8 blocks/SM (ptxas default 56 regs/9 blocks): 13.24 vs 13.70 us (gz=2), 51.3 vs 51.8 (gz=8)
+#endif
+#if BPO_P2MINB
+#define BPO_P2LB __launch_bounds__(128,BPO_P2MINB)
+#else
+#define BPO_P2LB __launch_bounds__(128)
+#endif
+extern "C" __global__ void BPO_P2LB bpo_middle_r16(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
-    __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
-    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    __shared__ __align__(16) u32 TA[BPO_R16V?8*260:8*292];   // one transpose buffer (A, then B, then the inverse): 8.3 KB (V) / 9.3 KB
+    const u32 j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
     const u64 base=u64(prime*8+j)*N;
-    u32 a[16],b[16];
+    BPO_CLK_DECL
+    #pragma unroll 1
+    for(u32 tt=0;tt<BPO_R16T;++tt){const u32 g=blockIdx.x*BPO_R16T+tt;
+    if(tt)BPO_R16SYNC();   // previous tile's inverse-transpose reads done
+    if((BPO_R16PF&1)&&tt+1<BPO_R16T&&threadIdx.x<2u)bpo_prefetch_l2((threadIdx.x?B:A)+base+(g+1u)*2048u,8192u);
+    u32 a[16],b[16];BPO_CLK_MARK()
     {   const u32* a0=A+base+g*2048u+c2*8u+s;const u32* b0=B+base+g*2048u+c2*8u+s;
         #pragma unroll
-        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
+        for(u32 c1=0;c1<16;++c1){if(BPO_R16ABL&1){a[c1]=(threadIdx.x*16u+c1+g)&0x3fffffffu;b[c1]=(threadIdx.x*7u+c1*3u+j)&0x3fffffffu;}else if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
     }
+    BPO_CLK_FENCE(bpo_xr16(a)^bpo_xr16(b)) BPO_CLK_MARK()
     r16_dif16(a,tf,p);r16_dif16(b,tf,p);
-    u32* const ta=TA+s*292u;
+    u32* const ta=TA+s*(BPO_R16V?260u:292u);u32* const tcol=ta+c2;u32* const trow=ta+17u*c2;const R16V tv(ta,c2);   // hoisted: constant smem offsets per element
     #pragma unroll
-    for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+    for(u32 i=1;i<16;++i){const u64 w=(BPO_R16ABL&16)?(u64(i*0x1234567u)|(u64(i*777u)<<32)):__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+    BPO_CLK_FENCE(bpo_xr16(a)^bpo_xr16(b)) BPO_CLK_MARK()
     #pragma unroll
-    for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
-    __syncthreads();
+    for(u32 i=0;i<16;++i){if(BPO_R16V)tv.cst(a[i],i);else BPO_R16ST tcol[17*i]=a[i];}
+    BPO_R16SYNC();
     #pragma unroll
-    for(u32 i=0;i<16;++i)a[i]=ta[17*c2+i];   // thread row t = c2: k1 = brev4(c2)
-    __syncthreads();
+    if(BPO_R16V)tv.rld(a);else
+    for(u32 i=0;i<16;++i)a[i]=BPO_R16LD(trow[i],a[i]);   // thread row t = c2: k1 = brev4(c2)
+    BPO_R16SYNC();
     #pragma unroll
-    for(u32 i=0;i<16;++i)ta[17*i+c2]=b[i];
-    __syncthreads();
+    for(u32 i=0;i<16;++i){if(BPO_R16V)tv.cst(b[i],i);else BPO_R16ST tcol[17*i]=b[i];}
+    BPO_R16SYNC();
     #pragma unroll
-    for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
+    if(BPO_R16V)tv.rld(b);else
+    for(u32 i=0;i<16;++i)b[i]=BPO_R16LD(trow[i],b[i]);
+    BPO_CLK_FENCE(bpo_xr16(a)^bpo_xr16(b)) BPO_CLK_MARK()
     r16_dif16(a,tf,p);r16_dif16(b,tf,p);
     {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
         #pragma unroll
@@ -924,18 +1007,24 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
     r16_dit16<true>(a,ti,p);
     {const u32 k1=r16_brev4(c2);
         #pragma unroll
-        for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],__ldg(ti+((i*k1)&255u)),p);   // natural c2' = i
+        for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],(BPO_R16ABL&16)?(u64(i*0x1234567u)|(u64(i*777u)<<32)):__ldg(ti+((i*k1)&255u)),p);   // natural c2' = i
         a[0]=pzred(a[0],p);}   // all canonical for the second DIT16 (CI)
-    __syncthreads();   // forward reads of TA done
+    BPO_CLK_FENCE(bpo_xr16(a)) BPO_CLK_MARK()
+    BPO_R16SYNC();   // forward reads of TA done
     #pragma unroll
-    for(u32 i=0;i<16;++i)ta[17*c2+i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
-    __syncthreads();
+    if(BPO_R16V)tv.rst(a);else
+    for(u32 i=0;i<16;++i)BPO_R16ST trow[i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
+    BPO_R16SYNC();
     #pragma unroll
-    for(u32 i=0;i<16;++i)a[i]=ta[17*i+c2];   // register i = row i -> k1 = brev4(i): bit-reversed input
+    for(u32 i=0;i<16;++i)a[i]=BPO_R16V?tv.cld(i):BPO_R16LD(tcol[17*i],a[i]);   // register i = row i -> k1 = brev4(i): bit-reversed input
+    BPO_CLK_FENCE(bpo_xr16(a)) BPO_CLK_MARK()
     r16_dit16<true>(a,ti,p);
+    BPO_CLK_FENCE(bpo_xr16(a)) BPO_CLK_MARK()
     u32* o=C+base+c2*256u+g*8u+s;
     #pragma unroll
-    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+    for(u32 c1=0;c1<16;++c1){if(!(BPO_R16ABL&2)||a[c1]==0xffffffffu)o[4096u*c1]=a[c1];}
+    }
+    BPO_CLK_MARK() BPO_CLK_FLUSH(0)
 }
 // P3 radix-16 (bpo_last_r16, FHERMA_P3R16): same values as bpo_last_cm3 (BPO_P3T 260). Block (column c, prime), 128 threads.
 // Phase J: thread t owns slots t and t+128: 8 digit words each (coalesced), F (cross untwiddle * t1) Shoup product,
@@ -1320,6 +1409,9 @@ __device__ __forceinline__ void bpo_bar_wait(u64* bar,u32 parity){
 #define BPO_P3TV BPO_P3T
 #endif
 // P3 with the shuffle-free DIT (skewed exchange tile, layout-3 entry); same values as bpo_last_cm2.
+#ifndef BPO_P3TN
+#define BPO_P3TN 1   // P3 t2n loads: 0 in the store loop (serialized behind the stores), 1 batched before the stores, 2 before the R-DIT
+#endif
 template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     constexpr u32 T=BPO_HAS_BULK?T0:0u;   // T0&16: ablation, no arithmetic (wrong values)
@@ -1328,7 +1420,9 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
     const u64* sit=stage_itw+prime*256u;
     const u32* src=C+u64(prime*8)*N+c*256u+t;
-    u32 yv[8];
+    const u64* tn=(dfl&2)?t2n+u64(prime*8+warp)*512u+(c>>7)+2u*lane:t2n+u64(prime*8+warp)*512u+(c>>7)*256u+lane;const u32 ts=(dfl&2)?64u:32u;   // dfl 2: old interleaved layout (A/B only)
+    u64 tv[8];   // BPO_P3TN: t2n words loaded ahead (the D stores would otherwise serialize each LDG behind the previous STG)
+    u32 yv[8];BPO_CLK_DECL BPO_CLK_MARK()
     if(T&2){
         if(t==0){bpo_bar_init(bar,1);bpo_bar_expect(bar,8192u);
             #pragma unroll
@@ -1344,6 +1438,7 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
         const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
         F=u64(wv)|(u64(q)<<32);
     }
+    BPO_CLK_FENCE(u32(F)^u32(F>>32)) BPO_CLK_MARK()
     if(T&2){
         bpo_bar_wait(bar,0);
         #pragma unroll
@@ -1356,6 +1451,7 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=src[u64(d)*N];
     }
+    BPO_CLK_FENCE(bpo_xr8(yv)) BPO_CLK_MARK()
     if((BPO_P3ABL!=1&&!(T0&16))&&(T0&4)){
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=pxmsh(yv[d],F,p);
@@ -1380,21 +1476,31 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
         for(u32 d=0;d<8;++d)yv[d]=mul_shoup(yv[d],F,p);
         BPO_JDIT(yv,sit)
     }
+    if(BPO_P3TN==2){
+        #pragma unroll
+        for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+ts*m);}
+    BPO_CLK_FENCE(bpo_xr8(yv)) BPO_CLK_MARK()
     #pragma unroll
     for(u32 d=0;d<8;++d)X[d*288+t+4*(t>>5)]=yv[d];
-    __syncthreads();
+    __syncthreads();BPO_CLK_MARK()
     if((dfl&1)&&lane<8u)bpo_discard(C+u64(prime*8+lane)*N+c*256u+32u*warp);   // C lines read by this warp (all used)
     u32 v[8];
     u32* base=X+warp*288;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+8*lane+4*(lane>>2));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
     if((BPO_P3ABL!=1&&!(T0&16))){if(T0&128){}else if((T0&4)&&(T0&256))pzdit_smr<false>(base,v,sit,p,lane);else if(T0&4)pxdit_smr<true>(base,v,sit,p,lane);else bpo_dit_smr(base,v,sit,p,lane);}
-    const u64* tn=(dfl&2)?t2n+u64(prime*8+warp)*512u+(c>>7)+2u*lane:t2n+u64(prime*8+warp)*512u+(c>>7)*256u+lane;const u32 ts=(dfl&2)?64u:32u;   // dfl 2: old interleaved layout (A/B only)
+    BPO_CLK_FENCE(bpo_xr8(v)) BPO_CLK_MARK()
+    if(BPO_P3TN==1){
+        #pragma unroll
+        for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+ts*m);}
+    if(BPO_P3TN==0){
+        #pragma unroll
+        for(u32 m=0;m<8;++m)tv[m]=0;}
     u32* out=D+u64(prime*8+warp)*N+c*256u+lane;
     if(T&1){
         __syncwarp();
         #pragma unroll
-        for(u32 m=0;m<8;++m)base[lane+32*m]=mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)base[lane+32*m]=mul_shoup(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);
         bpo_fence_async();
         __syncwarp();
         if(lane==0){bpo_bulk_store(out,base,1024u);bpo_bulk_commit();bpo_bulk_wait_read();}
@@ -1403,26 +1509,35 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
         for(u32 m=0;m<8;++m)out[32*m]=v[m];
     }else if(BPO_P3ABL==2){
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=mul_shoup(v[m],tn[ts*m],p);if(r==0xffffffffu)out[32*m]=r;}
+        for(u32 m=0;m<8;++m){const u32 r=mul_shoup(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);if(r==0xffffffffu)out[32*m]=r;}
     }else if(T0&8){   // residues stay in L2 for the CRT (evict_last policy)
         u64 pol;asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=(T0&4)?pxmsh(v[m],tn[ts*m],p):mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m){const u32 r=(T0&4)?pxmsh(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p):mul_shoup(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);
             asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
     }else if((T0&4)&&(dfl&4)){   // dfl 4 (runtime, prime-group P1): residues L2 evict_first (the CRT reads them only after all groups)
         u64 pol;asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);
             asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
     }else if(T0&4){
         #pragma unroll
-        for(u32 m=0;m<8;++m)out[32*m]=pxmsh(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)out[32*m]=pxmsh(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);
     }else{
         #pragma unroll
-        for(u32 m=0;m<8;++m)out[32*m]=mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)out[32*m]=mul_shoup(v[m],(BPO_P3TN?tv[m]:tn[ts*m]),p);
     }
+    BPO_CLK_MARK() BPO_CLK_FLUSH(1)
 }
-extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
+#ifndef BPO_P3MINB
+#define BPO_P3MINB 0   // >0: __launch_bounds__(256,BPO_P3MINB) (5: 48 regs, neutral locally)
+#endif
+#if BPO_P3MINB
+#define BPO_P3LB __launch_bounds__(256,BPO_P3MINB)
+#else
+#define BPO_P3LB __launch_bounds__(256)
+#endif
+extern "C" __global__ void BPO_P3LB bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
     bpo_p3_body<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);

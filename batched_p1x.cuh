@@ -14,6 +14,9 @@
 //             and phase-A stores / cp.async / fragment reads through hoisted pointers with immediate offsets.
 //        8192 (with 64) phase B: warp w owns prime w>>1, digits 4(w&1)..+3 in groups of BPO_X_NC columns that share
 //             the stage and cross twiddles (xrdif6s); len-2 psi^0 stage fused into the cross twiddle (with 1).
+//        16384 (with 8192) L1 prefetch of the warp's phase-B cross twiddles at the quad start (off: no gain measured).
+//        32768 (with 64, without 4) quad barrier just before the phase-A stores: phase-A math overlaps the previous quad's phase B.
+//        65536 (with 8192) phase-B TMA staging stores without the e0/e1 value swap (2-way bank conflict instead of 16 SELs per pair).
 //  * corrections as unsigned min (s-p wraps above s when s<p): add = IADD3+IADD3+IMNMX, no ISETP/SEL;
 //  * DIF butterfly y' = shoup(x+p-y, w): Shoup accepts any 32-bit input, so the difference needs no reduction;
 //  * base-conversion reduction of x = Y0+Y1 2^8+Y2 2^16+Y3 2^24 (< 2^46) with a 32-bit Barrett step on
@@ -35,7 +38,7 @@
 #ifndef BPO_X_NC
 #define BPO_X_NC 2
 #endif
-#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|512|2048|4096|8192):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
+#define BPO_XF (BPO_X_HAS_TMA?(1|2|64|128|256|512|2048|4096|8192|32768|65536):1)   // flags 64/128 assume the TMA path; 256 coalesced input staging; 2048 evict_first stores
 #endif
 #ifndef BPO_XV
 #define BPO_XV BPO_XF
@@ -292,10 +295,11 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         for(u32 n=0;n<NC;++n){
             const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
             uint4* const d=sd+n*(XD/4);
-            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}
+            if(F&65536){uint4* const d0=reinterpret_cast<uint4*>(base0+8*lane)+n*(XD/4);d0[0]=e0;d0[1]=e1;}   // flag 65536: no value swap (2-way bank conflict, no SELs)
+            else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8){
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -316,7 +320,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
-    const u32* src=(op?b:a)+u64(c)*L;
+    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
     if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
@@ -329,7 +333,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
-    const u32 xoff=(c*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
+    const u32 xoff=((BPO_XA==11?0u:c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
     const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
         u32 mk[8][2];   // flag 4096: per-thread masks of the partial fragment words (clamped funnel shift: 2^wd-1, 0 or ~0)
@@ -414,11 +418,18 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stride=weighted_root_stride(N);
     u64* STS=reinterpret_cast<u64*>(X+4*XS);   // flag 4: the quad's stage tables (4 x 256 u64)
     #pragma unroll 1
+    // flag 32768 (S6, without 4): the quad barrier moves from the loop top to just before the phase-A stores into X, so a
+    // warp's phase-A math (MMA, reduction, twist, J-DIF, R-DIF 256/128) overlaps the other warps' phase B of the previous quad.
+    constexpr bool LB=(F&32768)&&!(F&4)&&S6&&BPO_XA!=4&&BPO_XA!=5;
     for(u32 u=r0/4;u<r1/4;++u){
-        __syncthreads();   // previous quad's R-DIF reads of X (and STS) done
+        if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
             #pragma unroll
             for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t(4*u+q)*256+h];
+        }
+        if((F&16384)&&(F&8192)&&S6&&NW==8){   // flag 16384: phase-B cross twiddles of this warp's prime pulled into L1 now (L2 latency off phase B)
+            const u64* const ctp=ctab+(size_t(4*u+(warp>>1))*256u+c)*256u+8u*lane;
+            asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
             const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
@@ -462,6 +473,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
+                if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
                 if(F&4096){u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // row 64rr+rl -> skewed 72rr+rl+4(rl>>5): immediate offsets
                     #pragma unroll
                     for(u32 rr=0;rr<4;++rr)
