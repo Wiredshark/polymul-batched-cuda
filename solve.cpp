@@ -771,7 +771,7 @@ struct State {
     // (FHERMA_GFLAGS overrides): 1 plain P1 stores (no evict_first), 2 P1 stores evict_last, 4 P1 input loads normal on
     // all but the last group (input kept in L2 for the re-read), 8 P3 residues of all but the last group stored evict_first
     // (the CRT reads them only after the last group; the last group's residues stay normal so the CRT can hit them in L2).
-    static constexpr u32 WAVE_PDL=0,WAVE_SLICE=1,WAVE_SLICE_CHAINS=0;   // WAVE_SLICE products per launch; WAVE_SLICE_CHAINS (0 = keep) chains when slicing
+    static constexpr u32 WAVE_PDL=15,WAVE_SLICE=1,WAVE_SLICE_CHAINS=0;   // WAVE_SLICE products per launch; WAVE_SLICE_CHAINS (0 = keep) chains when slicing
     u32 ws_k[4]{};
     u32 slice_req(){if(const char* e=std::getenv("FHERMA_SLICE"))return std::max(1,std::atoi(e));return big_part()?WAVE_SLICE:1u;}static constexpr const char* WAVE_PRIO="";   // launch attributes (see build_graph)
     static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4;   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
