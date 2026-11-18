@@ -5,6 +5,9 @@
 // min of R timed reps (cudaEvent), after 2 warm-up reps. "cold" = a 2xL2 write flush before every rep.
 // FHERMA_DIAG=0 disables (also drops the BPO_DIAG kernels from the module). Clobbers the workspaces only.
 #include "kprof.h"
+#include "diag_mb.h"
+#include <nvrtc.h>
+#include <string>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -53,6 +56,49 @@ template<class C> struct Diag {
         if(bytes>0)std::printf("{\"diag\":\"%s\",\"med_ms\":%.4f,\"min_ms\":%.4f,\"GBps_med\":%.1f}\n",name,med,mn,bytes/med*1e-6);
         else std::printf("{\"diag\":\"%s\",\"med_ms\":%.4f,\"min_ms\":%.4f}\n",name,med,mn);
         ++lines;std::fflush(stdout);}
+    // Instruction / butterfly micro-benchmarks (diag_mb.h): one block of 1024 threads per SM, cycles from clock64 (max over
+    // SMs), SM clock from cycles/event-time. Prefers a native cubin for the device cc, falls back to compute_80 PTX.
+    void run_mb(){
+        if(std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()>6.0){std::printf("{\"diag\":\"mb\",\"skipped\":\"time budget\"}\n");return;}
+        CUmodule mod=nullptr;CUdeviceptr o=0,c=0;
+        try{
+            int cc1=0,cc2=0;if(kp.dattr){kp.dattr(&cc1,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,0);kp.dattr(&cc2,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,0);}
+            nvrtcProgram pr=nullptr;if(d.nvrtcCreateProgram(&pr,kDiagMbSource,"diag_mb.cu",0,nullptr,nullptr)!=NVRTC_SUCCESS)throw std::runtime_error("mb nvrtc create");
+            auto gsz=d.rtc.template get<nvrtcResult(*)(nvrtcProgram,size_t*)>("nvrtcGetCUBINSize");auto gcub=d.rtc.template get<nvrtcResult(*)(nvrtcProgram,char*)>("nvrtcGetCUBIN");
+            std::vector<char> img;bool native=false;
+            {std::string a="--gpu-architecture=sm_"+std::to_string(cc1*10+cc2);const char* op[]={a.c_str(),"--std=c++17"};
+             if(cc1>=8&&d.nvrtcCompileProgram(pr,2,op)==NVRTC_SUCCESS){size_t n=0;if(gsz(pr,&n)==NVRTC_SUCCESS&&n){img.resize(n);if(gcub(pr,img.data())==NVRTC_SUCCESS)native=true;else img.clear();}}}
+            if(!native){d.nvrtcDestroyProgram(&pr);pr=nullptr;d.nvrtcCreateProgram(&pr,kDiagMbSource,"diag_mb.cu",0,nullptr,nullptr);
+                const char* op[]={"--gpu-architecture=compute_80","--std=c++17"};
+                if(d.nvrtcCompileProgram(pr,2,op)!=NVRTC_SUCCESS){size_t n=0;d.nvrtcGetProgramLogSize(pr,&n);std::string l(n,'\0');d.nvrtcGetProgramLog(pr,l.data());d.nvrtcDestroyProgram(&pr);throw std::runtime_error("mb nvrtc: "+l);}
+                size_t n=0;d.nvrtcGetPTXSize(pr,&n);img.resize(n);d.nvrtcGetPTX(pr,img.data());}
+            d.nvrtcDestroyProgram(&pr);
+            d.check(d.cuModuleLoadData(&mod,img.data()));
+            d.check(d.cuMemAlloc(&o,size_t(sms)*1024*4));d.check(d.cuMemAlloc(&c,size_t(sms)*8));
+            std::printf("{\"diag\":\"mb_info\",\"sms\":%d,\"cc\":\"%d.%d\",\"native_cubin\":%s,\"threads\":1024}\n",sms,cc1,cc2,native?"true":"false");
+            struct K{const char* fn;const char* name;const char* key;double ops;int kind;};   // kind 0: thread-ops, 1: int8 mma, 2: butterflies
+            static const K ks[]={{"mb0","mb_imad","per_sm_clk",8,0},{"mb1","mb_imad_hi","per_sm_clk",8,0},{"mb2","mb_iadd3","per_sm_clk",8,0},{"mb3","mb_shoup_mulmod","per_sm_clk",8,0},
+                {"mb4","mb_ffma","per_sm_clk",4,0},{"mb5","mb_imma_s8_m16n8k32","int8_mac_per_sm_clk",0,1},{"mb6","mb_min_add_sub","per_sm_clk",8,0},{"mb7","mb_imad_wide_xor","per_sm_clk",4,0},
+                {"mb8","mb_imad4_lop3_4","per_sm_clk",8,0},{"mb9","mb_lop3","per_sm_clk",8,0},{"mb10","mb_add_asm","per_sm_clk",8,0},{"mb11","mb_min_asm","per_sm_clk",8,0},
+                {"mb12","mb_ffma_asm","per_sm_clk",8,0},{"mb13","mb_ffma4_lop3_4","per_sm_clk",8,0},{"mb14","mb_viaddmnmx","per_sm_clk",8,0},{"mb15","mb_add_then_min","per_sm_clk",8,0},
+                {"mb16","mb_xadd","per_sm_clk",8,0},{"mb17","mb_imad4_min4","per_sm_clk",8,0},{"mb18","mb_imad4_ffma4","per_sm_clk",8,0},{"mb19","mb_add_imm","per_sm_clk",8,0},
+                {"mb20","mb_shl_imm","per_sm_clk",8,0},{"mb21","mb_setp_selp","per_sm_clk",8,0},{"mb22","mb_prmt","per_sm_clk",8,0},
+                {"bf0","bf_current","bfly_per_sm_clk",8,2},{"bf1","bf_harvey","bfly_per_sm_clk",8,2}};
+            for(const auto& k:ks){
+                if(std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()>9.0){std::printf("{\"diag\":\"%s\",\"skipped\":\"time budget\"}\n",k.name);continue;}
+                CUfunction fn=nullptr;if(d.cuModuleGetFunction(&fn,mod,k.fn)!=CUDA_SUCCESS){std::printf("{\"diag\":\"%s\",\"skipped\":\"no kernel\"}\n",k.name);continue;}
+                const double iters=k.kind==2?2048.0:4096.0;unsigned long long best=~0ull;double mhz=0;
+                for(int r=0;r<6;++r){
+                    unsigned seed=3+r;void* pp[]={&o,&c,&seed};
+                    kp.erecord(ev0,s[0]);d.check(d.cuLaunchKernel(fn,unsigned(sms),1,1,1024,1,1,0,s[0],pp,nullptr));kp.erecord(ev1,s[0]);d.check(esync(ev1));
+                    std::vector<unsigned long long> h(sms);d.check(d.cuMemcpyDtoH(h.data(),c,size_t(sms)*8));unsigned long long mx=0;for(auto v:h)mx=std::max(mx,v);
+                    if(r==0||mx==0)continue;best=std::min(best,mx);const double ms=kp.ms(ev0,ev1);if(ms>0)mhz=std::max(mhz,double(mx)/ms*1e-3);}
+                if(best==~0ull){std::printf("{\"diag\":\"%s\",\"skipped\":\"no cycles\"}\n",k.name);continue;}
+                const double v=k.kind==1?1024.0/32*4096*4*(16*8*32)/double(best):1024.0*iters*k.ops/double(best);
+                std::printf("{\"diag\":\"%s\",\"%s\":%.2f,\"clk_mhz\":%.0f}\n",k.name,k.key,v,mhz);std::fflush(stdout);}
+        }catch(const std::exception& e){std::printf("{\"diag\":\"mb_error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+        d.cuCtxSynchronize();if(c)d.cuMemFree(c);if(o)d.cuMemFree(o);if(mod)d.cuModuleUnload(mod);
+    }
     void run(size_t in_bytes,size_t out_bytes){
         if(kp.last.empty()||!d.diag_bw)return;
         const auto& tr=kp.traces[kp.last.back().variant];
@@ -106,5 +152,5 @@ template<class C> struct Diag {
 };
 template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes){
     if(!diag_env()||!c.kp.enabled||!c.kp.pinfo||!c.diag_bw)return;
-    try{Diag<C> dg(c);dg.run(in_bytes,out_bytes);}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+    try{Diag<C> dg(c);dg.run_mb();dg.run(in_bytes,out_bytes);}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
 }
