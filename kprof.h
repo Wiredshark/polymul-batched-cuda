@@ -26,7 +26,7 @@ struct KProf {
     decltype(&::cuEventRecordWithFlags) erecordf=nullptr; decltype(&::cuEventElapsedTime) elapsed=nullptr;
     decltype(&::cuEventDestroy) edestroy=nullptr; decltype(&::cuOccupancyMaxActiveBlocksPerMultiprocessor) occ=nullptr;
     decltype(&::cuFuncGetAttribute) fattr=nullptr; decltype(&::cuDeviceGetAttribute) dattr=nullptr; decltype(&::cuDeviceGetName) dname=nullptr;
-    bool enabled=true,capturing=false,pending=false,reported=false;int variant=-1,product=-1,chain=-1,last_err=0;
+    bool enabled=false,capturing=false,pending=false,reported=false;int variant=-1,product=-1,chain=-1,last_err=0;
     std::vector<Name> names; std::vector<Trace> traces[8]; std::vector<int> seen;
     CUevent ref0=nullptr,ref1=nullptr; int pending_variant=-1; double pending_wall=0; unsigned long long calls=0;
     std::chrono::steady_clock::time_point t0;
@@ -35,7 +35,7 @@ struct KProf {
     // NVML (optional): current SM / memory clocks after each run
     void* nvml=nullptr; void* nvdev=nullptr; int (*nv_clock)(void*,int,unsigned*)=nullptr;
     template<class D> void init(D& driver){
-        if(const char* e=std::getenv("FHERMA_KPROF"))enabled=*e!='0';
+        if(const char* e=std::getenv("FHERMA_KPROF"))enabled=*e!='0';   // default off (pv53 batch sweep noev 0.988 on target: no event nodes in the timed graph); FHERMA_KPROF=1 on
         ecreate=driver.template get<decltype(ecreate)>("cuEventCreate");erecord=driver.template get<decltype(erecord)>("cuEventRecord");
         erecordf=driver.template get<decltype(erecordf)>("cuEventRecordWithFlags");elapsed=driver.template get<decltype(elapsed)>("cuEventElapsedTime_v2");
         if(!elapsed)elapsed=driver.template get<decltype(elapsed)>("cuEventElapsedTime");
