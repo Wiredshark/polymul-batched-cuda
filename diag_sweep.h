@@ -19,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <cmath>
+#include "crt_sweep_src.h"   // CRT_SWEEP_SOURCE: sweep-only CRT variants (crt_sweep.cuh)
 
 inline bool sweep_env(){const char* e=std::getenv("FHERMA_SWEEP");return !e||*e!='0';}
 
@@ -58,8 +59,10 @@ template<class C> struct Sweep {
         static const std::pair<const char*,const char*> crt_ld={"                a[m][s][0]=base[0];a[m][s][1]=base[8];\n                a[m][s][2]=base[u64(4)*8*N];a[m][s][3]=base[u64(4)*8*N+8];\n",
              "                a[m][s][0]=__ldcs(base);a[m][s][1]=__ldcs(base+8);\n                a[m][s][2]=__ldcs(base+u64(4)*8*N);a[m][s][3]=__ldcs(base+u64(4)*8*N+8);\n"};
         const bool has_crt_hl=has_crt&&twin(crt_head,"template<int SWMB> __global__ void __launch_bounds__(128,SWMB) sw_crt_hl(",{crt_hl[0],crt_hl[1]});
-        const bool has_crt_ld=has_crt&&twin(crt_head,"template<int SWMB> __global__ void __launch_bounds__(128,SWMB) sw_crt_ld(",{crt_ld});
-        const bool has_crt_hlld=has_crt&&twin(crt_head,"template<int SWMB> __global__ void __launch_bounds__(128,SWMB) sw_crt_hlld(",{crt_hl[0],crt_hl[1],crt_ld});
+        // round 3 ablation: production CRT with synthetic residues (no residue loads; values wrong by design) = its compute-only time
+        static const std::pair<const char*,const char*> crt_nold={crt_ld.first,
+             "                {const u32 z=(i0+16*m+gid)*2654435761u+(j*16+r)*40503u;(void)base;a[m][s][0]=z&0x7fffffffu;a[m][s][1]=(z*747796405u)&0x7fffffffu;a[m][s][2]=(z^0x5bd1e995u)&0x7fffffffu;a[m][s][3]=(z*2891336453u+7u)&0x7fffffffu;}\n"};
+        const bool has_crt_nold=has_crt&&twin(crt_head,"template<int SWMB> __global__ void __launch_bounds__(128,SWMB) sw_crt_nold(",{crt_nold});
         {const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
         s+="\n#define SWP1(NAME,F,MB) extern \"C\" __global__ void __launch_bounds__((((F)&8u)?512:256),MB) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){__shared__ __align__(128) u32 X[BPO_X_SMEM(F)/4];bpo_first_xb<(F)>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}\n"
            "#define SWP3(NAME,T,LB) extern \"C\" __global__ void __launch_bounds__ LB NAME(const u32* C,u32* D,const u32* primes,const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){__shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;bpo_p3_body<(T)>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);}\n";
@@ -95,22 +98,30 @@ template<class C> struct Sweep {
             int k=0;for(const auto& x:p3v){const std::string kn="sw_p3_"+std::to_string(k++);progs[size_t(pi)].src+="SWP3("+kn+","+x.t+","+x.lb+")\n";addv(KProf::P3,x.n,pi,addk(pi,kn,false));}
 }
         if(has_crt){const int pi=prog("crt",arch);addv(KProf::CRT,"ctrl",pi,addk(pi,"bpo_crt_tc_cm<0>",true));
-            if(has_crt_hl)for(int mb:{2,3})addv(KProf::CRT,"hl_mb"+std::to_string(mb),pi,addk(pi,"sw_crt_hl<"+std::to_string(mb)+">",true));
-            if(has_crt_ld)addv(KProf::CRT,"ld_mb3",pi,addk(pi,"sw_crt_ld<3>",true));
-            if(has_crt_hlld)for(int mb:{3})addv(KProf::CRT,"hlld_mb"+std::to_string(mb),pi,addk(pi,"sw_crt_hlld<"+std::to_string(mb)+">",true));}
+            if(has_crt_hl)addv(KProf::CRT,"hl_mb3",pi,addk(pi,"sw_crt_hl<3>",true));
+            if(has_crt_nold)addv(KProf::CRT,"abl_nold_prod",pi,addk(pi,"sw_crt_nold<3>",true),-1,0,0,true);}
+        if(has_crt){   // round 3: redesigned CRT (crt_sweep.cuh sw_crt_lean<min blocks, flags>), two programs (compile in parallel)
+            struct CV{const char* n;const char* k;bool abl;};
+            // flags (crt_sweep.cuh): 1 h from smem, 2 split output stage, 4 cp.async residue prefetch, 8/16 ablations, 128 PTX digit chains,
+            // 256 explicit [base+imm] smem addressing, 512 PTX final chains, 1024 per-coefficient output stores, 2048 alpha*NP folded into h
+            static const CV cv[2][4]={{{"cxa_o","sw_crt_lean<3,3973>",false},{"cxa4_o","sw_crt_lean<4,3971>",false},{"cx_o","sw_crt_lean<3,1925>",false},{"abl_mem","sw_crt_lean<3,8>",true}},
+                                      {{"cxa_reg_o","sw_crt_lean<3,3969>",false},{"cx4_o","sw_crt_lean<4,1923>",false},{"abl_nold_cx","sw_crt_lean<3,3985>",true},{"lean_cpa_hl","sw_crt_lean<3,5>",false}}};
+            for(int g=0;g<2;++g){const int pi=prog(g?"crtl2":"crtl1",arch);progs[size_t(pi)].src+=CRT_SWEEP_SOURCE;
+                for(const auto& x:cv[g])if(x.n)addv(KProf::CRT,x.n,pi,addk(pi,x.k,true),-1,0,0,x.abl);}}
         addv(KProf::P3,"dfl_discard_flip",-1,-1,8,1u);addv(KProf::P3,"dfl_evfirst_flip",-1,-1,8,4u);   // production kernel, runtime flag bits flipped
         addv(KProf::CRT,"dfl_discard_flip",-1,-1,8,1u);addv(KProf::CRT,"dfl_stcs_flip",-1,-1,8,2u);
         addv(KProf::P2,"ldcs_flip",-1,-1,6,4u);   // untw bit 4: A/B loads __ldcs
         if(has_p2){const int pi=prog("p2",arch);
             addv(KProf::P2,"ctrl",pi,addk(pi,"bpo_middle_r16<0>",true));
             for(int mb:{6,7,8})addv(KProf::P2,"mb"+std::to_string(mb),pi,addk(pi,"sw_p2r16<"+std::to_string(mb)+">",true));}   // (discard: production since bed0fde)
-        p1grp(1);
+        if(std::getenv("FHERMA_SWEEP_P1ALL"))p1grp(1);
         if(std::getenv("FHERMA_SWEEP_NATIVE")){const int pi=prog("native",native);progs[size_t(pi)].src+="SWP1(sw_n_p1,BPO_XF,BPO_TC_MINB)\n";
             addv(KProf::P1,"native_"+native,pi,addk(pi,"sw_n_p1",false));
             if(has_p2)addv(KProf::P2,"native_"+native,pi,addk(pi,"bpo_middle_r16<0>",true));
             addv(KProf::P3,"native_"+native,pi,addk(pi,"bpo_last_cm3<0>",true));
             if(has_crt)addv(KProf::CRT,"native_"+native,pi,addk(pi,"bpo_crt_tc_cm<0>",true));}
-        p1grp(2);p1grp(3);
+        // (round 3: P1 groups b..d dropped: all >= 1.0 on target in pv37; FHERMA_SWEEP_P1ALL=1 restores them)
+        if(std::getenv("FHERMA_SWEEP_P1ALL")){p1grp(2);p1grp(3);}
         for(auto& P:progs)P.fn.assign(P.kn.size(),nullptr);
         // worker threads: NVRTC compile + module load (driver JIT for PTX), in program order, until the compile deadline
         const unsigned hw=std::max(2u,std::thread::hardware_concurrency());const size_t nth=std::min<size_t>(progs.size(),std::max(1u,std::min(8u,hw-1)));
@@ -244,10 +255,9 @@ template<class C> struct Sweep {
         addc(best(0,0),best(1,0),best(2,0),best(3,0));addc(best(0,0),nullptr,nullptr,nullptr);addc(best(0,1),best(1,0),best(2,0),best(3,0));
         addc(best(0,2),nullptr,nullptr,nullptr);addc(nullptr,best(1,0),best(2,0),best(3,0));
         {const std::string nn="native_"+native;addc(byname(0,nn.c_str()),byname(1,nn.c_str()),byname(2,nn.c_str()),byname(3,nn.c_str()));}
-        for(const char* n:{"cpq","twh","mnv","cpq_twh","f4","twh_f4"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each new P1 variant alone
         // P3 store policy / CRT input path only show their effect on the CRT in a chain (residues L2-resident or not)
         addc(nullptr,nullptr,byname(2,"evict_last"),nullptr);addc(nullptr,nullptr,byname(2,"dfl_evfirst_flip"),nullptr);
-        addc(nullptr,nullptr,nullptr,byname(3,"hl_mb3"));addc(nullptr,nullptr,byname(2,"evict_last"),byname(3,"hlld_mb3"));
+        for(const char* n:{"cxa_o","cxa4_o","cxa_reg_o","cx_o"})addc(nullptr,nullptr,nullptr,byname(3,n));   // each new CRT alone
         if(cs.size()>16)cs.resize(16);
         const int nprod=[&]{int n=0;for(const auto& t:tr)n=std::max(n,t.product+1);return n;}();
         const KProf::Trace* crt0=k0s[KProf::CRT];

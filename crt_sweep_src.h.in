@@ -1,0 +1,2 @@
+#pragma once
+static const char CRT_SWEEP_SOURCE[] = R"CRTSWEEP(@CRT_SWEEP_SOURCE@)CRTSWEEP";
