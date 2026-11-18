@@ -17,7 +17,7 @@ find_path(CUDA_HEADER_DIR cuda.h HINTS ${CUDA_INCLUDE_DIR}
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kernels.cu" KERNEL_SOURCE)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/explicit_crt.cuh" EXPLICIT_CRT_SOURCE)
 string(APPEND KERNEL_SOURCE "\n#ifndef BATCHED_ONLY\n${EXPLICIT_CRT_SOURCE}\n#endif\n")
-foreach(WEIGHTED_HEADER weighted_prepare.cuh weighted_ntt.cuh weighted_crt.cuh column_pipeline.cuh batched_prepare.cuh batched_crt.cuh batched_ntt.cuh batched_outer.cuh batched_prepfwd.cuh batched_prepfwd_tc.cuh batched_passorder.cuh batched_p1x.cuh)
+foreach(WEIGHTED_HEADER weighted_prepare.cuh weighted_ntt.cuh weighted_crt.cuh column_pipeline.cuh batched_prepare.cuh batched_crt.cuh batched_ntt.cuh batched_outer.cuh batched_prepfwd.cuh batched_prepfwd_tc.cuh batched_passorder.cuh batched_p1x.cuh batched_p3crt.cuh)
   file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${WEIGHTED_HEADER}" WEIGHTED_SOURCE)
   # Legacy single-product kernels are skipped by NVRTC when BATCHED_ONLY is defined (shorter init).
   if(WEIGHTED_HEADER MATCHES "^(weighted_ntt|weighted_crt|column_pipeline)\\.cuh$")

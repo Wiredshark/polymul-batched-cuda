@@ -204,14 +204,14 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
 }
 template<u32 F>
 __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u32* B,
-    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
-    const XTMap* tmA,const XTMap* tmB,u32* X){
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 uq0,u32 uq1,u32 pfstep,const u64* ctab,
+    const XTMap* tmA,const XTMap* tmB,u32* X,const u32 id,const u32 pfid,const bool lastseg){
     constexpr u32 L=BCRT_L;
     constexpr u32 POS[9]={BCRT_POS,BCRT_W};
     constexpr bool S6=(F&64)!=0;
     constexpr u32 XD=(F&96)?320u:288u,XS=(F&96)?8*320:8*288+32;   // 128 B aligned (prime,digit) regions
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
-    const u32 id=blockIdx.x,c=id&255u,op=id>>8;
+    const u32 c=id&255u,op=id>>8;   // id: (operand, column) of this segment; quads [uq0,uq1); pfid: column to L2-prefetch (>=512 none)
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
     const u32* src=(op?b:a)+u64(c)*L;
     u32* dst=op?B:A;
@@ -235,8 +235,6 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             const u32* hs=src+u64(mt*128u*256u)*L;
             if(ca){   // flag 512: all 16 B chunks of the half in flight at once (cp.async, one DRAM/L2 round trip)
                 const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
-                if(mt==0&&h<128u){const u32* pr=hs+u64((128u+h)*256u)*L;   // half 1 row h to L2 while half 0 is in flight
-                    asm volatile("prefetch.global.L2 [%0];"::"l"(pr));asm volatile("prefetch.global.L2 [%0];"::"l"(pr+32));asm volatile("prefetch.global.L2 [%0];"::"l"(pr+L-1));}
                 u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
                 if(q<nch){
                     #pragma unroll
@@ -280,8 +278,8 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 af[j][mt][x]=width>=32?v:(width<=0?0u:(v&((1u<<width)-1)));
             }
     }
-    if(pfstep&&h<256u&&id+pfstep<512u){
-        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*L+u64(h*256u)*L;
+    if(pfid<512u&&h<256u){
+        const u32 pf=pfid;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*L+u64(h*256u)*L;
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+L-1));
@@ -289,7 +287,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stride=weighted_root_stride(N);
     u64* STS=reinterpret_cast<u64*>(X+4*XS);   // flag 4: the quad's stage tables (4 x 256 u64)
     #pragma unroll 1
-    for(u32 u=r0/4;u<r1/4;++u){
+    for(u32 u=uq0;u<uq1;++u){
         __syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
             #pragma unroll
@@ -365,8 +363,33 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
 #endif
     }
 #if BPO_X_HAS_TMA
-    if((F&2)&&lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
+    if((F&2)&&lane==0&&lastseg)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
 #endif
+}
+// Grid: 512 blocks = one (operand, column) each, all quads [r0/4,r1/4); or (flag-free runtime choice) a persistent grid
+// G < 512: the 512*nq (column, quad) items split evenly into G contiguous ranges, so G = SMs x blocks/SM fills
+// exactly one wave (no 1.36-wave tail); each column segment of a range restages its input (A fragments).
+template<u32 F_>
+__device__ __forceinline__ void bpo_first_xg(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const XTMap* tmA,const XTMap* tmB,u32* X){
+    const u32 G=gridDim.x,q0=r0/4,nq=(r1-r0)/4,ps=pfstep&0x0fffffffu;
+    if(G>=512u){const u32 id=blockIdx.x;
+        bpo_first_xb<F_>(a,b,A,B,twist,stage_tw,bpt,N,q0,q0+nq,pfstep,ctab,tmA,tmB,X,id,ps?id+ps:~0u,true);return;}
+    // whole columns first (column t*G+b in round t: concurrent blocks read adjacent input columns, which share
+    // L2 lines), then the R = 512 mod G leftover columns' R*nq items split evenly into G contiguous ranges.
+    const u32 b0=blockIdx.x,F=512u/G,R=512u-F*G,ext=R*nq,i0=u32((u64(b0)*ext)/G),i1=u32((u64(b0+1)*ext)/G);
+    #pragma unroll 1
+    for(u32 t=0;t<F;++t){const u32 col=t*G+b0;
+        if(t)__syncthreads();
+        bpo_first_xb<F_>(a,b,A,B,twist,stage_tw,bpt,N,q0,q0+nq,pfstep,ctab,tmA,tmB,X,col,ps?(t+1<F?col+G:(i0<i1?F*G+i0/nq:~0u)):~0u,i0==i1&&t+1==F);}
+    #pragma unroll 1
+    for(u32 i=i0;i<i1;){
+        const u32 col=F*G+i/nq,ie=min(i1,(i/nq+1)*nq);
+        if(F||i!=i0)__syncthreads();   // previous segment's phase-B reads of X done before the input restaging
+        bpo_first_xb<F_>(a,b,A,B,twist,stage_tw,bpt,N,q0+(i%nq),q0+(ie-(i/nq)*nq),pfstep,ctab,tmA,tmB,X,col,(ps&&ie<i1)?col+1:~0u,ie==i1);
+        i=ie;
+    }
 }
 #define BPO_X_SMEM(F) (4*(((F)&96)?8*320:8*288+32)*4+(((F)&4)?4*256*8:0))
 #if !defined(BPO_LEAN)||BPO_LEAN_P1X
@@ -374,7 +397,7 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
-    bpo_first_xb<BPO_XF>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+    bpo_first_xg<BPO_XF>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif // bpo_first_x
 #ifndef BPO_LEAN
@@ -382,7 +405,7 @@ extern "C" __global__ void __launch_bounds__((BPO_XV&8)?512:256,BPO_TC_MINB) bpo
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XV)/4];
-    bpo_first_xb<BPO_XV>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+    bpo_first_xg<BPO_XV>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif // bpo_first_xv
 #endif

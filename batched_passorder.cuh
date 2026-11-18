@@ -785,7 +785,7 @@ template<bool CI>__device__ __forceinline__ void pzdit_smr(u32* base,u32 (&v)[8]
 //   1 lean arithmetic + psi^0 stages as add/sub (S-DIF, S-DIT), 2 (with 1) A and B S-DIF interleaved,
 //   4 (with 1) lazy S-DIT: C words in [0,2p) (consumer: bpo_last_cm3 Shoup F product, exact for any u32)
 #ifndef BPO_P2F
-#define BPO_P2F 5   // 1: 62.57 vs 64.39 ms min A/B (median 63.70 vs 66.07); 5 (+lazy S-DIT, with P3T 260)
+#define BPO_P2F 37   // 32: single 9 KB tile + launch bounds (256,6): 6 blocks/SM (was 5: 18 KB smem, 48 regs); 1: 62.57 vs 64.39 ms min A/B (median 63.70 vs 66.07); 5 (+lazy S-DIT, with P3T 260)
 #endif
 #ifndef BPO_P2FV
 #define BPO_P2FV BPO_P2F
@@ -801,6 +801,25 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
     const u64* st=stage_tw+prime*256u;const u64* sit=stage_itw+prime*256u;
     const u64 base=u64(prime*8+j)*N;
+    u32 ab[2][8];u32 (&a)[8]=ab[0];u32 (&b)[8]=ab[1];
+    if(F&32){   // flag 32: one 9 KB tile (sb unused): A and B loads both in flight, transposed through sa in turn
+        const uint4* a4=reinterpret_cast<const uint4*>(A+base+g*2048u);
+        const uint4* b4=reinterpret_cast<const uint4*>(B+base+g*2048u);
+        uint4 va[2],vb[2];
+        #pragma unroll
+        for(u32 i=0;i<2;++i){const u32 q=threadIdx.x+256u*i;if(untw&4){va[i]=__ldcs(a4+q);vb[i]=__ldcs(b4+q);}else{va[i]=a4[q];vb[i]=b4[q];}}
+        #pragma unroll
+        for(u32 ob=0;ob<2;++ob){
+            if(ob)__syncthreads();   // A columns read out of sa
+            #pragma unroll
+            for(u32 i=0;i<2;++i){const u32 q=threadIdx.x+256u*i,cc=q>>1,s=(q&1u)*4;u32* x=sa+cc*9+s;const uint4 v=ob?vb[i]:va[i];x[0]=v.x;x[1]=v.y;x[2]=v.z;x[3]=v.w;}
+            __syncthreads();
+            #pragma unroll
+            for(u32 m=0;m<8;++m)ab[ob][m]=sa[(lane+32*m)*9+warp];
+        }
+        if((untw&8)&&threadIdx.x<128u)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);
+        __syncthreads();   // tile -> private regions
+    }else{
     {
         const uint4* a4=reinterpret_cast<const uint4*>(A+base+g*2048u);
         const uint4* b4=reinterpret_cast<const uint4*>(B+base+g*2048u);
@@ -812,17 +831,17 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
     }
     __syncthreads();
     if((untw&8)&&threadIdx.x<128u)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // tile is in smem
-    u32 ab[2][8];u32 (&a)[8]=ab[0];u32 (&b)[8]=ab[1];
     #pragma unroll
     for(u32 m=0;m<8;++m){a[m]=sa[(lane+32*m)*9+warp];b[m]=sb[(lane+32*m)*9+warp];}
     __syncthreads();   // tile -> private regions
-    u32* ra=sa+warp*288;u32* rb=sb+warp*288;
+    }
+    u32* ra=sa+warp*288;u32* rb=(F&32)?ra:sb+warp*288;
     if(F&16){   // ablation: no arithmetic (wrong values)
         #pragma unroll
         for(u32 m=0;m<8;++m)a[m]^=b[m];
     }else{
     if(L&&(F&2)){u32* const rr[2]={ra,rb};pxdif2_smr<true>(rr,ab,st,p,lane);}
-    else if(L){pxdif_smr<true>(ra,a,st,p,lane);pxdif_smr<true>(rb,b,st,p,lane);}
+    else if(L){pxdif_smr<true>(ra,a,st,p,lane);if(F&32)__syncwarp();pxdif_smr<true>(rb,b,st,p,lane);}
     else{bpo_dif_smr(ra,a,st,p,lane);bpo_dif_smr(rb,b,st,p,lane);}
     if(untw&16){   // Montgomery pointwise (a*b*2^-32; host folds 2^32 into the P3 table t2n)
         const u32 pinv=pxinv32(p);
@@ -848,10 +867,10 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
         if(BPO_P2ABL!=1||s[0]==0xffffffffu){o[0]=make_uint4(s[0],s[1],s[2],s[3]);o[1]=make_uint4(s[4],s[5],s[6],s[7]);}
     }
 }
-extern "C" __global__ void __launch_bounds__(256) bpo_middle_smr(const u32* A,const u32* B,u32* C,
+extern "C" __global__ void __launch_bounds__(256,(BPO_P2F&32)?6:1) bpo_middle_smr(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* ratios,const u64* untwist,const u64* stage_tw,const u64* stage_itw,u32 N,u32 logR,u32 untw){
     __shared__ __align__(16) u32 sa[256*9];
-    __shared__ __align__(16) u32 sb[256*9];
+    __shared__ __align__(16) u32 sb[(BPO_P2F&32)?4:256*9];
     bpo_p2_body<BPO_P2F>(sa,sb,A,B,C,primes,ratios,untwist,stage_tw,stage_itw,N,logR,untw);
 }
 #if !defined(BPO_LEAN)
