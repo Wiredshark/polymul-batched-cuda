@@ -31,6 +31,12 @@
 #ifndef BPO_XA
 #define BPO_XA 0
 #endif
+#ifndef BPO_MIXED
+#define BPO_MIXED 0   // 1 only in the exit-time h30 sweep module (primes < 2^30 present: per-prime P1 Barrett shift)
+#endif
+#ifndef BPO_NH30
+#define BPO_NH30 0
+#endif
 #if defined(__CUDA_ARCH__)&&__CUDA_ARCH__>=900
 #define BPO_X_HAS_TMA 1
 #else
@@ -49,6 +55,13 @@ struct __align__(64) XTMap{u64 w[16];};
 struct XNegP{u32 v[BCRT_K];};
 __host__ __device__ constexpr XNegP xnegp_make(){XNegP a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=0u-P[i];return a;}
 __constant__ XNegP bpr_np=xnegp_make();
+#if BPO_NH30
+__host__ __device__ constexpr XNegP xp2_make(){XNegP a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=2u*P[i];return a;}
+__constant__ XNegP bpr_p2=xp2_make();   // 2p loaded (ptxas otherwise rematerializes s-2p as IMAD p*-2+s per use)
+#define BPR_P2(r) bpr_p2.v[r]
+#else
+#define BPR_P2(r) 0u
+#endif
 struct XFMask{u32 v[8][2][4];};   // fragment word masks [digit j][x>>1][tig]: width POS[j+1]-POS[j]-32(tig+4(x>>1)) clamped to [0,32]
 __host__ __device__ constexpr XFMask xfmask_make(){XFMask a{};constexpr u32 P[9]={BCRT_POS,BCRT_W};
     for(u32 j=0;j<8;++j)for(u32 xh=0;xh<2;++xh)for(u32 t=0;t<4;++t){const int wd=int(P[j+1])-int(P[j])-32*int(t+4*xh);
@@ -61,13 +74,24 @@ __device__ __forceinline__ u32 xmsh(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u3
 __device__ __forceinline__ void xbf(u32& x,u32& y,u64 w,u32 p){const u32 a=x,b=y;x=xadd(a,b,p);y=xmsh(a+p-b,w,p);}
 __device__ __forceinline__ void xbf1(u32& x,u32& y,u32 p){const u32 a=x,b=y;x=xadd(a,b,p);y=xsub(a,b,p);}   // twiddle psi^0
 template<bool TRIV>__device__ __forceinline__ void xbft(u32& x,u32& y,const u64& w,u32 p){if(TRIV)xbf1(x,y,p);else xbf(x,y,w,p);}
+// Harvey-lazy butterflies (H, primes p < 2^30): words in [0,2p) between stages. hbf: x' = min(a+b, a+b-2p), y' = Shoup(a+2p-b)
+// unreduced (input < 4p < 2^32 -> [0,2p)); psi^0: y' = min(d, d-2p), d = a+2p-b. One correction per multiplied butterfly
+// instead of two. H=false: the canonical xbf/xbf1 (31-bit primes).
+__device__ __forceinline__ u32 xmshl(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u32(c>>32));return x*u32(c)-q*p;}
+template<bool H>__device__ __forceinline__ void xbfh(u32& x,u32& y,u64 w,u32 p,u32 p2){if(H){const u32 a=x,b=y;x=xadd(a,b,p2);y=xmshl(a+p2-b,w,p);}else xbf(x,y,w,p);}
+template<bool H>__device__ __forceinline__ void xbf1h(u32& x,u32& y,u32 p,u32 p2){if(H){const u32 a=x,b=y;x=xadd(a,b,p2);y=xadd(a,p2-b,p2);}else xbf1(x,y,p);}
+template<bool TRIV,bool H>__device__ __forceinline__ void xbfth(u32& x,u32& y,const u64& w,u32 p,u32 p2){if(TRIV)xbf1h<H>(x,y,p,p2);else xbfh<H>(x,y,w,p,p2);}
+template<bool H>__device__ __forceinline__ u32 xmshh(u32 x,u64 c,u32 p){return H?xmshl(x,c,p):xmsh(x,c,p);}
+#if BPO_NH30
+struct XHarvey{static constexpr bool v=true;};struct XShoup{static constexpr bool v=false;};   // quad tags (h30 sweep module only)
+#endif
 // 8-point cyclic DIF over the digit axis (= BPO_JDIF): entry e of the stage table = psi^(2eN/256).
-template<u32 F>__device__ __forceinline__ void xjdif(u32 (&x8)[8],const u64* st,u32 p){
+template<u32 F,bool H=false>__device__ __forceinline__ void xjdif(u32 (&x8)[8],const u64* st,u32 p,u32 p2=0){
     constexpr bool T=(F&1)!=0;
-    xbft<T>(x8[0],x8[4],st[0],p);xbf(x8[1],x8[5],st[32],p);xbf(x8[2],x8[6],st[64],p);xbf(x8[3],x8[7],st[96],p);
+    xbfth<T,H>(x8[0],x8[4],st[0],p,p2);xbfh<H>(x8[1],x8[5],st[32],p,p2);xbfh<H>(x8[2],x8[6],st[64],p,p2);xbfh<H>(x8[3],x8[7],st[96],p,p2);
     const u64 w0=st[0],w64=st[64];
-    xbft<T>(x8[0],x8[2],w0,p);xbf(x8[1],x8[3],w64,p);xbft<T>(x8[4],x8[6],w0,p);xbf(x8[5],x8[7],w64,p);
-    xbft<T>(x8[0],x8[1],w0,p);xbft<T>(x8[2],x8[3],w0,p);xbft<T>(x8[4],x8[5],w0,p);xbft<T>(x8[6],x8[7],w0,p);
+    xbfth<T,H>(x8[0],x8[2],w0,p,p2);xbfh<H>(x8[1],x8[3],w64,p,p2);xbfth<T,H>(x8[4],x8[6],w0,p,p2);xbfh<H>(x8[5],x8[7],w64,p,p2);
+    xbfth<T,H>(x8[0],x8[1],w0,p,p2);xbfth<T,H>(x8[2],x8[3],w0,p,p2);xbfth<T,H>(x8[4],x8[5],w0,p,p2);xbfth<T,H>(x8[6],x8[7],w0,p,p2);
 }
 // R-DIF of one (prime,digit) column in its 288-word skewed region + cross twiddle (ctab row from L1/L2).
 template<u32 F>
@@ -225,8 +249,8 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
 }
 // Flag 8192 phase B: NC columns of ONE prime (digits j..j+NC-1): stage twiddles and cross twiddles are loaded once and
 // shared by the NC columns; smem addresses as one hoisted pointer + immediates. Same values as xrdif6.
-template<u32 F,u32 NC>
-__device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm=0){
+template<u32 F,u32 NC,bool H=false>
+__device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,const u32 p2,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm=0){
     constexpr bool T=(F&1)!=0;
     constexpr u32 XD=320u;
     u32 v[NC][8];
@@ -245,17 +269,17 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         #pragma unroll
         for(u32 m=0;m<4;++m)
             #pragma unroll
-            for(u32 n=0;n<NC;++n)xbf(v[n][m],v[n][m+4],w64[m],p);   // len 64: j = row&31
+            for(u32 n=0;n<NC;++n)xbfh<H>(v[n][m],v[n][m+4],w64[m],p,p2);   // len 64: j = row&31
         #pragma unroll
         for(u32 qq=0;qq<2;++qq)
             #pragma unroll
             for(u32 n=0;n<NC;++n)
                 #pragma unroll
-                for(u32 hh=0;hh<2;++hh)xbf(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p);   // len 32: j = row&15
+                for(u32 hh=0;hh<2;++hh)xbfh<H>(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p,p2);   // len 32: j = row&15
         #pragma unroll
         for(u32 n=0;n<NC;++n)
             #pragma unroll
-            for(u32 m=0;m<8;m+=2)xbf(v[n][m],v[n][m+1],w16,p);   // len 16: j = row&7
+            for(u32 m=0;m<8;m+=2)xbfh<H>(v[n][m],v[n][m+1],w16,p,p2);   // len 16: j = row&7
         #pragma unroll
         for(u32 n=0;n<NC;++n)
             #pragma unroll
@@ -273,22 +297,22 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         #pragma unroll
         for(u32 lo=0;lo<4;++lo)
             #pragma unroll
-            for(u32 n=0;n<NC;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}   // len 8 (st[248]=psi^0)
+            for(u32 n=0;n<NC;++n){if(lo==0)xbfth<T,H>(v[n][0],v[n][4],w8[0],p,p2);else xbfh<H>(v[n][lo],v[n][lo+4],w8[lo],p,p2);}   // len 8 (st[248]=psi^0)
         #pragma unroll
         for(u32 k=0;k<4;++k)
             #pragma unroll
-            for(u32 n=0;n<NC;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+            for(u32 n=0;n<NC;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbfh<H>(v[n][lo],v[n][lo+2],w253,p,p2);else xbfth<T,H>(v[n][lo],v[n][lo+2],w252,p,p2);}
         if(!T){
         #pragma unroll
         for(u32 lo=0;lo<8;lo+=2)
             #pragma unroll
-            for(u32 n=0;n<NC;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}}
+            for(u32 n=0;n<NC;++n)xbfh<H>(v[n][lo],v[n][lo+1],w254,p,p2);}}
     {const ulonglong2* c2=reinterpret_cast<const ulonglong2*>(ct+8*lane);
         #pragma unroll
         for(u32 m2=0;m2<4;++m2){const ulonglong2 w=__ldg(c2+m2);
             #pragma unroll
             for(u32 n=0;n<NC;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
-                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}   // len-2 psi^0 stage fused into the cross twiddle
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+(H?p2:p)-b,u64(w.y),p);}   // H: a,b < 2p, Shoup inputs < 4p   // len-2 psi^0 stage fused into the cross twiddle
                 else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}}
 #if BPO_X_HAS_TMA
     __syncwarp();
@@ -320,8 +344,8 @@ __device__ __forceinline__ ulonglong2 xct_ldv(const u64* ctg,u32 lane,u32 m2){  
 // in ONE pass: layout-1 stages of both column pairs, one __syncwarp, layout-2 stages + cross twiddle per pair (rolled pair
 // loop), one proxy fence and one lane-0 TMA burst (4 boxes, 1 commit) per quad instead of 2 x (fence, syncwarp, TMA
 // section); stage and cross twiddles loaded once per quad, not per pair. Same values as xrdif6s (flag 65536 not used here).
-template<u32 F>
-__device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm){
+template<u32 F,bool H=false>
+__device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,const u32 p2,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm){
     constexpr bool T=(F&1)!=0;
     constexpr u32 XD=320u;
     constexpr u32 Q=2u,NI=4u/Q;   // column pairs
@@ -341,17 +365,17 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
             #pragma unroll
             for(u32 m=0;m<4;++m)
                 #pragma unroll
-                for(u32 n=0;n<Q;++n)xbf(v[n][m],v[n][m+4],w64[m],p);
+                for(u32 n=0;n<Q;++n)xbfh<H>(v[n][m],v[n][m+4],w64[m],p,p2);
             #pragma unroll
             for(u32 qq=0;qq<2;++qq)
                 #pragma unroll
                 for(u32 n=0;n<Q;++n)
                     #pragma unroll
-                    for(u32 hh=0;hh<2;++hh)xbf(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p);
+                    for(u32 hh=0;hh<2;++hh)xbfh<H>(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p,p2);
             #pragma unroll
             for(u32 n=0;n<Q;++n)
                 #pragma unroll
-                for(u32 m=0;m<8;m+=2)xbf(v[n][m],v[n][m+1],w16,p);
+                for(u32 m=0;m<8;m+=2)xbfh<H>(v[n][m],v[n][m+1],w16,p,p2);
             #pragma unroll
             for(u32 n=0;n<Q;++n)
                 #pragma unroll
@@ -375,21 +399,21 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
         #pragma unroll
         for(u32 lo=0;lo<4;++lo)
             #pragma unroll
-            for(u32 n=0;n<Q;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}
+            for(u32 n=0;n<Q;++n){if(lo==0)xbfth<T,H>(v[n][0],v[n][4],w8[0],p,p2);else xbfh<H>(v[n][lo],v[n][lo+4],w8[lo],p,p2);}
         #pragma unroll
         for(u32 k=0;k<4;++k)
             #pragma unroll
-            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbfh<H>(v[n][lo],v[n][lo+2],w253,p,p2);else xbfth<T,H>(v[n][lo],v[n][lo+2],w252,p,p2);}
         if(!T){
             #pragma unroll
             for(u32 lo=0;lo<8;lo+=2)
                 #pragma unroll
-                for(u32 n=0;n<Q;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}
+                for(u32 n=0;n<Q;++n)xbfh<H>(v[n][lo],v[n][lo+1],w254,p,p2);}
         #pragma unroll
         for(u32 m2=0;m2<4;++m2){const ulonglong2 w=xct_ldv(ct,lane,m2);
             #pragma unroll
             for(u32 n=0;n<Q;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
-                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+(H?p2:p)-b,u64(w.y),p);}   // H: a,b < 2p
                 else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}
 #if BPO_X_HAS_TMA
         __syncwarp();   // layout-2 reads of this pair's regions done (the other pair's regions are disjoint)
@@ -526,6 +550,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     // warp's phase-A math (MMA, reduction, twist, J-DIF, R-DIF 256/128) overlaps the other warps' phase B of the previous quad.
     constexpr bool LB=(F&32768)&&!(F&4)&&S6&&BPO_XA!=4&&BPO_XA!=5;
     for(u32 u=r0/4;u<r1/4;++u){
+      // quad body, instantiated for Harvey-lazy (quads of primes < 2^30, S6 + 8192 path only) and canonical arithmetic
+#if BPO_NH30
+      auto quad=[&](auto hv){constexpr bool H=decltype(hv)::v;
+#else
+      {constexpr bool H=false;
+#endif
         if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
             #pragma unroll
@@ -536,7 +566,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
-            const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
+            const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;   // floor(2^(64-msh)/p) < 2^32
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
             const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
@@ -554,29 +584,29 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                         if(F&4096){   // x = w + 2^16 z (w, z < 2^30): hi = floor(x/2^14) exactly, r = lo + q(-p)
                             const u32 w=y0+(y1<<8),z=y2+(y3<<8);
                             const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
-                            const u32 q=__umulhi(hi,m62)>>16;
+                            const u32 q=__umulhi(hi,m62)>>qsh;
                             res[2*mt+hf][j]=lo+q*np;
                         }else{
                         const u32 lo=y0+(y1<<8)+(y2<<16)+(y3<<24);
                         const u32 hi=(y0>>14)+(y1>>6)+(y2<<2)+(y3<<10);
-                        const u32 q=__umulhi(hi,m62)>>16;
+                        const u32 q=__umulhi(hi,m62)>>qsh;
                         res[2*mt+hf][j]=lo-q*p;}
                     }
                 }
             }
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
-                const u32 rl=8*warp+gid;
+                const u32 rl=8*warp+gid;const u32 p2=BPR_P2(r);
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
                     #pragma unroll
-                    for(u32 j=0;j<8;++j)res[rr][j]=xmsh(res[rr][j],t2,p);
-                    xjdif<F>(res[rr],st,p);
+                    for(u32 j=0;j<8;++j)res[rr][j]=xmshh<H>(res[rr][j],t2,p);   // H: [0,2p)
+                    xjdif<F,H>(res[rr],st,p,p2);
                 }
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
                 #pragma unroll
-                for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
+                for(u32 j=0;j<8;++j){xbfh<H>(res[0][j],res[2][j],wa,p,p2);xbfh<H>(res[1][j],res[3][j],wb,p,p2);xbfh<H>(res[0][j],res[1][j],wc,p,p2);xbfh<H>(res[2][j],res[3][j],wc,p,p2);}
                 if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
                 if(F&4096){u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // row 64rr+rl -> skewed 72rr+rl+4(rl>>5): immediate offsets
                     #pragma unroll
@@ -604,11 +634,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             constexpr u32 NC=BPO_X_NC;
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
-            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
+            if(F&131072u)xrdif6q<F,H>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,BPR_P2(r),lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
             else{
             #pragma unroll
             for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;
-                xrdif6s<F,NC>(X+q*XS+j*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+j,stm);}}
+                xrdif6s<F,NC,H>(X+q*XS+j*XD,8*q,st,ct,p,BPR_P2(r),lane,op?tmB:tmA,c,r*8+j,stm);}}
         }else
         #pragma unroll 1
         for(u32 n=0;n<(BPO_XA==3?0u:32/NW);++n){   // (prime q, digit j) columns of the quad (ablation 3: none)
@@ -626,6 +656,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         }
 #if BPO_X_HAS_TMA
         if((F&2)&&lane==0&&BPO_XA!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable (ablation 9: no wait)
+#endif
+#if BPO_NH30
+      };
+      if(S6&&(F&8192)&&NW==8&&4*u+3<BPO_NH30)quad(XHarvey{});else quad(XShoup{});
+#else
+      }
 #endif
     }
 #if BPO_X_HAS_TMA

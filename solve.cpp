@@ -8,6 +8,7 @@
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
 #include "kprof.h"
+#include "diag.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -163,7 +164,7 @@ struct Cuda {
     }
     KProf kp;
     void klaunch(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 bx,u32 smem,void** params){
-        if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream);}
+        if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream,params);}
         else check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));}
     template<class...Args>void launch(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,128,0,params);}
     template<class...Args>void launch_ntt(CUfunction fn,u32 gx,u32 gy,u32 threads,u32 shared_bytes,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,threads,shared_bytes,params);}
@@ -200,6 +201,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
+        if(cuda&&k&&weighted&&!h30)run_diag(*cuda,g_kernel_prefix+KERNEL_SOURCE,l,tables(),[this](std::string& pre,std::vector<DiagTab>& tabs){return build_h30(pre,tabs);});   // exit-time sweep (FHERMA_DIAG=0: off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -225,6 +227,8 @@ struct State {
             output_pool=std::make_unique<owning_pinned_vector::Pool>(
                 owning_pinned_vector::Backend{cuda.get(),&State::pin_output,&State::unpin_output},bytes,3);}
     CUdeviceptr p,mu,tw,itw,invn,weights,a,b,at,bt,A,B,C,prefix,lengths,inverses,midpoint,qmod,pmodq,out,outt,crt_inverses,crt_matrix,neg_pmodq;
+    // h30 exit-time sweep (build_h30): a table-only State on the production context with the mixed prime set
+    bool h30=false;Cuda* ext=nullptr;std::string h30_prefix;Big qbig;u32 nh30=0;
     u32 root_stride_host=0;bool weighted=false;u32 short_words=0,digit_terms=0,weighted_middle_threads=128;
     CUdeviceptr weighted_twist,positions,corrections,bias,tc_bfrag=0,tc_bpt=0,tc_rtw=0,r16tab=0,fxt=0,stage_tw=0,stage_itw=0,t2n=0,t2nM=0,t2nO=0,t2nMO=0,ctab=0;std::vector<u32> tc_bfrag_host,tc_bpt_host;std::vector<u64> tc_rtw_host;
     void init_weighted(const Big& q){
@@ -241,11 +245,23 @@ struct State {
         }
         const u32 digit_bits=(w+J-1)/J;digit_terms=(digit_bits+15)/16;
         const Big vmax=minus(two_power(digit_bits),Big{1});
-        const Big bound=multiply(multiply(multiply(vmax,vmax),Big{2*n*J}),Big{delta});
-        const u32 G=bits(bound);const Big target_bound=shift_left(bound,2);Big P{1};
-        u32 candidate=((u32(1)<<31)-2)/(2*n)*(2*n)+1;
+        // Production: 31-bit primes until P > 4 * loose bound (vmax^2 2NJ delta). h30 (exit-time sweep only, 9d2a5bd): NH30 = 12
+        // primes < 2^30 (Harvey-lazy NTT arithmetic) first, then 31-bit primes until P > 2 * tight bound * (1 + 2^-7). Tight
+        // bound: |c_kj| <= N S_j, S_j = sum_{j1+j2 = j mod J} (delta on wrap) 2^e (2^b_j1-1)(2^b_j2-1), e in {0,1}.
+        Big bound;
+        if(!h30)bound=multiply(multiply(multiply(vmax,vmax),Big{2*n*J}),Big{delta});
+        else{u32 pz[J+1];for(u32 j=0;j<J;++j)pz[j]=(w*j+J-1)/J;pz[J]=w;Big smax{0};
+            for(u32 j=0;j<J;++j){Big s{0};for(u32 j1=0;j1<J;++j1){const u32 j2=(j+J-j1)%J;
+                Big t=multiply(minus(two_power(pz[j1+1]-pz[j1]),Big{1}),minus(two_power(pz[j2+1]-pz[j2]),Big{1}));
+                t=shift_left(t,pz[j1]+pz[j2]-pz[(j1+j2)%J]-(j1+j2>=J?w:0u));if(j1+j2>=J)t=multiply(t,Big{delta});s=plus(s,t);}
+                if(cmp(s,smax)>0)smax=s;}
+            bound=multiply(smax,Big{n});}
+        const u32 G=bits(bound);const Big target_bound=!h30?shift_left(bound,2):plus(shift_left(bound,1),shift_right(bound,7));Big P{1};
+        nh30=h30?12u:0u;
+        u32 candidate=((u32(1)<<(nh30?30:31))-2)/(2*n)*(2*n)+1;
         std::vector<u32> primes,roots,betas;
-        while(cmp(P,target_bound)<=0){
+        while(cmp(P,target_bound)<=0||primes.size()<nh30){
+            if(primes.size()==nh30&&nh30&&candidate<(u32(1)<<30))candidate=((u32(1)<<31)-2)/(2*n)*(2*n)+1;   // 31-bit tail
             bool accepted=false;u32 beta=0;
             while(!accepted){
                 if(candidate<=2*n)throw std::runtime_error("weighted prime search exhausted");
@@ -315,11 +331,15 @@ struct State {
                  fw[(size_t(r)*J+j)*digit_terms+t]=u32(u64(digit_weights[size_t(r)*digit_terms+t])*u32(prepared[size_t(r)*J+j])%primes[r]);
              list("BPO_WEIGHTS",fw,"u");}
             m+="#define BPR_DT "+std::to_string(digit_terms)+nl;list("BCRT_BIAS",padded(bias_value,l),"u");
+            if(h30)m+="#define BPO_MIXED 1"+nl+"#define BPO_NH30 "+std::to_string(nh30)+nl;
             if(!compact_roots)m+="#define WROOT_COMPACT 0"+nl;
             if(k==16&&short_words==16&&!std::getenv("FHERMA_NO_TCCRT")){
                 // Tensor-core CRT constants (batched_crt_tc): B fragments, alpha reciprocals, 2^512-P, 2^G.
-                constexpr u32 F=46;bool ok=true;
+                // h30: F = largest <= 46 with every R = floor(2^F/p) < 2^16 (45 with primes < 2^30), plus the alpha rounding
+                // slack check 2 bound 2^F + 2 K pmax P < P 2^F (9d2a5bd). Production: F = 46.
+                u32 F=46;bool ok=true;u32 pmax=0;if(h30)for(u32 r=0;r<k;++r){pmax=std::max(pmax,primes[r]);while(F>32&&((u64(1)<<F)/primes[r])>>16)--F;}
                 std::vector<u32> R(k);for(u32 r=0;r<k;++r){R[r]=u32((u64(1)<<F)/primes[r]);if(R[r]>>16)ok=false;}
+                if(h30&&cmp(plus(shift_left(bound,F+1),multiply(P,Big{2*k*pmax})),shift_left(P,F))>=0)ok=false;
                 auto pm_byte=[&](u32 r,int c)->u32{if(c<0||c>=int(4*short_words))return 0;return (crtMatrix[size_t(r)*short_words+c/4]>>(8*(c%4)))&255u;};
                 auto r_byte=[&](u32 r,int c)->u32{if(c<0||c>=2)return 0;return (R[r]>>(8*c))&255u;};
                 tc_bfrag_host.assign(9*2*32*2,0);
@@ -368,9 +388,9 @@ struct State {
             if(std::getenv("FHERMA_PREPFWD"))m+="#define BPF_ENABLE 1"+nl;
             if(lean_jit()&&n==65536&&rows==256&&cols==256)m+="#define BPO_LEAN 1"+nl+"#define BPO_LEAN_SPLIT "+std::string(std::getenv("FHERMA_P1SPLIT")?"1":"0")+nl+"#define BPO_LEAN_GCT "+std::string(std::getenv("FHERMA_P1_CTSMEM")?"0":"1")+nl+"#define BPO_LEAN_P1X "+std::string(std::getenv("FHERMA_P1_TC2G")?"0":"1")+nl+"#define BPO_LEAN_TC2 "+std::string(std::getenv("FHERMA_P1_TC2G")?"1":"0")+nl+"#define BPO_LEAN_P1W "+std::string(std::getenv("FHERMA_P1W")?"1":"0")+nl;   // default graph kernels only (init time)
             if(const char* x=std::getenv("FHERMA_EXTRA_DEFINES")){for(const char* c=x;*c;++c)m+=(*c==';'?nl[0]:*c);m+=nl;}  // experiments only
-            if(w>=1024&&l<=64&&short_words<=32)g_kernel_prefix=m;
+            if(h30)h30_prefix=m;else if(w>=1024&&l<=64&&short_words<=32)g_kernel_prefix=m;
         }
-        cuda=std::make_unique<Cuda>();auto& device=*cuda;
+        if(!h30)cuda=std::make_unique<Cuda>();auto& device=h30?*ext:*cuda;
         {int v=0;CUdevice dev=0;auto attr=device.driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");
          if(device.cuDeviceGet(&dev,0)==CUDA_SUCCESS&&attr(&v,CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,dev)==CUDA_SUCCESS)l2_bytes=u32(v);}
         p=device.upload(primes);mu=device.upload(ratios);
@@ -391,7 +411,7 @@ struct State {
             // set-aside (164096 B requested, rounded up by the driver: 3 MB on the 5070) plus a persisting access-policy
             // window on the legacy default stream for the root tables; the batched graphs run on their own streams, so the
             // window never applied, only the set-aside carved L2. FHERMA_L2R1=1 restores it (A/B).
-            if(const char* e=std::getenv("FHERMA_L2R1");e&&*e=='1')device.enable_root_cache(tw,2*half);
+            if(const char* e=std::getenv("FHERMA_L2R1");e&&*e=='1'&&!h30)device.enable_root_cache(tw,2*half);
         }else{tw=device.upload(twists);itw=device.upload(untwists);}
         if(n==65536){   // pass-order kernels: 256-point stage twiddles, entry (len,j) at 256-len+j
             std::vector<u64> st(size_t(k)*256),sit(size_t(k)*256);
@@ -433,6 +453,7 @@ struct State {
         if(!tc_bfrag_host.empty())tc_bfrag=device.upload(tc_bfrag_host);
         if(!tc_bpt_host.empty())tc_bpt=device.upload(tc_bpt_host);
         if(!tc_rtw_host.empty())tc_rtw=device.upload(tc_rtw_host);
+        if(h30)return;   // tables only (the sweep replays production traces on the production workspaces)
         a=device.alloc(size_t(n)*l*4);b=device.alloc(size_t(n)*l*4);out=device.alloc(size_t(n)*l*4);at=device.alloc(size_t(n)*l*4);bt=device.alloc(size_t(n)*l*4);
         A=device.alloc(size_t(k)*J*n*4);B=device.alloc(size_t(k)*J*n*4);C=device.alloc(size_t(k)*J*n*4);
         if(n==65536&&k==16&&r16tab&&device.bpo_fxt_init&&device.bpo_middle_r16x&&device.bpo_p3crt_x){   // fused P3+CRT: F factor tables TH/TL
@@ -466,11 +487,24 @@ struct State {
         config.corrections=corrections;config.qmod=qmod;config.bias=bias;
         column_pipeline=std::make_unique<ColumnStripPipeline<Cuda>>(*cuda,config,slots);
     }
+    // h30 shell: same point geometry as o, tables built for the mixed prime set on o's context (no module, no workspaces)
+    struct H30Tag{};
+    State(const State& o,H30Tag):n(o.n),w(o.w),l(o.l),k(0),delta(o.delta),logn(o.logn),rows(o.rows),cols(o.cols),group(o.group),logrows(o.logrows),ntt_threads(o.ntt_threads){
+        h30=true;ext=o.cuda.get();qbig=o.qbig;init_weighted(qbig);}
+    // device tables the production P1/P2/P3/CRT kernels take as parameters (k = 16 layouts; same order for both prime sets)
+    std::vector<DiagTab> tables()const{const size_t K=k,RS=root_stride_host;
+        return {{p,K*4},{mu,K*8},{tw,K*RS*8},{itw,K*RS*8},{stage_tw,K*256*8},{stage_itw,K*256*8},{r16tab,K*512*8},
+                {t2n,K*8*512*8},{t2nM,K*8*512*8},{ctab,K*256*256*8},{tc_bpt,8*32*16*4},{tc_bfrag,9*2*32*2*4},{invn,K*8*8},{weighted_twist,K*8*8}};}
+    // exit-time sweep: h30 prefix + (production table, h30 table) pairs; false if the h30 set does not fit the batched layout
+    bool build_h30(std::string& pre,std::vector<DiagTab>& tabs){
+        State h(*this,H30Tag{});
+        if(h.k!=k||h.short_words!=short_words||h.tc_bfrag_host.empty()||h.tc_bpt_host.empty()||!h.ctab||!h.r16tab||!h.t2nM||h.root_stride_host!=root_stride_host)return false;
+        pre=h.h30_prefix+KERNEL_SOURCE;tabs=h.tables();return true;}
     explicit State(const fherma::Point& point):n(point.N),w(point.W),l(point.L){
         bcount=point.B;if(!bcount)throw std::runtime_error("B must be positive");
         long page_size=sysconf(_SC_PAGESIZE);if(page_size<=0||(page_size&(page_size-1)))throw std::runtime_error("unsupported host page size");host_page_size=size_t(page_size);
         if(n<2||n>65536||(n&(n-1))||w<2||w>1747||l!=(w+31)/32||point.q.data.size()!=l)throw std::runtime_error("unsupported point");
-        Big q=point.q.data;norm(q);if(bits(q)!=w||small_mod(q,2*n)!=1)throw std::runtime_error("invalid modulus");
+        Big q=point.q.data;norm(q);if(bits(q)!=w||small_mod(q,2*n)!=1)throw std::runtime_error("invalid modulus");qbig=q;
         Big pow2(w/32+1,0);pow2[w/32]=u32(1)<<(w%32);Big diff=minus(pow2,q);
         if(diff.size()!=1||!diff[0])throw std::runtime_error("requires q=2^W-d, 0<d<2^32");
         delta=diff[0];
