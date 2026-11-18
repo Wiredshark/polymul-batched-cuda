@@ -1,0 +1,3 @@
+#pragma once
+// generated: sweep-only kernels (old_sweep.cuh) as a string
+static const char OLD_SWEEP_SOURCE[] = R"OLDSWEEP(@OLD_SWEEP_SOURCE@)OLDSWEEP";
