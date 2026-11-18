@@ -908,7 +908,8 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
     for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
     #pragma unroll
     for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
-    __syncthreads();
+    __syncthreads();   // every thread's A/B loads have completed (values consumed above)
+    if(untw&8)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=ta[17*c2+i];   // thread row t = c2: k1 = brev4(c2)
     __syncthreads();
