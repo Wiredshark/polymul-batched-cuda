@@ -60,6 +60,9 @@
 #ifndef BPO_XV
 #define BPO_XV BPO_XF
 #endif
+#ifndef BPO_XG
+#define BPO_XG 0u   // second template word of bpo_first_x (production 0; FHERMA_EXTRA_DEFINES test hook for sweep variants, e.g. lw = 512u with BPO_XF|32768)
+#endif
 struct __align__(64) XTMap{u64 w[16];};
 struct XNegP{u32 v[BCRT_K];};
 __host__ __device__ constexpr XNegP xnegp_make(){XNegP a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=0u-P[i];return a;}
@@ -581,6 +584,12 @@ __device__ __forceinline__ void xrdif16(u32* const base0,const u32 so,const u64*
 #define XG_RED5(G) (((G)>>6)&1u)
 #define XG_WG(G) (((G)>>7)&1u)
 #define XG_PF2(G) (((G)>>8)&1u)
+// Sweep round 7 (p1x): G 512 XG_LW (with F flag 32768 = LB): late TMA drain wait. Production waits (lane 0, wait_group.read 0)
+//   at the END of each quad, before the next quad's phase-A math; with LB the only consumer of that wait is the barrier just
+//   before the next quad's phase-A stores into X, so XG_LW moves the wait there: quad u's bulk smem reads (store drain) overlap
+//   quad u+1's MMA / reduction / twist / J-DIF / R-DIF-256/128 math. Exact (X is rewritten only after every warp's lane 0 waited
+//   and the block barrier); the last quad's drain is covered by the final wait_group 0 as in production.
+#define XG_LW(G) (((G)>>9)&1u)
 struct XFMaskW{u32 v[8][2][4];};   // XG_WA word masks [digit j][xh][tig]: bits [POS[j]%32-32t, POS[j]%32+D-32t) of word t = tig+4xh
 __host__ __device__ constexpr XFMaskW xfmaskw_make(){XFMaskW a{};constexpr u32 P[9]={BCRT_POS,BCRT_W};
     for(u32 j=0;j<8;++j)for(u32 xh=0;xh<2;++xh)for(u32 t=0;t<4;++t){const int sh=int(P[j]%32u),e=sh+int(P[j+1])-int(P[j]),w0=32*int(t+4*xh);
@@ -855,7 +864,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 if constexpr(XR16(F)!=2)   // sweep r16a: R stages all in phase B
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
-                if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
+                if(LB){
+#if BPO_X_HAS_TMA
+                    if constexpr(XG_LW(G)!=0)if((F&2)&&lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // sweep lw: drain wait after the math
+#endif
+                    __syncthreads();}   // previous quad's phase-B / TMA reads of X done (flag 32768)
                 if(F&4096){u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // row 64rr+rl -> skewed 72rr+rl+4(rl>>5): immediate offsets
                     #pragma unroll
                     for(u32 rr=0;rr<4;++rr)
@@ -905,6 +918,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             xrdif<F>(X+q*XS+j*XD,(F&32)?8*q:0,(F&4)?STS+q*256u:stage_tw+size_t(r)*256,ctab+(size_t(r)*256u+c)*256u,bpr_pr[r],dst+u64(r*8+j)*N+c*8u,lane,op?tmB:tmA,c,r*8+j);
         }
 #if BPO_X_HAS_TMA
+        if constexpr(!(XG_LW(G)!=0&&LB))   // sweep lw: the wait moves to the LB barrier of the next quad (final wait_group 0 after the loop)
         if((F&2)&&lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable (ablation 9: no wait)
 #endif
     }
@@ -918,7 +932,7 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
-    bpo_first_xb<BPO_XF>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+    bpo_first_xb<BPO_XF,BPO_XG>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif // bpo_first_x
 #ifndef BPO_LEAN

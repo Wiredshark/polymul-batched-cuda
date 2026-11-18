@@ -20,7 +20,6 @@
 #include <memory>
 #include <cmath>
 #include <sstream>
-#include "old_sweep_src.h"   // OLD_SWEEP_SOURCE: sweep-only P1 xq / P2 r16db kernels (old_sweep.cuh)
 
 inline bool sweep_env(){const char* e=std::getenv("FHERMA_SWEEP");return !e||*e!='0';}
 
@@ -31,11 +30,10 @@ template<class C> struct Sweep {
     std::vector<Prog> progs; std::vector<std::thread> th; std::string arch,native;
     struct PB { std::vector<unsigned char> b; std::vector<size_t> o; template<class T> void add(T x){const size_t off=(b.size()+sizeof(T)-1)/sizeof(T)*sizeof(T);b.resize(off+sizeof(T));std::memcpy(b.data()+off,&x,sizeof(T));o.push_back(off);} };
     // mk: kernel with its own parameter list, built from the production trace it replaces (fused variants; no per-stage exactness)
-    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; std::function<bool(const KProf::Trace&,PB&)> mk; bool skip=false; bool wa=false; std::function<void(const KProf::Trace&,CUstream)> cl; };   // cl: custom launcher (multi-kernel / edited params)   // wa: P1 bpt (param 6) = shifted table
+    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; std::function<bool(const KProf::Trace&,PB&)> mk; bool skip=false; bool wa=false; int p1m=0; bool p1e=false; };   // p1m 1: m16 chain mode, 2: m16a (see run())   // wa: P1 bpt (param 6) = shifted table
     const std::vector<KProf::Trace>* trp=nullptr;
     std::vector<V> vs[4];   // per stage (KProf::P1..CRT)
     CUevent ea=nullptr,eb=nullptr,e0=nullptr,e1=nullptr,ej=nullptr;CUdeviceptr ref=0,bad=0,wabpt=0;size_t ref_n=0;CUfunction cmp=nullptr;
-    std::vector<CUstream> tst;std::vector<CUdeviceptr> tbuf;   // split: per-stream L2 intermediate T
     std::vector<unsigned> mprimes,mpos;   // BCRT_PRIMES / BCRT_POS parsed from the source prefix (XG_WA table)
     static std::vector<unsigned> mlist(const std::string& s,const char* name){std::vector<unsigned> v;const std::string k=std::string("#define ")+name+" ";const size_t p=s.find(k);if(p==std::string::npos)return v;
         const size_t e=s.find('\n',p);std::string x=s.substr(p+k.size(),e-p-k.size());for(char& ch:x)if(ch==','||ch=='u')ch=' ';std::istringstream is(x);unsigned long long y;while(is>>y)v.push_back(unsigned(y));return v;}
@@ -68,62 +66,24 @@ template<class C> struct Sweep {
         {const int c=prog("cmp",arch);progs[size_t(c)].src="typedef unsigned int u32;typedef unsigned long long u64;\n"   // exactness compare kernel (tiny)
             "extern \"C\" __global__ void sw_cmp(const uint4* a,const uint4* b,u64 n,u32* bad){u32 c=0;for(u64 i=u64(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=u64(gridDim.x)*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n";
          addk(c,"sw_cmp",false);}
-        // round 7 (oldideas, on 82f8da4): options rejected on the RTX 5070 (48 MB L2) and never measured on the 128 MB-L2 target.
-        // P1 (one group launch = 8 primes): ctrl (recompiled production); xq / xq2 = bpo_first_xq (p1occ 1427a86: the tc3
-        // low-register idea on bpo_first_x, one quad per block, grid y = quads, 3 / 2 blocks/SM); tc3 = the old bpo_first_tc3
-        // (62dda64, 3 blocks/SM, in-kernel cross twiddles, plain stores); split = P1SPLIT (89b9034: bpo_p1a TC+twist+J-DIF of
-        // 64 columns x the group's quads into an L2 intermediate T, then bpo_p1b R-DIF + cross twiddle); grp4 = PRIME_GROUP
-        // (v7 317efad / FHERMA_PO_GROUP) at 4 primes per P1 launch (production kernel, two launches per group trace, input kept
-        // in L2 between them); grp16 = one P1 launch over all 16 primes (the per-kernel line times 16 primes vs production's 8:
-        // compare it with 2.0; the chain drops the second group launch). P2: r16db = double buffer (0890374) on
-        // bpo_middle_r16 (two digit tiles per block, the second tile's loads issued before the first tile's transforms).
-        // CRT: pf = CRT-side L2 prefetch (ddce39b) of the next product on the same chain (product+2: its P1 inputs, as many
-        // columns as P1's own prefetch step, max 512) through bpo_crt_lean's pfa/pfb/pfitems; its gain shows only in the "x:"
-        // chains (products 0+1 chains, each followed by the P1 group 0 of product 2 / 3 on the same stream; prod_us = the same
-        // extended production chain).
-        const int pold=prog("old",arch);
-        {std::string& S=progs[size_t(pold)].src;
-         const std::string a1="#define BPO_LEAN_SPLIT 0",b1="#define BPO_LEAN_SPLIT 1";const size_t q1=S.find(a1);if(q1!=std::string::npos)S.replace(q1,a1.size(),b1);
-         const std::string a2="#ifndef BPO_LEAN\ntemplate<int SWD_> __global__ void __launch_bounds__(256,BPO_TC3_MINB) bpo_first_tc3";const size_t q2=S.find(a2);if(q2!=std::string::npos)S.replace(q2,16,"#if 1");}
-        const int k_tc3=addk(pold,"bpo_first_tc3<0>",true),k_p1a=addk(pold,"bpo_p1a<0>",true),k_p1b=addk(pold,"bpo_p1b<0>",true);
-        const int pxq=prog("xq",arch);progs[size_t(pxq)].src+="SWP1(sw_ctrl,BPO_XF,0u,2)\n"+std::string(OLD_SWEEP_SOURCE);
-        const int k_ctrl=addk(pxq,"sw_ctrl",false),k_xq=addk(pxq,"sw_xq",false),k_xq2=addk(pxq,"sw_xq2",false),k_db=addk(pxq,"sw_r16db",false);
-        auto fnof=[this](int pi,int ki)->CUfunction{const auto& P=progs[size_t(pi)];if(ki<0||size_t(ki)>=P.fn.size()||!P.fn[size_t(ki)])throw std::runtime_error("kernel missing");return P.fn[size_t(ki)];};
-        auto lp=[this](CUfunction f,unsigned gx,unsigned gy,unsigned gz,unsigned bx,unsigned sm,CUstream st,std::vector<unsigned char>& b,const std::vector<size_t>& po){
-            void* pp[64];for(size_t i=0;i<po.size();++i)pp[i]=b.data()+po[i];d.check(d.cuLaunchKernel(f,gx,gy,gz,bx,1,1,sm,st,pp,nullptr));};
-        auto lq=[this](CUfunction f,unsigned gx,unsigned gy,unsigned gz,CUstream st,PB& q){
-            void* pp[64];for(size_t i=0;i<q.o.size();++i)pp[i]=q.b.data()+q.o[i];d.check(d.cuLaunchKernel(f,gx,gy,gz,256,1,1,0,st,pp,nullptr));};
-        addv(KProf::P1,"ctrl",pxq,k_ctrl);
-        for(int w=0;w<2;++w){const int ki=w?k_xq2:k_xq;addv(KProf::P1,w?"xq2":"xq",pxq,ki);
-            vs[KProf::P1].back().cl=[pxq,ki,fnof,lp](const KProf::Trace& t,CUstream st){const unsigned r0=param<unsigned>(t,9),r1=param<unsigned>(t,10);
-                std::vector<unsigned char> b=t.pb;lp(fnof(pxq,ki),t.gx,std::max(1u,(r1-r0)/4u),1,256,0,st,b,t.po);};}
-        addv(KProf::P1,"tc3",pold,k_tc3);
-        vs[KProf::P1].back().cl=[pold,k_tc3,fnof,lp](const KProf::Trace& t,CUstream st){std::vector<unsigned char> b=t.pb;
-            const unsigned pf=param<unsigned>(t,11)&0x0fffffffu;std::memcpy(b.data()+t.po[11],&pf,4);lp(fnof(pold,k_tc3),t.gx,1,1,256,0,st,b,t.po);};
-        addv(KProf::P1,"split",pold,k_p1a);
-        vs[KProf::P1].back().cl=[this,pold,k_p1a,k_p1b,fnof,lq](const KProf::Trace& t,CUstream st){
-            const unsigned r0=param<unsigned>(t,9),r1=param<unsigned>(t,10),N=param<unsigned>(t,7),pfs=param<unsigned>(t,11)&0x0fffffffu,ncol=64,nq=(r1-r0)/4;
-            size_t slot=0;for(;slot<tst.size()&&tst[slot]!=st;++slot){}
-            if(slot==tst.size()){CUdeviceptr x=0;d.check(d.cuMemAlloc(&x,size_t(2)*16*8*ncol*256*4));tst.push_back(st);tbuf.push_back(x);}
-            const CUdeviceptr T=tbuf[slot];const CUdeviceptr a=param<CUdeviceptr>(t,0),b=param<CUdeviceptr>(t,1),A=param<CUdeviceptr>(t,2),B=param<CUdeviceptr>(t,3),
-                tw=param<CUdeviceptr>(t,4),stw=param<CUdeviceptr>(t,5),bpt=param<CUdeviceptr>(t,6),ct=param<CUdeviceptr>(t,12);
-            for(unsigned c0=0;c0<256;c0+=ncol){
-                {PB q;q.add(a);q.add(b);q.add(T);q.add(tw);q.add(stw);q.add(bpt);q.add(N);q.add(c0);q.add(ncol);q.add(r0/4);q.add(r0/4+nq);q.add(pfs);lq(fnof(pold,k_p1a),2*ncol,1,1,st,q);}
-                {PB q;q.add(T);q.add(A);q.add(B);q.add(stw);q.add(ct);q.add(N);q.add(c0);q.add(ncol);q.add(r0);q.add(0u);lq(fnof(pold,k_p1b),ncol,4*nq,2,st,q);}}};
-        for(unsigned G:{4u,16u}){addv(KProf::P1,G==4?"grp4":"grp16",-1,-1);
-            vs[KProf::P1].back().cl=[G,lp](const KProf::Trace& t,CUstream st){const unsigned r0=param<unsigned>(t,9),r1=param<unsigned>(t,10),pf=param<unsigned>(t,11);
-                auto go=[&](unsigned s0,unsigned s1,unsigned pfv){std::vector<unsigned char> b=t.pb;std::memcpy(b.data()+t.po[9],&s0,4);std::memcpy(b.data()+t.po[10],&s1,4);std::memcpy(b.data()+t.po[11],&pfv,4);
-                    lp(t.fn,t.gx,t.gy,t.gz,t.bx,t.smem,st,b,t.po);};
-                if(G==16){if(r0==0)go(0,16,pf&~(1u<<28));return;}   // one launch over all primes (no later group re-reads the input)
-                for(unsigned s0=r0;s0<r1;s0+=G)go(s0,s0+G,s0+G<r1?(pf|(1u<<28)):pf);};}   // non-last sub-groups keep the input L2-normal
-        addv(KProf::P2,"r16db",pxq,k_db);
-        vs[KProf::P2].back().cl=[pxq,k_db,fnof,lp](const KProf::Trace& t,CUstream st){std::vector<unsigned char> b=t.pb;lp(fnof(pxq,k_db),t.gx,t.gy/2,t.gz,t.bx,t.smem,st,b,t.po);};
-        addv(KProf::CRT,"pf",-1,-1);
-        vs[KProf::CRT].back().cl=[this,lp](const KProf::Trace& t,CUstream st){std::vector<unsigned char> b=t.pb;
-            const KProf::Trace* nx=nullptr;if(trp)for(const auto& u:*trp)if(u.product==t.product+2&&u.stage==KProf::P1&&!u.pb.empty()){nx=&u;break;}
-            if(nx&&t.po.size()>=9){const CUdeviceptr na=param<CUdeviceptr>(*nx,0),nb=param<CUdeviceptr>(*nx,1);const unsigned it=std::min(512u,param<unsigned>(*nx,11)&0x0fffffffu);
-                std::memcpy(b.data()+t.po[5],&na,8);std::memcpy(b.data()+t.po[6],&nb,8);std::memcpy(b.data()+t.po[7],&it,4);}
-            lp(t.fn,t.gx,t.gy,t.gz,t.bx,t.smem,st,b,t.po);};
+        // round 7 (p1x, on 82f8da4 + round-6 scaffolding): P1 store-drain overlap. Production lane 0 of every warp waits for its
+        // quad's bulk smem reads (cp.async.bulk.wait_group.read 0) at the END of the quad, before the next quad's phase-A math.
+        // lb = flag 32768 alone (quad barrier just before the phase-A stores; pv26 on older kernels: neutral), lw = lb + G 512 XG_LW
+        // (the drain wait moved after the next quad's phase-A math, right before that barrier: quad u's store drain overlaps quad
+        // u+1's MMA / reduction / twist / J-DIF / R-DIF math), abl_nw = no per-quad drain wait (XABL 9, wrong values: upper bound
+        // of what lw can hide), co_prod = compute-only reference. Chains: prod, p1=lb, p1=lw, m16 (production kernel, P1 group 0
+        // runs all 16 primes in one launch, group-1 P1 skipped: one input staging + one launch per product instead of two),
+        // m16+lw, and cf:* = the same chains after a clean (read-only) L2 flush instead of the dirty 2xL2 write flush.
+        {struct P1V{const char* n;const char* f;unsigned g;bool abl;bool wa;};
+         static const char* const CO="(BPO_XF|(8u<<20)|(1u<<24))";
+         static const P1V p1v[]={
+             {"ctrl","BPO_XF",0,false,false},{"lb","(BPO_XF|32768u)",0,false,false},{"lw","(BPO_XF|32768u)",512,false,false},
+             {"abl_nw","(BPO_XF|(9u<<20))",0,true,false},{"co_prod",CO,0,true,false}};
+         constexpr size_t NV=sizeof(p1v)/sizeof(p1v[0]),PER=3;
+         int pi=-1;
+         for(size_t k=0;k<NV;++k){const auto& x=p1v[k];if(k%PER==0){const char nm[4]={'p','1',char('a'+k/PER),0};pi=prog(nm,arch);}
+             const std::string kn="sw_p1_"+std::to_string(k);progs[size_t(pi)].src+="SWP1("+kn+","+x.f+","+std::to_string(x.g)+"u,2)\n";
+             addv(KProf::P1,x.n,pi,addk(pi,kn,false),-1,0,0,x.abl);vs[KProf::P1].back().wa=x.wa;}}
         for(auto& P:progs)P.fn.assign(P.kn.size(),nullptr);
         // worker threads: NVRTC compile + module load (driver JIT for PTX), in program order, until the compile deadline
         const unsigned hw=std::max(2u,std::thread::hardware_concurrency());const size_t nth=std::min<size_t>(progs.size(),std::max(1u,std::min(8u,hw-1)));
@@ -157,7 +117,7 @@ template<class C> struct Sweep {
         P.done=true;
     }
     void join(){for(auto& t:th)if(t.joinable())t.join();th.clear();}
-    ~Sweep(){join();d.cuCtxSynchronize();for(auto& P:progs)if(P.mod)d.cuModuleUnload(P.mod);for(auto e:{ea,eb,e0,e1,ej})if(e)kp.edestroy(e);for(auto p:{ref,bad,wabpt})if(p)d.cuMemFree(p);for(auto p:tbuf)if(p)d.cuMemFree(p);}
+    ~Sweep(){join();d.cuCtxSynchronize();for(auto& P:progs)if(P.mod)d.cuModuleUnload(P.mod);for(auto e:{ea,eb,e0,e1,ej})if(e)kp.edestroy(e);for(auto p:{ref,bad,wabpt})if(p)d.cuMemFree(p);}
     // XG_WA B table: the production bpt ([j][lane][tile*2+reg], bytes of 2^(8m) fa mod p) with each digit factor fa times
     // 2^-(POS[j]%32); fa is read back from the table (m = 0 bytes) and the whole production table re-derived as a check.
     bool make_wabpt(CUdeviceptr src){
@@ -179,7 +139,6 @@ template<class C> struct Sweep {
 
     // ---- measurement -------------------------------------------------------------------------------------------
     template<class D> void launch(D& g,const KProf::Trace& t,CUstream st,const V* v){
-        if(v&&v->cl){v->cl(t,st);return;}
         if(v&&v->mk){PB q;if(!v->mk(t,q))throw std::runtime_error("no params");void* pp[64];for(size_t i=0;i<q.o.size();++i)pp[i]=q.b.data()+q.o[i];
             d.check(d.cuLaunchKernel(v->fn,t.gx,t.gy,t.gz,v->bx?v->bx:t.bx,1,1,t.smem,st,pp,nullptr));return;}
         std::vector<unsigned char> b=t.pb;void* pp[64];
@@ -251,6 +210,7 @@ template<class C> struct Sweep {
          for(int w=0;w<200&&(w<3||std::chrono::duration<double>(std::chrono::steady_clock::now()-tw).count()<0.3);++w){
              for(size_t i=0;i<tr.size();++i){const auto& t=tr[i];if(t.product==0&&!t.pb.empty())g.replay(t,g.s[0]);}d.check(d.cuCtxSynchronize());}}
         trp=&tr;
+        {size_t i1=0;const KProf::Trace* t1=first(0,KProf::P1,&i1);if(t1&&t1->fn==pf[KProf::P1]&&!make_wabpt(param<CUdeviceptr>(*t1,6)))std::printf("{\"diag\":\"sw\",\"k\":\"p1\",\"error\":\"no wa table\"}\n");}
         const int RE=std::getenv("FHERMA_SWEEP_R")?std::atoi(std::getenv("FHERMA_SWEEP_R")):0;
         const KProf::Trace* k0s[4]={};const KProf::Trace* k1s[4]={};const KProf::Trace* q0s[4]={};const KProf::Trace* q1s[4]={};
         for(int st=0;st<4;++st){
@@ -273,29 +233,47 @@ template<class C> struct Sweep {
         auto best=[&](int st,size_t rank)->const V*{std::vector<const V*> c;for(auto& v:vs[st])if(v.ok&&v.ex==1&&!v.abl&&v.v!="ctrl"&&v.vs>0&&v.c1vs>0&&score(&v)<0.995)c.push_back(&v);
             std::sort(c.begin(),c.end(),[&](const V* a,const V* b){return score(a)<score(b);});return rank<c.size()?c[rank]:nullptr;};
         auto byname=[&](int st,const char* n)->const V*{for(auto& v:vs[st])if(v.ok&&v.v==n)return &v;return nullptr;};
-        struct Combo{std::string name;const V* v[4];bool ext=false;};std::vector<Combo> cs;
-        auto addc=[&](const V* a,const V* b,const V* c,const V* e){Combo x{"",{a,b,c,e}};bool any=false;for(int st=0;st<4;++st)if(x.v[st]){any=true;x.name+=(x.name.empty()?"":",")+std::string(kn[st])+"="+x.v[st]->v;}
+        struct Combo{std::string name;const V* v[4];bool cf=false;};std::vector<Combo> cs;
+        auto addc=[&](const V* a,const V* b,const V* c,const V* e){Combo x{"",{a,b,c,e},false};bool any=false;for(int st=0;st<4;++st)if(x.v[st]){any=true;x.name+=(x.name.empty()?"":",")+std::string(kn[st])+"="+x.v[st]->v;}
             if(!any)x.name="prod";for(auto& y:cs)if(y.name==x.name)return;cs.push_back(x);};
         static V skip3;skip3.v="skip";skip3.skip=true;skip3.ok=true;
+        (void)skip3;
+        // m16 chain mode: the production P1 kernel (or lw) with the group-0 trace's r1 = all primes, group-1 P1 traces skipped
+        static V m16;m16.v="m16";m16.ok=true;m16.p1m=1;static V m16lw;m16lw.v="m16+lw";m16lw.p1m=1;
+        if(const V* lw=byname(0,"lw")){m16lw.fn=lw->fn;m16lw.ok=lw->ok&&lw->ex==1;}
+        // m16a: m16 plus P2 and P3 as one launch over all primes too (group-0 trace with grid z / y = all primes, later groups
+        // skipped) = the FHERMA_PO_GROUP=16 schedule; P2/P3 kernels and parameters unchanged (they index by blockIdx prime)
+        static V m16a=m16;m16a.v="m16a";m16a.p1m=2;static V m16alw=m16lw;m16alw.v="m16a+lw";m16alw.p1m=2;static V pas;pas.v="all";pas.ok=true;pas.p1m=2;
+        // m16e: m16 with the P1 stores' L2 evict_first policy (TMA policy bits 29-30 cleared: stm 0 + flag 2048) = exactly what
+        // FHERMA_PO_GROUP=16 does in production (gfl = 0 for an ungrouped P1; P2/P3 stay per 8-prime L2 group): local B=128 harness
+        // 51.9 / 53.5 ms vs prod 55.9, with lw 50.8 / 50.7
+        static V m16e=m16;m16e.v="m16e";m16e.p1e=true;static V m16elw=m16lw;m16elw.v="m16e+lw";m16elw.p1e=true;
         addc(nullptr,nullptr,nullptr,nullptr);
-        for(const char* n:{"xq","xq2","tc3","split","grp4","grp16"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each P1 variant alone
-        addc(nullptr,byname(1,"r16db"),nullptr,nullptr);
-        addc(nullptr,nullptr,nullptr,byname(3,"pf"));
-        addc(best(0,0),best(1,0),nullptr,nullptr);   // best exact P1 + P2 (if any beat production by > 0.5%)
-        {Combo x{"x:crt=pf",{nullptr,nullptr,nullptr,byname(3,"pf")},true};if(x.v[3])cs.push_back(x);}   // extended chains (+ next product's P1 g0)
-        {Combo x{"x:p1=grp16,crt=pf",{byname(0,"grp16"),nullptr,nullptr,byname(3,"pf")},true};if(x.v[0]&&x.v[3])cs.push_back(x);}
+        for(const char* n:{"lb","lw"})addc(byname(0,n),nullptr,nullptr,nullptr);   // each P1 variant alone
+        {Combo x{"m16",{&m16,nullptr,nullptr,nullptr}};cs.push_back(x);}
+        if(m16lw.ok){Combo x{"m16+lw",{&m16lw,nullptr,nullptr,nullptr}};cs.push_back(x);}
+        (void)m16alw;(void)m16a;(void)pas;   // m16a / m16a+lw measured locally +12..14% (C workspace leaves L2): not run
+        {Combo x{"m16e",{&m16e,nullptr,nullptr,nullptr}};cs.push_back(x);}
+        if(m16elw.ok){Combo x{"m16e+lw",{&m16elw,nullptr,nullptr,nullptr}};cs.push_back(x);}
+        {const size_t n0=cs.size();for(size_t i=0;i<n0;++i){if(i==1)continue;Combo x=cs[i];x.name="cf:"+x.name;x.cf=true;cs.push_back(x);}}   // clean-flush twins
         if(cs.size()>16)cs.resize(16);
+        unsigned p1k=0;for(const auto& t:tr)if(t.product==0&&t.stage==KProf::P1&&!t.pb.empty())p1k=std::max(p1k,param<unsigned>(t,10));   // all primes (m16)
         const int nprod=[&]{int n=0;for(const auto& t:tr)n=std::max(n,t.product+1);return n;}();
         const KProf::Trace* crt0=k0s[KProf::CRT];
-        auto chain=[&](int prod,CUstream a,const Combo* c){for(const auto& t:tr)if(t.product==prod&&!t.pb.empty()){const V* v=nullptr;if(c&&t.stage<4&&k0s[t.stage]&&t.fn==k0s[t.stage]->fn)v=c->v[t.stage];if(v&&v->skip)continue;launch(g,t,a,v);}
-            if(c&&c->ext)for(const auto& t:tr)if(t.product==prod+2&&t.stage==KProf::P1&&!t.pb.empty()){launch(g,t,a,nullptr);break;}};   // x: next product's P1 g0 (production kernel)
-        Combo cext{"x:prod",{nullptr,nullptr,nullptr,nullptr},true};
-        auto csample=[&](const Combo* c)->float{CUstream a=g.s[0],b=g.s[1];g.do_flush(a);kp.erecord(e0,a);g.swait(b,e0,0);chain(0,a,c);if(nprod>1)chain(1,b,c);kp.erecord(ej,b);g.swait(a,ej,0);kp.erecord(e1,a);d.check(g.esync(e1));return kp.ms(e0,e1);};
+        auto chain=[&](int prod,CUstream a,const Combo* c){int ng[4]={0,0,0,0};for(const auto& t:tr)if(t.product==prod&&!t.pb.empty()){const V* v=nullptr;if(c&&t.stage<4&&k0s[t.stage]&&t.fn==k0s[t.stage]->fn)v=c->v[t.stage];if(v&&v->skip)continue;
+            if(v&&v->p1m==2&&(t.stage==KProf::P2||t.stage==KProf::P3)){if(ng[t.stage]++||!p1k)continue;   // m16a: group-0 P2 / P3 over all primes
+                std::vector<unsigned char> b=t.pb;void* pp[64];for(size_t i=0;i<t.po.size();++i)pp[i]=b.data()+t.po[i];
+                const unsigned gy=t.stage==KProf::P3?p1k:t.gy,gz=t.stage==KProf::P2?p1k:t.gz;d.check(d.cuLaunchKernel(t.fn,t.gx,gy,gz,t.bx,1,1,t.smem,a,pp,nullptr));continue;}
+            if(v&&v->p1m>=1&&t.stage==KProf::P1){if(param<unsigned>(t,9)!=0||!p1k)continue;   // m16: later P1 groups skipped; group 0 runs r1 = all primes, input loads evict_first (no re-read)
+                std::vector<unsigned char> b=t.pb;void* pp[64];std::memcpy(b.data()+t.po[10],&p1k,4);unsigned pf=0;std::memcpy(&pf,b.data()+t.po[11],4);pf&=~(1u<<28);if(v->p1e)pf&=~(3u<<29);std::memcpy(b.data()+t.po[11],&pf,4);
+                for(size_t i=0;i<t.po.size();++i)pp[i]=b.data()+t.po[i];d.check(d.cuLaunchKernel(v->fn?v->fn:t.fn,t.gx,t.gy,t.gz,t.bx,1,1,t.smem,a,pp,nullptr));continue;}
+            launch(g,t,a,v);}};
+        auto csample=[&](const Combo* c,bool cf)->float{CUstream a=g.s[0],b=g.s[1];if(cf)g.bw(a,g.flush,g.flush,g.flush_n,0);else g.do_flush(a);kp.erecord(e0,a);g.swait(b,e0,0);chain(0,a,c);if(nprod>1)chain(1,b,c);kp.erecord(ej,b);g.swait(a,ej,0);kp.erecord(e1,a);d.check(g.esync(e1));return kp.ms(e0,e1);};
         std::vector<Reg> crg;if(crt0)crg=regions(KProf::CRT,*crt0);
         for(const auto& c:cs){
             if(el()>budget-3){std::printf("{\"diag\":\"sw\",\"k\":\"chain\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",c.name.c_str());continue;}
             std::vector<float> pa,va,rr;const int RC=7;
-            for(int r=0;r<RC+1;++r){const bool vf=r&1;const Combo* bz=c.ext?&cext:nullptr;const float x=csample(vf?&c:bz),y=csample(vf?bz:&c);if(r>=1){(vf?va:pa).push_back(x);(vf?pa:va).push_back(y);if(x>0&&y>0)rr.push_back(vf?x/y:y/x);}}
+            for(int r=0;r<RC+1;++r){const bool vf=r&1;const float x=csample(vf?&c:nullptr,c.cf),y=csample(vf?nullptr:&c,c.cf);if(r>=1){(vf?va:pa).push_back(x);(vf?pa:va).push_back(y);if(x>0&&y>0)rr.push_back(vf?x/y:y/x);}}
             int ex=-1;
             if(cmp&&!crg.empty()){size_t tot=crg[0].bytes;if(tot>ref_n){if(ref)d.cuMemFree(ref);d.check(d.cuMemAlloc(&ref,tot));ref_n=tot;}
                 chain(0,g.s[0],nullptr);d.check(dtod(ref,crg[0].p,tot,g.s[0]));d.check(memset32(crg[0].p,0x5a5a5a5au,tot/4,g.s[0]));chain(0,g.s[0],&c);
