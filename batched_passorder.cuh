@@ -785,7 +785,7 @@ template<bool CI>__device__ __forceinline__ void pzdit_smr(u32* base,u32 (&v)[8]
 //   1 lean arithmetic + psi^0 stages as add/sub (S-DIF, S-DIT), 2 (with 1) A and B S-DIF interleaved,
 //   4 (with 1) lazy S-DIT: C words in [0,2p) (consumer: bpo_last_cm3 Shoup F product, exact for any u32)
 #ifndef BPO_P2F
-#define BPO_P2F 37   // 32: single 9 KB tile + launch bounds (256,6): 6 blocks/SM (was 5: 18 KB smem, 48 regs); 1: 62.57 vs 64.39 ms min A/B (median 63.70 vs 66.07); 5 (+lazy S-DIT, with P3T 260)
+#define BPO_P2F 5   // 1: 62.57 vs 64.39 ms min A/B (median 63.70 vs 66.07); 5 (+lazy S-DIT, with P3T 260)
 #endif
 #ifndef BPO_P2FV
 #define BPO_P2FV BPO_P2F
@@ -801,25 +801,6 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
     const u64* st=stage_tw+prime*256u;const u64* sit=stage_itw+prime*256u;
     const u64 base=u64(prime*8+j)*N;
-    u32 ab[2][8];u32 (&a)[8]=ab[0];u32 (&b)[8]=ab[1];
-    if(F&32){   // flag 32: one 9 KB tile (sb unused): A and B loads both in flight, transposed through sa in turn
-        const uint4* a4=reinterpret_cast<const uint4*>(A+base+g*2048u);
-        const uint4* b4=reinterpret_cast<const uint4*>(B+base+g*2048u);
-        uint4 va[2],vb[2];
-        #pragma unroll
-        for(u32 i=0;i<2;++i){const u32 q=threadIdx.x+256u*i;if(untw&4){va[i]=__ldcs(a4+q);vb[i]=__ldcs(b4+q);}else{va[i]=a4[q];vb[i]=b4[q];}}
-        #pragma unroll
-        for(u32 ob=0;ob<2;++ob){
-            if(ob)__syncthreads();   // A columns read out of sa
-            #pragma unroll
-            for(u32 i=0;i<2;++i){const u32 q=threadIdx.x+256u*i,cc=q>>1,s=(q&1u)*4;u32* x=sa+cc*9+s;const uint4 v=ob?vb[i]:va[i];x[0]=v.x;x[1]=v.y;x[2]=v.z;x[3]=v.w;}
-            __syncthreads();
-            #pragma unroll
-            for(u32 m=0;m<8;++m)ab[ob][m]=sa[(lane+32*m)*9+warp];
-        }
-        if((untw&8)&&threadIdx.x<128u)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);
-        __syncthreads();   // tile -> private regions
-    }else{
     {
         const uint4* a4=reinterpret_cast<const uint4*>(A+base+g*2048u);
         const uint4* b4=reinterpret_cast<const uint4*>(B+base+g*2048u);
@@ -831,17 +812,17 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
     }
     __syncthreads();
     if((untw&8)&&threadIdx.x<128u)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // tile is in smem
+    u32 ab[2][8];u32 (&a)[8]=ab[0];u32 (&b)[8]=ab[1];
     #pragma unroll
     for(u32 m=0;m<8;++m){a[m]=sa[(lane+32*m)*9+warp];b[m]=sb[(lane+32*m)*9+warp];}
     __syncthreads();   // tile -> private regions
-    }
-    u32* ra=sa+warp*288;u32* rb=(F&32)?ra:sb+warp*288;
+    u32* ra=sa+warp*288;u32* rb=sb+warp*288;
     if(F&16){   // ablation: no arithmetic (wrong values)
         #pragma unroll
         for(u32 m=0;m<8;++m)a[m]^=b[m];
     }else{
     if(L&&(F&2)){u32* const rr[2]={ra,rb};pxdif2_smr<true>(rr,ab,st,p,lane);}
-    else if(L){pxdif_smr<true>(ra,a,st,p,lane);if(F&32)__syncwarp();pxdif_smr<true>(rb,b,st,p,lane);}
+    else if(L){pxdif_smr<true>(ra,a,st,p,lane);pxdif_smr<true>(rb,b,st,p,lane);}
     else{bpo_dif_smr(ra,a,st,p,lane);bpo_dif_smr(rb,b,st,p,lane);}
     if(untw&16){   // Montgomery pointwise (a*b*2^-32; host folds 2^32 into the P3 table t2n)
         const u32 pinv=pxinv32(p);
@@ -867,11 +848,159 @@ template<u32 F>__device__ __forceinline__ void bpo_p2_body(u32* sa,u32* sb,const
         if(BPO_P2ABL!=1||s[0]==0xffffffffu){o[0]=make_uint4(s[0],s[1],s[2],s[3]);o[1]=make_uint4(s[4],s[5],s[6],s[7]);}
     }
 }
-extern "C" __global__ void __launch_bounds__(256,(BPO_P2F&32)?6:1) bpo_middle_smr(const u32* A,const u32* B,u32* C,
+extern "C" __global__ void __launch_bounds__(256) bpo_middle_smr(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* ratios,const u64* untwist,const u64* stage_tw,const u64* stage_itw,u32 N,u32 logR,u32 untw){
     __shared__ __align__(16) u32 sa[256*9];
-    __shared__ __align__(16) u32 sb[(BPO_P2F&32)?4:256*9];
+    __shared__ __align__(16) u32 sb[256*9];
     bpo_p2_body<BPO_P2F>(sa,sb,A,B,C,primes,ratios,untwist,stage_tw,stage_itw,N,logR,untw);
+}
+// P2 radix-16 (bpo_middle_r16, FHERMA_P2R16): the S = 256-point cyclic DFTs as 16 x 16 in registers.
+// 128 threads = 8 slots s x 16 threads; thread (s, c2) owns x[16 c1 + c2], c1 = 0..15 (coalesced 128 B warp loads:
+// warp w = c2 in 4w..4w+3, lane&7 = s). Forward per operand: DIF16 over c1 (twiddles w^(16e) from the r16 table),
+// middle twiddle w^(c2 k1), one 16 x 16 smem transpose (slot stride 292 = 4 mod 32, row stride 17: conflict-free both ways),
+// DIF16 over c2 -> thread t holds X[brev4(t) + 16 brev4(i)] in register i for both operands. Pointwise (Montgomery
+// with untw&16), inverse = DIT16 (bit-reversed in) + w^-(c2 k1) + transpose + DIT16: thread (s, c2) gets 256 x[16 c1 + c2]
+// (unnormalized, lazy words in [0,2p)) and stores C[c][g*8+s]. Same residues as bpo_middle_smr (P3 consumes any u32).
+// r16: per prime 2 x 256 Shoup words, [0][e] = w^e, [1][e] = w^-e, w = psi^512 (the S root of the stage tables).
+__device__ __forceinline__ void r16_dif16(u32 (&v)[16],const u64* t,u32 p){
+    #pragma unroll
+    for(u32 j=0;j<8;++j){const u32 a=v[j],b=v[j+8];v[j]=pxadd(a,b,p);v[j+8]=j?pxmsh(a+p-b,t[16*j],p):pxsub(a,b,p);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=8)
+        #pragma unroll
+        for(u32 j=0;j<4;++j){const u32 a=v[h+j],b=v[h+j+4];v[h+j]=pxadd(a,b,p);v[h+j+4]=j?pxmsh(a+p-b,t[32*j],p):pxsub(a,b,p);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=4){
+        {const u32 a=v[h],b=v[h+2];v[h]=pxadd(a,b,p);v[h+2]=pxsub(a,b,p);}
+        {const u32 a=v[h+1],b=v[h+3];v[h+1]=pxadd(a,b,p);v[h+3]=pxmsh(a+p-b,t[64],p);}}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=2){const u32 a=v[h],b=v[h+1];v[h]=pxadd(a,b,p);v[h+1]=pxsub(a,b,p);}
+}
+// lazy DIT16, bit-reversed input -> natural output; CI: inputs canonical (first stage without input reductions)
+template<bool CI>__device__ __forceinline__ void r16_dit16(u32 (&v)[16],const u64* t,u32 p){
+    #pragma unroll
+    for(u32 h=0;h<16;h+=2){if(CI)pzdit1c(v[h],v[h+1],p);else pzdit1(v[h],v[h+1],0,p);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=4){pzdit1(v[h],v[h+2],0,p);pzdit(v[h+1],v[h+3],t[64],p);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=8)
+        #pragma unroll
+        for(u32 j=0;j<4;++j){if(j)pzdit(v[h+j],v[h+j+4],t[32*j],p);else pzdit1(v[h],v[h+4],0,p);}
+    #pragma unroll
+    for(u32 j=0;j<8;++j){if(j)pzdit(v[j],v[j+8],t[16*j],p);else pzdit1(v[0],v[8],0,p);}
+}
+__device__ __forceinline__ constexpr u32 r16_brev4(u32 i){return ((i&1u)<<3)|((i&2u)<<1)|((i&4u)>>1)|((i&8u)>>3);}
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
+    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
+    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
+    const u64 base=u64(prime*8+j)*N;
+    u32 a[16],b[16];
+    {   const u32* a0=A+base+g*2048u+c2*8u+s;const u32* b0=B+base+g*2048u+c2*8u+s;
+        #pragma unroll
+        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
+    }
+    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    u32* const ta=TA+s*292u;
+    #pragma unroll
+    for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=ta[17*c2+i];   // thread row t = c2: k1 = brev4(c2)
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*i+c2]=b[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
+    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
+    r16_dit16<true>(a,ti,p);
+    {const u32 k1=r16_brev4(c2);
+        #pragma unroll
+        for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],__ldg(ti+((i*k1)&255u)),p);   // natural c2' = i
+        a[0]=pzred(a[0],p);}   // all canonical for the second DIT16 (CI)
+    __syncthreads();   // forward reads of TA done
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*c2+i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=ta[17*i+c2];   // register i = row i -> k1 = brev4(i): bit-reversed input
+    r16_dit16<true>(a,ti,p);
+    u32* o=C+base+c2*256u+g*8u+s;
+    #pragma unroll
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+}
+// P3 radix-16 (bpo_last_r16, FHERMA_P3R16): same values as bpo_last_cm3 (BPO_P3T 260). Block (column c, prime), 128 threads.
+// Phase J: thread t owns slots t and t+128: 8 digit words each (coalesced), F (cross untwiddle * t1) Shoup product,
+// lazy 8-point J-DIT, tile X[d][sl + sl/16] (digit stride 272 = 16 mod 32). Phase R: thread (d = tid/16, a = tid%16)
+// takes slots 16a+b (b = 0..15; slot holds frequency brev8, so k1 = brev4(a), k2 = brev4(b): bit-reversed DIT input),
+// DIT16 over k2, w^-(h2 k1), transpose T[d][a][h2] (row stride 17), DIT16 over k1 -> natural h1: h = 16 h1 + h2.
+// Output D[(prime*8+d)*N + c*256 + h] = Shoup(v, t2n[...][(c>>7)*256 + h]) canonical. R and J roots = r16 inverse table.
+extern "C" __global__ void __launch_bounds__(128) bpo_last_r16(const u32* C,u32* D,const u32* primes,
+    const u64* untwist,const u64* r16,const u64* t2n,u32 N,u32 logR){
+    __shared__ u32 X[8*272];u32* const T=X;   // 8.7 KB: the transpose reuses the tile (one more barrier)
+    const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
+    const u32 tid=threadIdx.x;
+    const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
+    const u64* ti=r16+u64(prime)*512u+256u;
+    {   const u32* src=C+u64(prime*8)*N+c*256u+tid;
+        u32 y[2][8];
+        #pragma unroll
+        for(u32 hf=0;hf<2;++hf)
+            #pragma unroll
+            for(u32 d=0;d<8;++d)y[hf][d]=src[u64(d)*N+128u*hf];
+        #pragma unroll
+        for(u32 hf=0;hf<2;++hf){
+            const u32 t=tid+128u*hf;
+            u64 F;{const u32 k1=__brev(t)>>(32-logR);
+                const u32 wv=mul_shoup(u32(bm_root(itw,2u*c*k1,N,p)),itw[1+(c&127u)],p);
+                const u64 m0=itw[0];u32 q=wv*u32(m0>>32)+__umulhi(wv,u32(m0));
+                const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
+                F=u64(wv)|(u64(q)<<32);}
+            u32 (&yv)[8]=y[hf];
+            #pragma unroll
+            for(u32 d=0;d<8;++d)yv[d]=pxmsh(yv[d],F,p);
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=2)pzdit1c(yv[d0],yv[d0+1],p);
+            #pragma unroll
+            for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+                #pragma unroll
+                for(u32 d0=0;d0<8;d0+=len){
+                    #pragma unroll
+                    for(u32 jj=0;jj<half;++jj){if(jj==0)pzdit1(yv[d0],yv[d0+half],0,p);else pzdit(yv[d0+jj],yv[d0+jj+half],ti[jj*(256u/len)],p);}}}
+            #pragma unroll
+            for(u32 d=0;d<8;++d)X[d*272u+t+(t>>4)]=yv[d];
+        }
+    }
+    __syncthreads();
+    const u32 d=tid>>4,a=tid&15u;
+    u32 v[16];
+    #pragma unroll
+    for(u32 b=0;b<16;++b)v[b]=X[d*272u+17u*a+b];
+    r16_dit16<false>(v,ti,p);
+    {const u32 k1=r16_brev4(a);
+        #pragma unroll
+        for(u32 i=1;i<16;++i)v[i]=pxmsh(v[i],__ldg(ti+((i*k1)&255u)),p);
+        v[0]=pzred(v[0],p);}
+    __syncthreads();   // all tile reads done before the transpose overwrites it
+    #pragma unroll
+    for(u32 i=0;i<16;++i)T[d*272u+17u*a+i]=v[i];
+    __syncthreads();
+    const u32 h2=a;
+    #pragma unroll
+    for(u32 i=0;i<16;++i)v[i]=T[d*272u+17u*i+h2];
+    r16_dit16<true>(v,ti,p);
+    const u64* tn=t2n+u64(prime*8+d)*512u+(c>>7)*256u+h2;
+    u32* out=D+u64(prime*8+d)*N+c*256u+h2;
+    #pragma unroll
+    for(u32 h1=0;h1<16;++h1)out[16u*h1]=pxmsh(v[h1],tn[16u*h1],p);
 }
 #if !defined(BPO_LEAN)
 extern "C" __global__ void __launch_bounds__(256) bpo_middle_smrv(const u32* A,const u32* B,u32* C,
