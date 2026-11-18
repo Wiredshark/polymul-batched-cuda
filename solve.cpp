@@ -590,7 +590,7 @@ struct State {
         return true;
     }
     // Pass-order pipeline: P1 (prepare+J+R fwd) -> P2 (S fwd, pointwise, S inv) -> P3 (J+R inv) -> CRT.
-    CUdeviceptr next_a=0,next_b=0;   // input of the next product on the same chain (CRT prefetch)
+    CUdeviceptr next_a=0,next_b=0;   // input of the next product on the same chain (i+S, S = chains; 0 for the last S products): CRT prefetch, default on
     u32 xoff=0;   // variant 5 = variant 4 minus features in FHERMA_V5_OFF (1 CRT prefetch, 2 P1 L2 prefetch, 4 P3v2)
     bool off(u32 bit)const{return (xoff&bit)!=0;}
     // FHERMA_P1_PAD=bytes (variant 4/5, xoff bit 8 disables): extra dynamic smem so fewer P1 blocks
@@ -685,7 +685,7 @@ struct State {
             else if(g2<pg){for(u32 s0=r0;s0<r0+pg;s0+=g2)p23(s0,g2,wsG[cur_ws]);}else p23(r0,pg,Cg);
         }
         if(!(sm&32)){}else if(fxon)d.launch3(d.bpo_p3crt_x,8u,256u,1u,64u,C,out,tc_bfrag,r16tab,t2nM,n,delta);
-        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&std::getenv("FHERMA_CRTPF");d.launch(d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?d.bpo_crt_lean:d.bpo_crt_tc_cm,n/128,1,A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(p1_grid,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}
+        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&!std::getenv("FHERMA_NO_CRTPF");d.launch(d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?d.bpo_crt_lean:d.bpo_crt_tc_cm,n/128,1,A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(p1_grid,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}   // default (pv44 sweep x:crt=pf 0.983): L2 prefetch of the next same-chain product's P1 input; none for the last product of each chain (next_a=0); FHERMA_NO_CRTPF=1 off
         else if(po==2)d.launch(d.bpo_crt_cm,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));
         else if(d.batched_crt_tc&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT"))d.launch(d.batched_crt_tc,n/128,1,A,out,tc_bfrag,n,delta);
         else d.launch(d.batched_crt,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));mark(5);
