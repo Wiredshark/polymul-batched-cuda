@@ -31,6 +31,20 @@
 #ifndef BPO_XA
 #define BPO_XA 0
 #endif
+// Diagnostic ablations in template flag bits >= 20 (BPO_DIAG kernels / exit-time sweep only; production F has none set):
+// bits 20-23 override BPO_XA, bit 24 inputs from column 0 of a (L2-resident).
+#define XABL(F) ((((F)>>20)&15u)?(((F)>>20)&15u):u32(BPO_XA))
+#define XDIN(F) (((F)>>24)&1u)
+// Sweep-only variant bits (exit-time sweep round 2; production BPO_XF sets none of them):
+//   bit 28 XCPQ input staging in 64-row quarters, two cp.async groups in flight (fragments of quarter k built while k+1 lands)
+//   bit 29 XTWH phase-A twist / J-DIF / R-DIF-256/128 twiddles loaded before the MMA digit loop (latency off the chain)
+//   bit 30 XMNV phase-A MMAs as non-volatile asm (ptxas may interleave them with the reduction / integer work)
+//   bit 31 XQ4  pbq phase B layout-2 stages on all 4 columns at once (no rolled pair loop, 4x8 live values)
+//   1024        pbq phase B layout-1 groups as a rolled loop too (smaller code; sweep a26c406 "r1" on xrdif6q)
+#define XCPQ(F) (((F)>>28)&1u)
+#define XTWH(F) (((F)>>29)&1u)
+#define XMNV(F) (((F)>>30)&1u)
+#define XQ4(F) (((F)>>31)&1u)
 #if defined(__CUDA_ARCH__)&&__CUDA_ARCH__>=900
 #define BPO_X_HAS_TMA 1
 #else
@@ -55,6 +69,10 @@ __host__ __device__ constexpr XFMask xfmask_make(){XFMask a{};constexpr u32 P[9]
         a.v[j][xh][t]=wd>=32?~0u:(wd<=0?0u:((1u<<wd)-1u));}return a;}
 __constant__ XFMask bpr_fmask=xfmask_make();   // -p mod 2^32 as an opaque constant: r = lo + q(-p) is one IMAD (ptxas re-derives -q from 0-p)
    // CUtensorMap (128 B) passed as __grid_constant__
+__device__ __forceinline__ void pimma16832nv(u32 (&c)[4],u32 a0,u32 a1,u32 a2,u32 a3,u32 b0,u32 b1){   // sweep XMNV: schedulable
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3]):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+}
 __device__ __forceinline__ u32 xadd(u32 a,u32 b,u32 p){const u32 s=a+b;return min(s,s-p);}
 __device__ __forceinline__ u32 xsub(u32 a,u32 b,u32 p){const u32 d=a-b;return min(d,d+p);}
 __device__ __forceinline__ u32 xmsh(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u32(c>>32));const u32 r=x*u32(c)-q*p;return min(r,r-p);}
@@ -66,6 +84,12 @@ template<u32 F>__device__ __forceinline__ void xjdif(u32 (&x8)[8],const u64* st,
     constexpr bool T=(F&1)!=0;
     xbft<T>(x8[0],x8[4],st[0],p);xbf(x8[1],x8[5],st[32],p);xbf(x8[2],x8[6],st[64],p);xbf(x8[3],x8[7],st[96],p);
     const u64 w0=st[0],w64=st[64];
+    xbft<T>(x8[0],x8[2],w0,p);xbf(x8[1],x8[3],w64,p);xbft<T>(x8[4],x8[6],w0,p);xbf(x8[5],x8[7],w64,p);
+    xbft<T>(x8[0],x8[1],w0,p);xbft<T>(x8[2],x8[3],w0,p);xbft<T>(x8[4],x8[5],w0,p);xbft<T>(x8[6],x8[7],w0,p);
+}
+template<u32 F>__device__ __forceinline__ void xjdifv(u32 (&x8)[8],const u64 w0,const u64 w32,const u64 w64,const u64 w96,u32 p){   // = xjdif, twiddles in registers
+    constexpr bool T=(F&1)!=0;
+    xbft<T>(x8[0],x8[4],w0,p);xbf(x8[1],x8[5],w32,p);xbf(x8[2],x8[6],w64,p);xbf(x8[3],x8[7],w96,p);
     xbft<T>(x8[0],x8[2],w0,p);xbf(x8[1],x8[3],w64,p);xbft<T>(x8[4],x8[6],w0,p);xbf(x8[5],x8[7],w64,p);
     xbft<T>(x8[0],x8[1],w0,p);xbft<T>(x8[2],x8[3],w0,p);xbft<T>(x8[4],x8[5],w0,p);xbft<T>(x8[6],x8[7],w0,p);
 }
@@ -126,14 +150,14 @@ __device__ __forceinline__ void xrdif(u32* const base0,const u32 so,const u64* s
         sd[sw?1:0]=sw?e1:e0;sd[sw?0:1]=sw?e0:e1;   // conflict-free quarter-warp phases
         asm volatile("fence.proxy.async.shared::cta;":::"memory");
         __syncwarp();
-        if(lane==0&&BPO_XA!=1){const u32 sa=u32(__cvta_generic_to_shared(base0));
+        if(lane==0&&XABL(F)!=1){const u32 sa=u32(__cvta_generic_to_shared(base0));
             asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane),"r"(sa):"memory");
             asm volatile("cp.async.bulk.commit_group;":::"memory");}
         return;
     }
 #endif
     uint4* o=reinterpret_cast<uint4*>(outp+lane*2048u);
-    if(BPO_XA==1&&(v[0]^v[1]^v[2]^v[3]^v[4]^v[5]^v[6]^v[7])!=0xffffffffu)return;   // ablation: compute only
+    if(XABL(F)==1&&(v[0]^v[1]^v[2]^v[3]^v[4]^v[5]^v[6]^v[7])!=0xffffffffu)return;   // ablation: compute only
     o[0]=make_uint4(v[0],v[1],v[2],v[3]);o[1]=make_uint4(v[4],v[5],v[6],v[7]);
 }
 // Flag 64 phase B: stages len 64..2 of one column (len 256/128 done in phase A). Layout 1: row = (lane&7)+8m+64(lane>>3)
@@ -143,7 +167,7 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
     constexpr bool T=(F&1)!=0;
     u32 v[NC][8];
     const u32 l7=lane&7u,b1=l7+72u*(lane>>3);   // skew(l7+64g) = l7+72g; +8m (m<4) / +8m+4 (m>=4)
-    if(BPO_XA==5){   // ablation: memory only (TMA of the region as is)
+    if(XABL(F)==5){   // ablation: memory only (TMA of the region as is)
 #if BPO_X_HAS_TMA
         if(lane==0){
             #pragma unroll
@@ -211,7 +235,7 @@ __device__ __forceinline__ void xrdif6(u32* const (&base0)[NC],const u32 (&so)[N
         sd[sw?1:0]=sw?e1:e0;sd[sw?0:1]=sw?e0:e1;}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8){   // ablation 8: compute only (no output stores)
+    if(lane==0&&XABL(F)!=8){   // ablation 8: compute only (no output stores)
         #pragma unroll
         for(u32 n=0;n<NC;++n){const u32 sa=u32(__cvta_generic_to_shared(base0[n]));
             if((F&2048)&&stm!=1u){   // flag 2048: L2 evict_first policy (P1 output is re-read only after all primes are written);
@@ -301,7 +325,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
             else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
+    if(lane==0&&XABL(F)!=8&&XABL(F)!=11){
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -357,8 +381,12 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
                 #pragma unroll
                 for(u32 m=0;m<8;++m)pb[(Q*pr+n)*XD+8*m+4*(m>>2)]=v[n][m];
         };
+        if(F&1024u){   // sweep flag 1024: layout-1 groups as a rolled loop
+            #pragma unroll 1
+            for(u32 pr=0;pr<NI;++pr)l1(pr);
+        }else{
         #pragma unroll
-        for(u32 pr=0;pr<NI;++pr){l1(pr);if(pr+1<NI)__syncwarp();}   // groups kept sequential (8Q live values)
+        for(u32 pr=0;pr<NI;++pr){l1(pr);if(pr+1<NI)__syncwarp();}}   // groups kept sequential (8Q live values)
     }
     __syncwarp();
     u64 w8[4];
@@ -367,43 +395,44 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
     const u64 w253=st[253u],w252=st[252u],w254=st[254u];
     const u32* const pr0=base0+so+8*lane+4*(lane>>2);
     const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);
+    constexpr u32 Q2=XQ4(F)?4u:Q,NI2=4u/Q2;   // sweep bit 31: all 4 columns in one layout-2 pass
     #pragma unroll 1
-    for(u32 pr=0;pr<NI;++pr){u32 v[Q][8];
+    for(u32 pr=0;pr<NI2;++pr){u32 v[Q2][8];
         #pragma unroll
-        for(u32 n=0;n<Q;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr0+(Q*pr+n)*XD);const uint4 x0=p4[0],x1=p4[1];
+        for(u32 n=0;n<Q2;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr0+(Q2*pr+n)*XD);const uint4 x0=p4[0],x1=p4[1];
             v[n][0]=x0.x;v[n][1]=x0.y;v[n][2]=x0.z;v[n][3]=x0.w;v[n][4]=x1.x;v[n][5]=x1.y;v[n][6]=x1.z;v[n][7]=x1.w;}
         #pragma unroll
         for(u32 lo=0;lo<4;++lo)
             #pragma unroll
-            for(u32 n=0;n<Q;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}
+            for(u32 n=0;n<Q2;++n){if(lo==0)xbft<T>(v[n][0],v[n][4],w8[0],p);else xbf(v[n][lo],v[n][lo+4],w8[lo],p);}
         #pragma unroll
         for(u32 k=0;k<4;++k)
             #pragma unroll
-            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
+            for(u32 n=0;n<Q2;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)xbf(v[n][lo],v[n][lo+2],w253,p);else xbft<T>(v[n][lo],v[n][lo+2],w252,p);}
         if(!T){
             #pragma unroll
             for(u32 lo=0;lo<8;lo+=2)
                 #pragma unroll
-                for(u32 n=0;n<Q;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}
+                for(u32 n=0;n<Q2;++n)xbf(v[n][lo],v[n][lo+1],w254,p);}
         #pragma unroll
         for(u32 m2=0;m2<4;++m2){const ulonglong2 w=xct_ldv(ct,lane,m2);
             #pragma unroll
-            for(u32 n=0;n<Q;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
+            for(u32 n=0;n<Q2;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
                 if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+p-b,u64(w.y),p);}
                 else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}
 #if BPO_X_HAS_TMA
         __syncwarp();   // layout-2 reads of this pair's regions done (the other pair's regions are disjoint)
         #pragma unroll
-        for(u32 n=0;n<Q;++n){
+        for(u32 n=0;n<Q2;++n){
             const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
-            uint4* const d=sd+(Q*pr+n)*(XD/4);
+            uint4* const d=sd+(Q2*pr+n)*(XD/4);
             d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}
 #endif
     }
 #if BPO_X_HAS_TMA
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
+    if(lane==0&&XABL(F)!=8&&XABL(F)!=11){
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -424,11 +453,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
-    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
+    const u32* src=(op?b:a)+u64(XABL(F)==11?0u:c)*L;if(XDIN(F))src=a;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
-    if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
+    if(XABL(F)==6||XABL(F)==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
-        if(BPO_XA==6)for(u32 x=h;x<256u*L;x+=256){const u32 rr=x/L,w=x-rr*L;acc^=__ldg(src+u64(rr*256u)*L+w);}
+        if(XABL(F)==6)for(u32 x=h;x<256u*L;x+=256){const u32 rr=x/L,w=x-rr*L;acc^=__ldg(src+u64(rr*256u)*L+w);}
         uint4* o=reinterpret_cast<uint4*>(dst+u64(c)*32768u);
         #pragma unroll 4
         for(u32 x=h;x<8192u;x+=256)o[x]=make_uint4(acc,x,acc^x,id);
@@ -437,8 +466,43 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
-    const u32 xoff=((BPO_XA==11?0u:c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
+    const u32 xoff=XDIN(F)?0u:((XABL(F)==11?0u:c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
     const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
+    bool cpqd=false;   // sweep XCPQ path taken (if constexpr: production code generation untouched)
+    if constexpr(XCPQ(F)&&(F&256)&&(F&512)&&(F&4096)&&S6&&MT==2)if(ca){   // sweep XCPQ: 64-row quarters, one cp.async group in flight while building
+        cpqd=true;
+        u32 mk[8][2];
+        #pragma unroll
+        for(u32 j=0;j<8;++j)
+            #pragma unroll
+            for(u32 xh=0;xh<2;++xh)mk[j][xh]=bpr_fmask.v[j][xh][tig];
+        const u32 q=h&15u,nch=(xoff+L+3u)/4u;
+        u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+        auto issue=[&](const u32 k){   // quarter k = rows 64(k&1)..+63 of half k>>1 -> X rows 64(k&1)..
+            if(q<nch){const u32* const g0=src+u64((k>>1)*128u*256u)*L-xoff+4u*q+u64((64u*(k&1u)+(h>>4))*256u)*L;
+                const u32 sa0=u32(__cvta_generic_to_shared(X+(64u*(k&1u)+(h>>4))*XRS+4u*q));
+                #pragma unroll
+                for(u32 i=0;i<4;++i){const u32 sa=sa0+i*(16u*XRS*4u);const u32* g=g0+i*(16u*256u*L);
+                    if(ldn)asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(g):"memory");
+                    else asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"::"r"(sa),"l"(g),"l"(pol):"memory");}}
+            asm volatile("cp.async.commit_group;":::"memory");};
+        auto build=[&](const u32 k){const u32 mt=k>>1,xo=k&1u;const u32* const rpt=X+(8*warp+gid)*XRS+xoff+tig;
+            #pragma unroll
+            for(u32 j=0;j<8;++j){
+                const u32 wb=POS[j]/32,sh=POS[j]%32;
+                const int D=int(POS[j+1])-int(POS[j]);
+                #pragma unroll
+                for(u32 xh=0;xh<2;++xh){
+                    const u32* rp=rpt+64*xo*XRS+wb+4*xh;
+                    const u32 v=__funnelshift_r(rp[0],rp[1],sh);
+                    if(D-32*(3+4*int(xh))>=32)af[j][mt][xo+2*xh]=v;else af[j][mt][xo+2*xh]=v&mk[j][xh];}}};
+        issue(0);issue(1);
+        asm volatile("cp.async.wait_group 1;":::"memory");__syncthreads();build(0);__syncthreads();issue(2);
+        asm volatile("cp.async.wait_group 1;":::"memory");__syncthreads();build(1);__syncthreads();issue(3);
+        asm volatile("cp.async.wait_group 1;":::"memory");__syncthreads();build(2);
+        asm volatile("cp.async.wait_group 0;":::"memory");__syncthreads();build(3);
+    }
+    if(cpqd){}else
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
         u32 mk[8][2];   // flag 4096: per-thread masks of the partial fragment words (clamped funnel shift: 2^wd-1, 0 or ~0)
         #pragma unroll
@@ -524,7 +588,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     #pragma unroll 1
     // flag 32768 (S6, without 4): the quad barrier moves from the loop top to just before the phase-A stores into X, so a
     // warp's phase-A math (MMA, reduction, twist, J-DIF, R-DIF 256/128) overlaps the other warps' phase B of the previous quad.
-    constexpr bool LB=(F&32768)&&!(F&4)&&S6&&BPO_XA!=4&&BPO_XA!=5;
+    constexpr bool LB=(F&32768)&&!(F&4)&&S6&&XABL(F)!=4&&XABL(F)!=5;
     for(u32 u=r0/4;u<r1/4;++u){
         if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
@@ -535,19 +599,28 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             const u64* const ctp=ctab+(size_t(4*u+(warp>>1))*256u+c)*256u+8u*lane;
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
-        if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
+        if(XABL(F)!=4&&XABL(F)!=5){   // ablation 4/5: no phase A
             const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
             const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
+            u64 hw[4+4+3];   // sweep XTWH: twist (4 rows), J-DIF st[0,32,64,96], R-DIF st[rl], st[64+rl], st[128+rl]
+            if(XTWH(F)&&S6){const u32 rl=8*warp+gid;
+                #pragma unroll
+                for(u32 rr=0;rr<4;++rr)hw[rr]=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+                #pragma unroll
+                for(u32 e=0;e<4;++e)hw[4+e]=st[32u*e];
+                hw[8]=st[rl];hw[9]=st[64u+rl];hw[10]=st[128u+rl];}
             #pragma unroll
             for(u32 j=0;j<8;++j){
                 const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
                 #pragma unroll
                 for(u32 mt=0;mt<MT;++mt){
                     u32 c0[4]={0,0,0,0},c1[4]={0,0,0,0};
+                    if(XMNV(F)){pimma16832nv(c0,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.x,bv.y);
+                        pimma16832nv(c1,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.z,bv.w);}else{
                     pimma16832(c0,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.x,bv.y);
-                    pimma16832(c1,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.z,bv.w);
+                    pimma16832(c1,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.z,bv.w);}
                     #pragma unroll
                     for(u32 hf=0;hf<2;++hf){
                         const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];   // each < 2^21
@@ -569,12 +642,13 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 const u32 rl=8*warp+gid;
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
-                    const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+                    const u64 t2=XTWH(F)?hw[rr]:tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
                     #pragma unroll
                     for(u32 j=0;j<8;++j)res[rr][j]=xmsh(res[rr][j],t2,p);
+                    if(XTWH(F))xjdifv<F>(res[rr],hw[4],hw[5],hw[6],hw[7],p);else
                     xjdif<F>(res[rr],st,p);
                 }
-                const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
+                const u64 wa=XTWH(F)?hw[8]:st[rl],wb=XTWH(F)?hw[9]:st[64u+rl],wc=XTWH(F)?hw[10]:st[128u+rl];
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
                 if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
@@ -600,7 +674,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             }
         }
         __syncthreads();
-        if((F&8192)&&S6&&NW==8&&BPO_XA!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
+        if((F&8192)&&S6&&NW==8&&XABL(F)!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
             constexpr u32 NC=BPO_X_NC;
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
@@ -611,7 +685,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 xrdif6s<F,NC>(X+q*XS+j*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+j,stm);}}
         }else
         #pragma unroll 1
-        for(u32 n=0;n<(BPO_XA==3?0u:32/NW);++n){   // (prime q, digit j) columns of the quad (ablation 3: none)
+        for(u32 n=0;n<(XABL(F)==3?0u:32/NW);++n){   // (prime q, digit j) columns of the quad (ablation 3: none)
             const u32 ci=warp+NW*n,j=ci&7u,q=ci>>3,r=4*u+q;
             if(S6&&!(F&128)){u32* const bs[1]={X+q*XS+j*XD};const u32 so[1]={8*q};const u64* const sts[1]={(F&4)?STS+q*256u:stage_tw+size_t(r)*256};
                 const u64* const cts[1]={ctab+(size_t(r)*256u+c)*256u};const u32 ps[1]={bpr_pr[r]},pl[1]={r*8+j};
@@ -625,7 +699,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             xrdif<F>(X+q*XS+j*XD,(F&32)?8*q:0,(F&4)?STS+q*256u:stage_tw+size_t(r)*256,ctab+(size_t(r)*256u+c)*256u,bpr_pr[r],dst+u64(r*8+j)*N+c*8u,lane,op?tmB:tmA,c,r*8+j);
         }
 #if BPO_X_HAS_TMA
-        if((F&2)&&lane==0&&BPO_XA!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable (ablation 9: no wait)
+        if((F&2)&&lane==0&&XABL(F)!=9)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable (ablation 9: no wait)
 #endif
     }
 #if BPO_X_HAS_TMA
@@ -649,4 +723,16 @@ extern "C" __global__ void __launch_bounds__((BPO_XV&8)?512:256,BPO_TC_MINB) bpo
     bpo_first_xb<BPO_XV>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif // bpo_first_xv
+#if defined(BPO_DIAG)&&(!defined(BPO_LEAN)||BPO_LEAN_P1X)
+// Exit-time diagnostics (solve.cpp diag): bpo_first_x ablations with the production signature, and bandwidth probes.
+#define BPO_XD_KERNEL(NAME,FL) extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) NAME(const u32* a,const u32* b,u32* A,u32* B,    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];    bpo_first_xb<(FL)>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}
+BPO_XD_KERNEL(bpo_xd_nostore,BPO_XF|(8u<<20))
+BPO_XD_KERNEL(bpo_xd_l2in,BPO_XF|(1u<<24))
+BPO_XD_KERNEL(bpo_xd_compute,BPO_XF|(8u<<20)|(1u<<24))
+extern "C" __global__ void diag_bw(const uint4* __restrict__ src,uint4* dst,u64 nr,u64 nw,u32 seed){   // read nr / write nw uint4s, grid-stride
+    const u64 t=u64(blockIdx.x)*blockDim.x+threadIdx.x,S=u64(gridDim.x)*blockDim.x;u32 acc=0;
+    const u64 m=nr>nw?nr:nw;
+    for(u64 i=t;i<m;i+=S){if(i<nr){const uint4 x=__ldcs(src+i);acc^=x.x^x.y^x.z^x.w;}if(i<nw)dst[i]=make_uint4(u32(i),seed,acc,u32(i>>32));}
+    if(acc==0x9e3779b9u&&seed==1u)dst[0].x=acc;}
+#endif
 #endif
