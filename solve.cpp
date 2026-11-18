@@ -604,7 +604,7 @@ struct State {
     bool p1split()const{return pox&&!off(2048)&&cuda->bpo_p1a&&cuda->bpo_p1b&&ctab&&tc_bpt&&wsT[cur_ws]&&std::getenv("FHERMA_P1SPLIT");}
     bool pox=false;u32 p1x=0,p1_grid=96;   // p1x: P1 kernel 1 bpo_first_x, 2 bpo_first_xv (graph variant 7, A/B FHERMA_P1X), 3 bpo_first_w
       // variant 4: persistent out-of-phase P1
-    bool p3r16()const{return cuda->bpo_last_r16&&r16tab&&std::getenv("FHERMA_P3R16")&&std::atoi(std::getenv("FHERMA_P3R16"))!=0;}   // opt-in: neutral-to-slower locally (P3 is latency-bound, not issue-bound)
+    bool p3r16()const{return cuda->bpo_last_r16&&r16tab&&!(std::getenv("FHERMA_P3R16")&&std::atoi(std::getenv("FHERMA_P3R16"))==0);}   // opt-in: neutral-to-slower locally (P3 is latency-bound, not issue-bound)
     bool p2r16()const{return cuda->bpo_middle_r16&&r16tab&&!(std::getenv("FHERMA_P2R16")&&std::atoi(std::getenv("FHERMA_P2R16"))==0);}   // default on; FHERMA_P2R16=0 restores the old kernel
     bool p3v2()const{return pox&&!off(4)&&(cuda->bpo_last_cm2||cuda->bpo_last_cm3)&&t2n&&!std::getenv("FHERMA_NO_P3V2");}
     int po=0;   // 0 v14 pipeline, 1 pass-order (natural CRT layout), 2 pass-order column-major residues
