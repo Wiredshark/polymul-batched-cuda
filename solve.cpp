@@ -8,6 +8,7 @@
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
 #include "kprof.h"
+#include "diag.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -108,7 +109,7 @@ struct Cuda {
     std::unique_ptr<L2RootCachePolicy> root_cache;
     CUfunction prepare,forward,pointwise,inverse,finish,reconstruct,transpose_inputs,transpose_output,reconstruct_explicit,middle_local,inverse_finish,fourstep_forward,fourstep_middle,fourstep_inverse;
     CUfunction weighted_prepare,weighted_forward,weighted_middle,weighted_inverse,reconstruct_weighted8,reconstruct_weighted8_subwarp16;
-    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_p3crt_x=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
+    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_p3crt_x=nullptr,bpo_xd_nostore=nullptr,bpo_xd_l2in=nullptr,bpo_xd_compute=nullptr,bpo_xd_stg=nullptr,bpo_xd_stcs=nullptr,diag_bw=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
     void getfn(CUfunction* f,CUmodule m,const char* name){CUresult r=cuModuleGetFunction(f,m,name);if(r==CUDA_ERROR_NOT_FOUND){*f=nullptr;return;}check(r);kp.add_name(*f,name);}
     void check(CUresult r){if(r!=CUDA_SUCCESS){const char* message=nullptr;cuGetErrorString(r,&message);throw std::runtime_error(message?message:"CUDA error");}}
     void rcheck(nvrtcResult r){if(r!=NVRTC_SUCCESS)throw std::runtime_error("NVRTC error "+std::to_string(int(r)));}
@@ -137,7 +138,8 @@ struct Cuda {
         getfn(&batched_prepare_fused,module,"batched_prepare_fused");
         getfn(&batched_middle,module,"batched_middle");
         getfn(&batched_forward,module,"batched_forward");getfn(&batched_inverse,module,"batched_inverse");
-        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");}
+        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");
+            getfn(&bpo_xd_nostore,module,"bpo_xd_nostore");getfn(&bpo_xd_l2in,module,"bpo_xd_l2in");getfn(&bpo_xd_compute,module,"bpo_xd_compute");getfn(&bpo_xd_stg,module,"bpo_xd_stg");getfn(&bpo_xd_stcs,module,"bpo_xd_stcs");getfn(&diag_bw,module,"diag_bw");}   // BPO_DIAG (exit-time diag)
         getfn(&transpose_inputs_columns,module,"transpose_inputs_columns");
         getfn(&weighted_prepare_columns,module,"weighted_prepare_columns");
         getfn(&weighted_forward_columns,module,"weighted_forward_columns");
@@ -163,7 +165,7 @@ struct Cuda {
     }
     KProf kp;
     void klaunch(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 bx,u32 smem,void** params){
-        if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream);}
+        if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream,params);}
         else check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));}
     template<class...Args>void launch(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,128,0,params);}
     template<class...Args>void launch_ntt(CUfunction fn,u32 gx,u32 gy,u32 threads,u32 shared_bytes,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,threads,shared_bytes,params);}
@@ -200,6 +202,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
+        if(cuda&&k)run_diag(*cuda,size_t(2)*n*l*4,size_t(2)*k*8*n*4,g_kernel_prefix+KERNEL_SOURCE,l);   // exit-time diag (FHERMA_DIAG=0: off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -366,7 +369,7 @@ struct State {
             }
             if(n==65536&&rows==256&&cols==256&&!std::getenv("FHERMA_LEGACY_KERNELS"))m+="#define BATCHED_ONLY 1"+nl;
             if(std::getenv("FHERMA_PREPFWD"))m+="#define BPF_ENABLE 1"+nl;
-            if(lean_jit()&&n==65536&&rows==256&&cols==256)m+="#define BPO_LEAN 1"+nl+"#define BPO_LEAN_SPLIT "+std::string(std::getenv("FHERMA_P1SPLIT")?"1":"0")+nl+"#define BPO_LEAN_GCT "+std::string(std::getenv("FHERMA_P1_CTSMEM")?"0":"1")+nl+"#define BPO_LEAN_P1X "+std::string(std::getenv("FHERMA_P1_TC2G")?"0":"1")+nl+"#define BPO_LEAN_TC2 "+std::string(std::getenv("FHERMA_P1_TC2G")?"1":"0")+nl+"#define BPO_LEAN_P1W "+std::string(std::getenv("FHERMA_P1W")?"1":"0")+nl;   // default graph kernels only (init time)
+            if(lean_jit()&&n==65536&&rows==256&&cols==256)m+="#define BPO_LEAN 1"+nl+"#define BPO_LEAN_SPLIT "+std::string(std::getenv("FHERMA_P1SPLIT")?"1":"0")+nl+"#define BPO_LEAN_GCT "+std::string(std::getenv("FHERMA_P1_CTSMEM")?"0":"1")+nl+"#define BPO_LEAN_P1X "+std::string(std::getenv("FHERMA_P1_TC2G")?"0":"1")+nl+"#define BPO_LEAN_TC2 "+std::string(std::getenv("FHERMA_P1_TC2G")?"1":"0")+nl+"#define BPO_LEAN_P1W "+std::string(std::getenv("FHERMA_P1W")?"1":"0")+nl+(diag_env()?"#define BPO_DIAG 1"+nl:std::string())+((group_flags()&128)?"#define BPO_P3EL 1"+nl:std::string());   // GFLAGS 128 (opt-in, sweep chain p3el): group-0 P3 residue stores evict_last   // default graph kernels only (init time)
             if(const char* x=std::getenv("FHERMA_EXTRA_DEFINES")){for(const char* c=x;*c;++c)m+=(*c==';'?nl[0]:*c);m+=nl;}  // experiments only
             if(w>=1024&&l<=64&&short_words<=32)g_kernel_prefix=m;
         }
@@ -673,7 +676,7 @@ struct State {
             else if(p2r16()&&p3v2()&&mont)d.launch3(d.bpo_middle_r16,32u,J,gg,128u,Ag,Bg,Cg,pgs_,r16tab+size_t(s0)*512*8,n,(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)&&!std::getenv("FHERMA_P2_NODISCARD")?8u:0u)|(mont?16u:0u));
             else d.launch3(p1x==2&&d.bpo_middle_smrv?d.bpo_middle_smrv:pox&&!off(128)&&d.bpo_middle_smr?d.bpo_middle_smr:d.bpo_middle,32u,J,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u)|(mont?16u:0u));mark(3);
             if(!(which&2)||!(sm&16)||fxon){}else if(po==2&&p3v2()&&p3r16()&&!t2n_old())d.launch3(d.bpo_last_r16,cols,gg,1u,128u,Cg,Ag,pgs_,itwg,r16tab+size_t(s0)*512*8,(mont?t2nM:t2n)+size_t(s0)*J*512*8,n,logrows);
-            else if(po==2&&p3v2())d.launch3(p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u));
+            else if(po==2&&p3v2())d.launch3(p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));
             else if(po==2)d.launch3(d.bpo_last_cm,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);
             else d.launch3(d.bpo_last,64u/p3h,gg,1u,256u*p3h,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);mark(4);};
             if(g2<pg&&p23db_now&&wsG2[cur_ws]&&side_streams[cur_ws]){   // P3(g) on a side stream overlaps P2(g+1); C double-buffered
@@ -751,7 +754,7 @@ struct State {
     // (FHERMA_GFLAGS overrides): 1 plain P1 stores (no evict_first), 2 P1 stores evict_last, 4 P1 input loads normal on
     // all but the last group (input kept in L2 for the re-read), 8 P3 residues of all but the last group stored evict_first
     // (the CRT reads them only after the last group; the last group's residues stay normal so the CRT can hit them in L2).
-    static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4;   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
+    static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4;   // 128 (opt-in): group-0 P3 residue stores evict_last (CRT reads group 0 from L2; adds BPO_P3EL to the module)   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
     int big_cache=-1;
     bool big_part(){if(big_cache>=0)return big_cache!=0;if(const char* e=std::getenv("FHERMA_BIG")){big_cache=*e=='1';return big_cache!=0;}
         int sms=0,l2=0;CUdevice dev=0;auto& d=*cuda;auto attr=d.driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");
