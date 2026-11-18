@@ -14,6 +14,11 @@
 //             and phase-A stores / cp.async / fragment reads through hoisted pointers with immediate offsets.
 //        8192 (with 64) phase B: warp w owns prime w>>1, digits 4(w&1)..+3 in groups of BPO_X_NC columns that share
 //             the stage and cross twiddles (xrdif6s); len-2 psi^0 stage fused into the cross twiddle (with 1).
+//        16384 (with 8192) L1 prefetch of the warp's phase-B cross twiddles at the quad start (opt-in, p1c: no gain locally).
+//        32768 (with 64, without 4) quad barrier just before the phase-A stores: phase-A math overlaps the previous quad's phase B.
+//        65536 (with 8192) phase-B TMA staging stores without the e0/e1 value swap (2-way bank conflict instead of 16 SELs per pair).
+//        (32768/65536 from branch p1c 32bc7b2: opt-in here, production BPO_XF unchanged; official pv26 with both = 19.1 ms.)
+//        bits 28-29 (exit-time sweep only): phase-B column group NC (1: 1, 2: 2, 3: 4; 0: BPO_X_NC); bit 30: quad loop unrolled 2x.
 //  * corrections as unsigned min (s-p wraps above s when s<p): add = IADD3+IADD3+IMNMX, no ISETP/SEL;
 //  * DIF butterfly y' = shoup(x+p-y, w): Shoup accepts any 32-bit input, so the difference needs no reduction;
 //  * base-conversion reduction of x = Y0+Y1 2^8+Y2 2^16+Y3 2^24 (< 2^46) with a 32-bit Barrett step on
@@ -298,7 +303,8 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
         for(u32 n=0;n<NC;++n){
             const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
             uint4* const d=sd+n*(XD/4);
-            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}
+            if(F&65536){uint4* const d0=reinterpret_cast<uint4*>(base0+8*lane)+n*(XD/4);d0[0]=e0;d0[1]=e1;}   // flag 65536: no value swap (2-way bank conflict, no SELs)
+            else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
     if(XDST(F)>=2){   // diag: per-lane global stores of the box rows (row = lane: 8 words at plane*N + lane*2048 + c*8)
@@ -425,12 +431,20 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     }
     const u32 stride=weighted_root_stride(N);
     u64* STS=reinterpret_cast<u64*>(X+4*XS);   // flag 4: the quad's stage tables (4 x 256 u64)
-    #pragma unroll 1
+    // flag 32768 (S6, without 4): the quad barrier moves from the loop top to just before the phase-A stores into X, so a
+    // warp's phase-A math (MMA, reduction, twist, J-DIF, R-DIF 256/128) overlaps the other warps' phase B of the previous quad.
+    constexpr bool LB=(F&32768)&&!(F&4)&&S6&&XABL(F)!=4&&XABL(F)!=5;
+    constexpr int QUN=((F>>30)&1u)?2:1;   // bit 30 (sweep): quad loop unrolled 2x
+    #pragma unroll QUN
     for(u32 u=r0/4;u<r1/4;++u){
-        __syncthreads();   // previous quad's R-DIF reads of X (and STS) done
+        if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
             #pragma unroll
             for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t(4*u+q)*256+h];
+        }
+        if((F&16384)&&(F&8192)&&S6&&NW==8){   // flag 16384: phase-B cross twiddles of this warp's prime pulled into L1 now
+            const u64* const ctp=ctab+(size_t(4*u+(warp>>1))*256u+c)*256u+8u*lane;
+            asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(XABL(F)!=4&&XABL(F)!=5){   // ablation 4/5: no phase A
             const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
@@ -474,6 +488,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
+                if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
                 if(F&4096){u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // row 64rr+rl -> skewed 72rr+rl+4(rl>>5): immediate offsets
                     #pragma unroll
                     for(u32 rr=0;rr<4;++rr)
@@ -497,7 +512,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         }
         __syncthreads();
         if((F&8192)&&S6&&NW==8&&XABL(F)!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
-            constexpr u32 NC=BPO_X_NC;
+            constexpr u32 NC=((F>>28)&3u)?(1u<<(((F>>28)&3u)-1u)):u32(BPO_X_NC);   // bits 28-29: sweep override
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
             #pragma unroll

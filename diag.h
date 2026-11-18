@@ -122,7 +122,9 @@ template<class C> struct Diag {
         const V vs[]={{"nostore",d.bpo_xd_nostore,-1,true},{"l2in",d.bpo_xd_l2in,-1,true},{"compute",d.bpo_xd_compute,-1,true},{"st_global",d.bpo_xd_stg,-1,true},{"st_global_cs",d.bpo_xd_stcs,-1,false},
             {"tma_nohint",nullptr,base|ld|(1u<<29),true},{"tma_evict_first",nullptr,base|ld,true},{"tma_evict_last",nullptr,base|ld|(2u<<29),true},{"ld_flip",nullptr,(pf0^(1u<<28)),false}};
         char nm[96];
+        const bool full=std::getenv("FHERMA_DIAG_FULL")&&*std::getenv("FHERMA_DIAG_FULL")=='1';   // TMA hints / ld_flip / st_global_cs: measured in pv25 (no effect), off by default
         for(const auto& x:vs){if(!x.f&&x.pf<0)continue;   // ablation kernel missing
+            if(!full&&(!x.f||x.f==d.bpo_xd_stcs))continue;
             std::snprintf(nm,sizeof nm,"p1_%s_c1_cold",x.n);time(nm,p1run(x.f,x.pf,false),true);
             if(p1&&x.c2){std::snprintf(nm,sizeof nm,"p1_%s_c2_cold",x.n);time(nm,p1run(x.f,x.pf,true),true);}}
         // exactness of the per-lane store path vs TMA (A,B planes of group 0)
@@ -150,7 +152,14 @@ template<class C> struct Diag {
         std::printf("{\"diag\":\"done\",\"s\":%.2f}\n",std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());std::fflush(stdout);
     }
 };
-template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes){
+#include "diag_sweep.h"
+// src: the production NVRTC source (prefix + kernels) for the variant sweep (diag_sweep.h; FHERMA_SWEEP=0 off), l: limbs.
+// The instruction micro-benchmarks (run_mb, measured on the target in pv27) only run with FHERMA_DIAG_MB=1.
+template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes,const std::string& src,unsigned l){
     if(!diag_env()||!c.kp.enabled||!c.kp.pinfo||!c.diag_bw)return;
-    try{Diag<C> dg(c);dg.run_mb();dg.run(in_bytes,out_bytes);}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+    std::unique_ptr<Sweep<C>> sw;
+    try{if(sweep_env())sw=std::make_unique<Sweep<C>>(c,src,l);}catch(const std::exception& e){std::printf("{\"diag\":\"sw_error\",\"what\":\"%.100s\"}\n",e.what());}
+    try{Diag<C> dg(c);const char* mb=std::getenv("FHERMA_DIAG_MB");if(mb&&*mb=='1')dg.run_mb();dg.run(in_bytes,out_bytes);
+        if(sw)sw->run(dg);}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+    sw.reset();
 }

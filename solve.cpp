@@ -202,7 +202,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
-        if(cuda&&k)run_diag(*cuda,size_t(2)*n*l*4,size_t(2)*k*8*n*4);   // exit-time diag (FHERMA_DIAG=0: off)
+        if(cuda&&k)run_diag(*cuda,size_t(2)*n*l*4,size_t(2)*k*8*n*4,g_kernel_prefix+KERNEL_SOURCE,l);   // exit-time diag (FHERMA_DIAG=0: off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();

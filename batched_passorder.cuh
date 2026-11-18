@@ -917,6 +917,9 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
     __syncthreads();
     #pragma unroll
     for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
+#ifdef BPO_SWEEP
+    if(untw&8)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // sweep only (bytes bed0fde): dead A/B lines, no write-back
+#endif
     r16_dif16(a,tf,p);r16_dif16(b,tf,p);
     {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
         #pragma unroll
@@ -1313,6 +1316,7 @@ __device__ __forceinline__ void bpo_bar_wait(u64* bar,u32 parity){
 //   1 TMA bulk store of each warp's 1 KB output row, 2 TMA bulk loads of the 8 C rows (both compute_90+ only),
 //   4 lean arithmetic (J-DIT psi^0 butterflies and R-DIT psi^0 stages as add/sub),
 //   256 (with 4) lazy J-DIT + R-DIT: words in [0,2p) between stages, the t2n Shoup product canonicalizes
+//   1024 / 2048 (exit-time sweep; = stall 2fe0785 BPO_P3TN 1 / 2): t2n words loaded ahead of the D stores / before the R-DIT
 #ifndef BPO_P3T
 #define BPO_P3T 260   // 4 lean ~neutral A/B (63.22 vs 63.64); 260 = 4 + lazy J-DIT/R-DIT (P2F 5 lazy S-DIT feeds it)
 #endif
@@ -1383,6 +1387,10 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
     #pragma unroll
     for(u32 d=0;d<8;++d)X[d*288+t+4*(t>>5)]=yv[d];
     __syncthreads();
+    constexpr u32 TN=(T0&1024)?1u:(T0&2048)?2u:0u;u64 tv[8];
+    if(TN==2){const u64* tn2=(dfl&2)?t2n+u64(prime*8+warp)*512u+(c>>7)+2u*lane:t2n+u64(prime*8+warp)*512u+(c>>7)*256u+lane;const u32 ts2=(dfl&2)?64u:32u;
+        #pragma unroll
+        for(u32 m=0;m<8;++m)tv[m]=__ldg(tn2+ts2*m);}
     if((dfl&1)&&lane<8u)bpo_discard(C+u64(prime*8+lane)*N+c*256u+32u*warp);   // C lines read by this warp (all used)
     u32 v[8];
     u32* base=X+warp*288;
@@ -1390,11 +1398,14 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
     if((BPO_P3ABL!=1&&!(T0&16))){if(T0&128){}else if((T0&4)&&(T0&256))pzdit_smr<false>(base,v,sit,p,lane);else if(T0&4)pxdit_smr<true>(base,v,sit,p,lane);else bpo_dit_smr(base,v,sit,p,lane);}
     const u64* tn=(dfl&2)?t2n+u64(prime*8+warp)*512u+(c>>7)+2u*lane:t2n+u64(prime*8+warp)*512u+(c>>7)*256u+lane;const u32 ts=(dfl&2)?64u:32u;   // dfl 2: old interleaved layout (A/B only)
+    if(TN==1){
+        #pragma unroll
+        for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+ts*m);}
     u32* out=D+u64(prime*8+warp)*N+c*256u+lane;
     if(T&1){
         __syncwarp();
         #pragma unroll
-        for(u32 m=0;m<8;++m)base[lane+32*m]=mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)base[lane+32*m]=mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);
         bpo_fence_async();
         __syncwarp();
         if(lane==0){bpo_bulk_store(out,base,1024u);bpo_bulk_commit();bpo_bulk_wait_read();}
@@ -1403,23 +1414,23 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
         for(u32 m=0;m<8;++m)out[32*m]=v[m];
     }else if(BPO_P3ABL==2){
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=mul_shoup(v[m],tn[ts*m],p);if(r==0xffffffffu)out[32*m]=r;}
+        for(u32 m=0;m<8;++m){const u32 r=mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);if(r==0xffffffffu)out[32*m]=r;}
     }else if(T0&8){   // residues stay in L2 for the CRT (evict_last policy)
         u64 pol;asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=(T0&4)?pxmsh(v[m],tn[ts*m],p):mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m){const u32 r=(T0&4)?pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p):mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);
             asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
     }else if((T0&4)&&(dfl&4)){   // dfl 4 (runtime, prime-group P1): residues L2 evict_first (the CRT reads them only after all groups)
         u64 pol;asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p);
             asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
     }else if(T0&4){
         #pragma unroll
-        for(u32 m=0;m<8;++m)out[32*m]=pxmsh(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)out[32*m]=pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p);
     }else{
         #pragma unroll
-        for(u32 m=0;m<8;++m)out[32*m]=mul_shoup(v[m],tn[ts*m],p);
+        for(u32 m=0;m<8;++m)out[32*m]=mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);
     }
 }
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
