@@ -235,6 +235,8 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             const u32* hs=src+u64(mt*128u*256u)*L;
             if(ca){   // flag 512: all 16 B chunks of the half in flight at once (cp.async, one DRAM/L2 round trip)
                 const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
+                if(mt==0&&h<128u){const u32* pr=hs+u64((128u+h)*256u)*L;   // half 1 row h to L2 while half 0 is in flight
+                    asm volatile("prefetch.global.L2 [%0];"::"l"(pr));asm volatile("prefetch.global.L2 [%0];"::"l"(pr+32));asm volatile("prefetch.global.L2 [%0];"::"l"(pr+L-1));}
                 u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
                 if(q<nch){
                     #pragma unroll
