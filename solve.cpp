@@ -8,6 +8,7 @@
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
 #include "kprof.h"
+#include "diag_cluster.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -200,6 +201,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
+        if(cuda)run_cluster_diag(*cuda);   // exit-time cluster/DSMEM probe (FHERMA_CLDIAG=0 off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
