@@ -1605,6 +1605,97 @@ template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,
         for(u32 m=0;m<8;++m)out[32*m]=mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);
     }
 }
+#if !defined(BPO_P3_OLD)&&BPO_P3T==2308&&BPO_P3ABL==0
+#define BPO_P3B 1
+// p3b (default; pv67 on-target whole batch p3b 0.9941 / repeat 0.9934, round-21 sweep line cl_p3b): the BPO_P3T 2308 values of
+// bpo_p3_body (lean, lazy / Harvey J-DIT + R-DIT, t2n hoisted before the R-DIT, BPO_P3EL group-0 evict_last) with p2k
+// addressing: N = 65536, logR = 8 compile-time, C rows / X / t2n / D as base + immediates, 2p from a lane-0 shuffle (no 16-way
+// bpo_p2_of lookup), one t2n layout; kernel __maxnreg__(32) (40 -> 32 regs, 0 spill; P3 blocks pack better next to P1 / P2
+// blocks). sm_90 SASS 1423 -> 1198 instr. The kernel falls back to bpo_p3_body when N != 65536, logR != 8 or dfl 2 (old t2n
+// layout). FHERMA_P3_OLD=1 compiles the old kernel (BPO_P3_OLD).
+template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u32* primes,
+    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 dfl){
+    constexpr u32 N=65536u,logR=8u;
+    const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
+    const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
+    const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
+    const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
+    const u64* sit=stage_itw+prime*256u;
+    u32 yv[8];
+    {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
+        #pragma unroll
+        for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
+    u64 F;{
+        const u32 k1=__brev(t)>>(32-logR);
+        const u32 wv=mul_shoup(u32(bm_root(itw,2u*c*k1,N,p)),itw[1+(c&127u)],p);
+        const u64 m0=itw[0];u32 q=wv*u32(m0>>32)+__umulhi(wv,u32(m0));
+        const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
+        F=u64(wv)|(u64(q)<<32);}
+    #pragma unroll
+    for(u32 d=0;d<8;++d)yv[d]=pxmshh<H>(yv[d],F,p);
+    if(H){
+        #pragma unroll
+        for(u32 d0=0;d0<8;d0+=2)phdit1c(yv[d0],yv[d0+1],p2);
+        #pragma unroll
+        for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=len){
+                #pragma unroll
+                for(u32 jj=0;jj<half;++jj){if(jj==0)phdit1(yv[d0],yv[d0+half],p2);else phdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p,p2);}}}
+    }else{
+        #pragma unroll
+        for(u32 d0=0;d0<8;d0+=2)pzdit1c(yv[d0],yv[d0+1],p);
+        #pragma unroll
+        for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=len){
+                #pragma unroll
+                for(u32 jj=0;jj<half;++jj){if(jj==0)pzdit1(yv[d0],yv[d0+half],sit[0],p);else pzdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p);}}}
+    }
+    {u32* const xw=X+(t+4u*(t>>5));
+        #pragma unroll
+        for(u32 d=0;d<8;++d)xw[d*288u]=yv[d];}
+    __syncthreads();
+    const u64* const tn=t2n+(u64(prime*8u+warp)*512u+((c>>7)*256u+lane));
+    u64 tv[8];
+    #pragma unroll
+    for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+32u*m);
+    if((dfl&1)&&lane<8u)bpo_discard(C+u64(prime*8u+lane)*N+(c*256u+32u*warp));   // C lines read by this warp (all used)
+    u32 v[8];
+    u32* const base=X+warp*288u;
+    {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
+     v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
+    if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
+    u32* const out=D+(u64(prime*8u+warp)*N+(c*256u+lane));
+#ifdef BPO_P3EL
+    const u32 pm=12u;   // dfl 8: group-0 residues L2 evict_last; dfl 4: evict_first (bpo_p3_body order)
+#else
+    const u32 pm=4u;
+#endif
+    if(dfl&pm){
+        u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+        #pragma unroll
+        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
+    }else{
+        #pragma unroll
+        for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
+    }
+}
+extern "C" __global__ void __maxnreg__(32) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
+    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
+    __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
+    if(N==65536u&&logR==8u&&!(dfl&2u)){
+#if BPO_NH30
+        if(primes[blockIdx.y]<(1u<<30))bpo_p3b_body<true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
+#endif
+        bpo_p3b_body<false>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
+        return;}
+#if BPO_NH30
+    if(primes[blockIdx.y]<(1u<<30))bpo_p3_body<BPO_P3T,true>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);else
+#endif
+    bpo_p3_body<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);
+}
+#else
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
@@ -1613,6 +1704,7 @@ extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32*
 #endif
     bpo_p3_body<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);
 }
+#endif
 #if !defined(BPO_LEAN)
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3v(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){

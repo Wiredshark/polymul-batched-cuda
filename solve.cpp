@@ -333,6 +333,7 @@ struct State {
             m+="#define BPR_DT "+std::to_string(digit_terms)+nl;list("BCRT_BIAS",padded(bias_value,l),"u");
             if(h30)m+="#define BPO_MIXED 1"+nl+"#define BPO_NH30 "+std::to_string(nh30)+nl;
             if(std::getenv("FHERMA_P2_OLD"))m+="#define BPO_P2_OLD 1"+nl;   // opt-out: pre-p2k bpo_middle_r16 addressing (pv65 p2k 0.985 on target)
+            if(std::getenv("FHERMA_P3_OLD"))m+="#define BPO_P3_OLD 1"+nl;   // opt-out: pre-p3b bpo_last_cm3 (pv67 p3b 0.994 on target)
             if(!compact_roots)m+="#define WROOT_COMPACT 0"+nl;
             if(k==16&&short_words==16&&!std::getenv("FHERMA_NO_TCCRT")){
                 // Tensor-core CRT constants (batched_crt_tc): B fragments, alpha reciprocals, 2^512-P, 2^G.
