@@ -31,6 +31,9 @@
 #ifndef BPO_XA
 #define BPO_XA 0
 #endif
+#ifndef BPO_MIXED
+#define BPO_MIXED 0   // 1 with the h30 prime set (primes < 2^30 present: per-prime P1 Barrett shift)
+#endif
 #if defined(__CUDA_ARCH__)&&__CUDA_ARCH__>=900
 #define BPO_X_HAS_TMA 1
 #else
@@ -536,7 +539,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
-            const u32 r=4*u+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
+            const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;   // floor(2^(64-msh)/p) < 2^32 (BPO_MIXED: h30 prime set)
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
             const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
@@ -554,12 +557,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                         if(F&4096){   // x = w + 2^16 z (w, z < 2^30): hi = floor(x/2^14) exactly, r = lo + q(-p)
                             const u32 w=y0+(y1<<8),z=y2+(y3<<8);
                             const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
-                            const u32 q=__umulhi(hi,m62)>>16;
+                            const u32 q=__umulhi(hi,m62)>>qsh;
                             res[2*mt+hf][j]=lo+q*np;
                         }else{
                         const u32 lo=y0+(y1<<8)+(y2<<16)+(y3<<24);
                         const u32 hi=(y0>>14)+(y1>>6)+(y2<<2)+(y3<<10);
-                        const u32 q=__umulhi(hi,m62)>>16;
+                        const u32 q=__umulhi(hi,m62)>>qsh;
                         res[2*mt+hf][j]=lo-q*p;}
                     }
                 }

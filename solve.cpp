@@ -225,6 +225,10 @@ struct State {
             output_pool=std::make_unique<owning_pinned_vector::Pool>(
                 owning_pinned_vector::Backend{cuda.get(),&State::pin_output,&State::unpin_output},bytes,3);}
     CUdeviceptr p,mu,tw,itw,invn,weights,a,b,at,bt,A,B,C,prefix,lengths,inverses,midpoint,qmod,pmodq,out,outt,crt_inverses,crt_matrix,neg_pmodq;
+    // h30 (default, pv59 whole-batch h30p23 0.993 on target): mixed prime set of 9d2a5bd (12 primes < 2^30 + 31-bit tail, tight
+    // CRT bound, tensor CRT F = 45); P2 / P3 Harvey-lazy butterflies for the primes < 2^30 (BPO_NH30), P1 / CRT Shoup (P1 per-prime
+    // Barrett shift BPO_MIXED). FHERMA_NO_H30=1: the previous all-31-bit prime set (loose bound, F = 46).
+    bool h30=!std::getenv("FHERMA_NO_H30");u32 nh30=0;
     u32 root_stride_host=0;bool weighted=false;u32 short_words=0,digit_terms=0,weighted_middle_threads=128;
     CUdeviceptr weighted_twist,positions,corrections,bias,tc_bfrag=0,tc_bpt=0,tc_rtw=0,r16tab=0,fxt=0,stage_tw=0,stage_itw=0,t2n=0,t2nM=0,t2nO=0,t2nMO=0,ctab=0;std::vector<u32> tc_bfrag_host,tc_bpt_host;std::vector<u64> tc_rtw_host;
     void init_weighted(const Big& q){
@@ -241,11 +245,23 @@ struct State {
         }
         const u32 digit_bits=(w+J-1)/J;digit_terms=(digit_bits+15)/16;
         const Big vmax=minus(two_power(digit_bits),Big{1});
-        const Big bound=multiply(multiply(multiply(vmax,vmax),Big{2*n*J}),Big{delta});
-        const u32 G=bits(bound);const Big target_bound=shift_left(bound,2);Big P{1};
-        u32 candidate=((u32(1)<<31)-2)/(2*n)*(2*n)+1;
+        // FHERMA_NO_H30=1: 31-bit primes until P > 4 * loose bound (vmax^2 2NJ delta). h30 (default, 9d2a5bd): NH30 = 12
+        // primes < 2^30 (Harvey-lazy NTT arithmetic) first, then 31-bit primes until P > 2 * tight bound * (1 + 2^-7). Tight
+        // bound: |c_kj| <= N S_j, S_j = sum_{j1+j2 = j mod J} (delta on wrap) 2^e (2^b_j1-1)(2^b_j2-1), e in {0,1}.
+        Big bound;
+        if(!h30)bound=multiply(multiply(multiply(vmax,vmax),Big{2*n*J}),Big{delta});
+        else{u32 pz[J+1];for(u32 j=0;j<J;++j)pz[j]=(w*j+J-1)/J;pz[J]=w;Big smax{0};
+            for(u32 j=0;j<J;++j){Big s{0};for(u32 j1=0;j1<J;++j1){const u32 j2=(j+J-j1)%J;
+                Big t=multiply(minus(two_power(pz[j1+1]-pz[j1]),Big{1}),minus(two_power(pz[j2+1]-pz[j2]),Big{1}));
+                t=shift_left(t,pz[j1]+pz[j2]-pz[(j1+j2)%J]-(j1+j2>=J?w:0u));if(j1+j2>=J)t=multiply(t,Big{delta});s=plus(s,t);}
+                if(cmp(s,smax)>0)smax=s;}
+            bound=multiply(smax,Big{n});}
+        const u32 G=bits(bound);const Big target_bound=!h30?shift_left(bound,2):plus(shift_left(bound,1),shift_right(bound,7));Big P{1};
+        nh30=h30?12u:0u;
+        u32 candidate=((u32(1)<<(nh30?30:31))-2)/(2*n)*(2*n)+1;
         std::vector<u32> primes,roots,betas;
-        while(cmp(P,target_bound)<=0){
+        while(cmp(P,target_bound)<=0||primes.size()<nh30){
+            if(primes.size()==nh30&&nh30&&candidate<(u32(1)<<30))candidate=((u32(1)<<31)-2)/(2*n)*(2*n)+1;   // 31-bit tail
             bool accepted=false;u32 beta=0;
             while(!accepted){
                 if(candidate<=2*n)throw std::runtime_error("weighted prime search exhausted");
@@ -315,11 +331,15 @@ struct State {
                  fw[(size_t(r)*J+j)*digit_terms+t]=u32(u64(digit_weights[size_t(r)*digit_terms+t])*u32(prepared[size_t(r)*J+j])%primes[r]);
              list("BPO_WEIGHTS",fw,"u");}
             m+="#define BPR_DT "+std::to_string(digit_terms)+nl;list("BCRT_BIAS",padded(bias_value,l),"u");
+            if(h30)m+="#define BPO_MIXED 1"+nl+"#define BPO_NH30 "+std::to_string(nh30)+nl;
             if(!compact_roots)m+="#define WROOT_COMPACT 0"+nl;
             if(k==16&&short_words==16&&!std::getenv("FHERMA_NO_TCCRT")){
                 // Tensor-core CRT constants (batched_crt_tc): B fragments, alpha reciprocals, 2^512-P, 2^G.
-                constexpr u32 F=46;bool ok=true;
+                // h30: F = largest <= 46 with every R = floor(2^F/p) < 2^16 (45 with primes < 2^30), plus the alpha rounding
+                // slack check 2 bound 2^F + 2 K pmax P < P 2^F (9d2a5bd). Production: F = 46.
+                u32 F=46;bool ok=true;u32 pmax=0;if(h30)for(u32 r=0;r<k;++r){pmax=std::max(pmax,primes[r]);while(F>32&&((u64(1)<<F)/primes[r])>>16)--F;}
                 std::vector<u32> R(k);for(u32 r=0;r<k;++r){R[r]=u32((u64(1)<<F)/primes[r]);if(R[r]>>16)ok=false;}
+                if(h30&&cmp(plus(shift_left(bound,F+1),multiply(P,Big{2*k*pmax})),shift_left(P,F))>=0)ok=false;
                 auto pm_byte=[&](u32 r,int c)->u32{if(c<0||c>=int(4*short_words))return 0;return (crtMatrix[size_t(r)*short_words+c/4]>>(8*(c%4)))&255u;};
                 auto r_byte=[&](u32 r,int c)->u32{if(c<0||c>=2)return 0;return (R[r]>>(8*c))&255u;};
                 tc_bfrag_host.assign(9*2*32*2,0);
