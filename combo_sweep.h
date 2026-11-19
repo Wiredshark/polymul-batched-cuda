@@ -1,26 +1,20 @@
 #pragma once
-// Round 19 (combo2, on 9758254 = pv62: BIG_GFLAGS 1|4|128 (group-0 P3 evict_last), CRT prefetch items 3*p1_grid/4): exit-time
+// Round 20 (p23, on addc191 = 9758254 = pv62 production): P2 / P3 busy-SM-time lines (p23_sweep.cuh kernels, module "var" =
+// production source + P23_SWEEP_SOURCE). Keys: ctrl / rc / ctrl_end controls; p2k (cb_p2k), p3k (cb_p3k), p3r16h / p3r16t
+// (cb_p3r16h / cb_p3r16t, 128 threads, r16 table: BatchOvr bx[2] = 128, p3tab = 1), p3r16n (production bpo_last_r16 = the
+// non-Harvey opt-in kernel, no L2 hints: reference); top-3 repeats (_r); combo = best P2 + best P3 line <= FHERMA_COMBO_T;
+// c_p2k_p3r16h = that pair unconditionally.
+// iso_* lines: the same batch graph with only P2 (FHERMA_STAGE_MASK 8) or only P3 (16) launched (ex 0 by design): isolated
+// stage throughput under the 2-chain schedule; compare med_us within a stage (iso_p2 / iso_p2_e and iso_p3 / iso_p3_e = prod).
+// combo_regs: JIT registers / local bytes per sweep kernel on the device. p2k / p3k / p3r16*: see p23_sweep.cuh.
+// Mechanism (round 19, combo2): exit-time
 // WHOLE-BATCH lines (State::combo_sweep -> run_combo). Every line recaptures the full B-product production graph (variant 6, as
 // fherma_run launches it) with one set of substitutions (State::batch_line: per-stage kernel from a sweep module, environment
 // overrides read at capture time, CRT prefetch items) and times it against the production graph exec in paired, alternating
 // reps (vs_prod = median of pair ratios; < 1 = faster). ex = 1 when all B outputs are bit-identical to production (device compare).
 // Sweep modules: the production NVRTC source (prefix + kernels, same arch option) with every extern "C" kernel turned into an
-// uninstantiated template (only the named instances compile); module "var" adds text substitutions (each must match) and a P3
-// wrapper; compiled in worker threads at exit.
-// Keys (v) and what each maps to as a production default:
-//   ctrl / ctrl_end  production config recaptured (capture control)
-//   rc               P2 bpo_middle_r16 + P3 bpo_last_cm3 + CRT bpo_crt_lean recompiled unchanged (module control)
-//   gfl6             FHERMA_GFLAGS=134 (6|128): P1 TMA output stores L2 evict_last (pfstep bit 30) instead of plain (bit 29)
-//                    -> BIG_GFLAGS = 2|4|128 = the "P1 output evict_last for P2" line
-//   gfl13            FHERMA_GFLAGS=141 (13|128): adds bit 8 (non-last-group P3 residues evict_first); with 2 groups and bit 128
-//                    the group-0 P3 takes the evict_last branch first, so this is the production config again (2nd control)
-//   pf58 / pf78 / pfg  CRT prefetch items 5*p1_grid/8, 7*p1_grid/8, p1_grid (solve.cpp CRT launch; production 3*p1_grid/4)
-//   p3all            P3 = cb_p3el_all (bpo_last_cm3 with T0|8): residue stores evict_last for EVERY prime group
-//   crtef            CRT residue cp.async with L2::cache_hint evict_first (batched_crt_lean.cuh swc_cpa16); the CRT already
-//                    discards the residue lines after use (dfl 1, l2f 8, production)
-//   p3all_crtef      p3all + crtef
-//   p2el             P2 C stores st.global.L2::cache_hint evict_last (bpo_r16_body output loop) for the P3 reads
-//   combo / combo2   best line per family scoring <= FHERMA_COMBO_T (default 0.996) merged (combo2: best two); *_r repeats
+// uninstantiated template (only the named instances compile); compiled in worker threads at exit.
+// (Round-19 keys gfl6 / gfl13 / pf* / p3all / crtef / p2el: measured in pv63, all >= 0.9968, removed.)
 // FHERMA_COMBO=0 off, FHERMA_COMBO_S time budget (s, default 55, compiles included), FHERMA_BATCH_R pairs per line (default 13).
 #include <thread>
 #include <atomic>
@@ -65,6 +59,7 @@ template<class C> struct ComboMods {
 };
 
 // src: production NVRTC source (prefix + kernels); line: State::batch_line; cmp: State::batch_cmp (set while the lines run).
+#include "p23_sweep_src.h"
 template<class C> inline void run_combo(C& d,const std::string& src,unsigned p1_grid,unsigned cols,const std::function<BatchRes(const BatchOvr&,const char*)>& line,CUfunction& cmp){
     if(const char* e=std::getenv("FHERMA_COMBO"))if(*e=='0')return;
     const auto t0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();};
@@ -73,47 +68,38 @@ template<class C> inline void run_combo(C& d,const std::string& src,unsigned p1_
     // ---- sweep modules
     std::string s=src;{const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
     ComboMods<C> M(d);
-    const std::string P2="bpo_middle_r16<0>",P3="bpo_last_cm3<0>",CR="bpo_crt_lean<0>";
-    const int m_rc=M.add("rc",s+"\nextern \"C\" __global__ void cb_cmp(const uint4* a,const uint4* b,unsigned long long n,unsigned* bad){unsigned c=0;for(unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n",{P2,P3,CR,"cb_cmp"});
-    // variant module: substitutions (every pattern must be found; count reported)
-    std::string v=s;std::string subinfo;
-    auto sub=[&](const char* tag,const std::string& a,const std::string& b)->bool{size_t p=0;int c=0;while((p=v.find(a,p))!=std::string::npos){v.replace(p,a.size(),b);p+=b.size();++c;}
-        subinfo+=std::string(subinfo.empty()?"":",")+"\""+tag+"\":"+std::to_string(c);return c>0;};
-    const bool ok_crt=sub("crtef","__device__ __forceinline__ void swc_cpa16(u32 dst,const void* src){asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\"::\"r\"(dst),\"l\"(src):\"memory\");}",
-        "__device__ __forceinline__ void swc_cpa16(u32 dst,const void* src){u64 pol_;asm(\"createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\":\"=l\"(pol_));asm volatile(\"cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\"::\"r\"(dst),\"l\"(src),\"l\"(pol_):\"memory\");}");
-    const bool ok_p2=sub("p2el","for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];",
-        "{u64 pol_;asm(\"createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\":\"=l\"(pol_));for(u32 c1=0;c1<16;++c1)asm volatile(\"st.global.L2::cache_hint.u32 [%0], %1, %2;\"::\"l\"(o+4096u*c1),\"r\"(a[c1]),\"l\"(pol_):\"memory\");}");
-    v+="\nextern \"C\" __global__ void __launch_bounds__(256) cb_p3el_all(const u32* C,u32* D,const u32* primes,const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){\n"
-       "    __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;\n"
-       "#if BPO_NH30\n    if(primes[blockIdx.y]<(1u<<30))bpo_p3_body<(BPO_P3T|8u),true>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);else\n#endif\n"
-       "    bpo_p3_body<(BPO_P3T|8u)>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);\n}\n";
-    const int m_var=M.add("var",v,{P2,CR,"cb_p3el_all"});
+    const std::string P2="bpo_middle_r16<0>",P3="bpo_last_cm3<0>",CR="bpo_crt_lean<0>",P3R="bpo_last_r16<0>";
+    const int m_rc=M.add("rc",s+"\nextern \"C\" __global__ void cb_cmp(const uint4* a,const uint4* b,unsigned long long n,unsigned* bad){unsigned c=0;for(unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n",{P2,P3,CR,"cb_cmp",P3R});
+    // var: cb_p3k instantiates the production bpo_p3_body with 2p from a lane-0 shuffle instead of the bpo_p2_of constant lookup
+    // (only cb_* kernels are instantiated in this module, so the substitution reaches no other kernel)
+    std::string v=s;int nsub=0;{const std::string a="bpo_p2_of(p)",b="__shfl_sync(0xffffffffu,2u*(p),0)";size_t q=0;while((q=v.find(a,q))!=std::string::npos){v.replace(q,a.size(),b);q+=b.size();++nsub;}}
+    const int m_var=M.add("var",v+"\n"+P23_SWEEP_SOURCE,{"cb_p2k","cb_p3k","cb_p3r16h","cb_p3r16t"});
     M.build();
     {std::string info;for(const auto& P:M.progs){char b[160];std::snprintf(b,sizeof b,"%s\"%s\":{\"s\":%.1f,\"ok\":%d%s%s%s}",info.empty()?"":",",P.name.c_str(),P.t,int(P.mod!=nullptr),P.err.empty()?"":",\"err\":\"",P.err.substr(0,80).c_str(),P.err.empty()?"":"\"");info+=b;}
-     std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"p1_grid\":%u,\"crt_pf_prod\":%u,\"thr\":%.4f,\"compile_s\":%.1f,\"subs\":{%s},\"mods\":{%s}}\n",p1_grid,std::min(3*p1_grid/4,2u*cols),thr,el(),subinfo.c_str(),info.c_str());std::fflush(stdout);}
+     std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"round\":20,\"p2sub\":%d,\"p1_grid\":%u,\"crt_pf_prod\":%u,\"thr\":%.4f,\"compile_s\":%.1f,\"mods\":{%s}}\n",nsub,p1_grid,std::min(3*p1_grid/4,2u*cols),thr,el(),info.c_str());std::fflush(stdout);}
+    {   // JIT register / local-memory (spill) footprint of every sweep kernel as loaded on this device
+        auto ga=d.driver.template get<decltype(&::cuFuncGetAttribute)>("cuFuncGetAttribute");std::string r;
+        auto one=[&](const char* nm,CUfunction f){if(!f)return;int rg=0,lc=0;ga(&rg,CU_FUNC_ATTRIBUTE_NUM_REGS,f);ga(&lc,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,f);char b[96];std::snprintf(b,sizeof b,"%s\"%s\":[%d,%d]",r.empty()?"":",",nm,rg,lc);r+=b;};
+        one("p2",M.fn(m_rc,0));one("p3",M.fn(m_rc,1));one("p3r16n",M.fn(m_rc,4));one("p2k",M.fn(m_var,0));one("p3k",M.fn(m_var,1));one("p3r16h",M.fn(m_var,2));one("p3r16t",M.fn(m_var,3));
+        std::printf("{\"diag\":\"sw\",\"k\":\"combo_regs\",\"regs_local\":{%s}}\n",r.c_str());std::fflush(stdout);}
     cmp=M.fn(m_rc,3);
     // ---- lines
-    struct L{std::string v;int fam=0;CUfunction p2=nullptr,p3=nullptr,crt=nullptr;int gfl=-1;int crtpf=-1;BatchRes r;};
+    struct L{std::string v;int fam=0;CUfunction p2=nullptr,p3=nullptr,crt=nullptr;unsigned p3bx=0,p3tab=0;const char* mask=nullptr;BatchRes r;};
     auto run=[&](L& x)->bool{
         if(el()>budget){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",x.v.c_str());std::fflush(stdout);return false;}
-        BatchOvr o;o.check=true;o.fn[1]=x.p2;o.fn[2]=x.p3;o.fn[3]=x.crt;o.crtpf=x.crtpf;
-        if(x.gfl>=0)o.env.push_back({"FHERMA_GFLAGS",std::to_string(x.gfl)});
+        BatchOvr o;o.check=true;o.fn[1]=x.p2;o.fn[2]=x.p3;o.fn[3]=x.crt;o.bx[2]=x.p3bx;o.p3tab=x.p3tab;if(x.mask)o.env.push_back({"FHERMA_STAGE_MASK",x.mask});
         x.r=line(o,x.v.c_str());return x.r.ok;};
     std::vector<L> done;
     auto single=[&](L x,bool need){if(need&&!x.p2&&!x.p3&&!x.crt){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"module missing\"}\n",x.v.c_str());std::fflush(stdout);return;}if(run(x))done.push_back(x);};
     auto mk=[](const char* v,int fam){L x;x.v=v;x.fam=fam;return x;};
-    // families: 1 GFLAGS (P1 store policy), 2 CRT prefetch items, 3 P3 residue policy / CRT residue loads, 4 P2 C stores; 0 controls
+    // families: 1 P2 kernel, 2 P3 kernel; 0 controls / references (never combined)
     single(mk("ctrl",0),false);
     {L x=mk("rc",0);x.p2=M.fn(m_rc,0);x.p3=M.fn(m_rc,1);x.crt=M.fn(m_rc,2);single(x,true);}
-    {L x=mk("gfl6",1);x.gfl=6|128;single(x,false);}
-    {L x=mk("gfl13",0);x.gfl=13|128;single(x,false);}   // = production (see header): control, never combined
-    struct PF{const char* v;unsigned items;};
-    const PF pfs[]={{"pf58",5*p1_grid/8},{"pf78",7*p1_grid/8},{"pfg",p1_grid}};
-    for(const auto& p:pfs){L x=mk(p.v,2);x.crtpf=int(std::min(p.items,2u*cols));single(x,false);}
-    {L x=mk("p3all",3);x.p3=M.fn(m_var,2);single(x,true);}
-    if(ok_crt){L x=mk("crtef",3);x.crt=M.fn(m_var,1);single(x,true);}
-    if(ok_crt){L x=mk("p3all_crtef",3);x.p3=M.fn(m_var,2);x.crt=M.fn(m_var,1);if(x.p3)single(x,true);}
-    if(ok_p2){L x=mk("p2el",4);x.p2=M.fn(m_var,0);single(x,true);}
+    {L x=mk("p2k",1);x.p2=M.fn(m_var,0);single(x,true);}
+    {L x=mk("p3k",2);x.p3=M.fn(m_var,1);single(x,true);}
+    {L x=mk("p3r16h",2);x.p3=M.fn(m_var,2);x.p3bx=128;x.p3tab=1;single(x,true);}
+    {L x=mk("p3r16t",2);x.p3=M.fn(m_var,3);x.p3bx=128;x.p3tab=1;single(x,true);}
+    {L x=mk("p3r16n",0);x.p3=M.fn(m_rc,4);x.p3bx=128;x.p3tab=1;single(x,true);}
     // repeats of the top single lines (exact, by vs_prod)
     std::vector<size_t> ord;for(size_t i=0;i<done.size();++i)if(done[i].fam>0&&done[i].r.ex==1)ord.push_back(i);
     std::sort(ord.begin(),ord.end(),[&](size_t a,size_t b){return done[a].r.vs<done[b].r.vs;});
@@ -122,17 +108,21 @@ template<class C> inline void run_combo(C& d,const std::string& src,unsigned p1_
     // per family: best exact line (mean with its repeat when repeated) <= thr
     std::vector<double> score(done.size(),0);
     for(size_t i=0;i<nsingle;++i){double s1=done[i].r.vs;int c=1;for(size_t j=nsingle;j<done.size();++j)if(done[j].v==done[i].v+"_r"&&done[j].r.ex==1){s1+=done[j].r.vs;++c;}score[i]=s1/c;}
-    std::vector<int> best(5,-1);
+    std::vector<int> best(3,-1);
     for(size_t i=0;i<nsingle;++i){const L& x=done[i];if(x.fam<=0||x.r.ex!=1||score[i]>thr)continue;if(best[size_t(x.fam)]<0||score[i]<score[size_t(best[size_t(x.fam)])])best[size_t(x.fam)]=int(i);}
-    std::vector<int> win;for(int f=1;f<=4;++f)if(best[size_t(f)]>=0)win.push_back(best[size_t(f)]);
-    std::sort(win.begin(),win.end(),[&](int a,int b){return score[size_t(a)]<score[size_t(b)];});
-    auto merge=[&](size_t cnt,const char* tag)->L{L c=mk(tag,-1);std::string nm=tag;
-        for(size_t i=0;i<cnt&&i<win.size();++i){const L& x=done[size_t(win[i])];nm+=":"+x.v;
-            if(x.p2)c.p2=x.p2;if(x.p3)c.p3=x.p3;if(x.crt)c.crt=x.crt;if(x.gfl>=0)c.gfl=x.gfl;if(x.crtpf>=0)c.crtpf=x.crtpf;}
-        c.v=nm;return c;};
+    std::vector<int> win;for(int f=1;f<=2;++f)if(best[size_t(f)]>=0)win.push_back(best[size_t(f)]);
     std::printf("{\"diag\":\"sw\",\"k\":\"combo_pick\",\"winners\":%zu,\"list\":\"",win.size());for(int i:win)std::printf("%s=%.4f ",done[size_t(i)].v.c_str(),score[size_t(i)]);std::printf("\"}\n");std::fflush(stdout);
-    if(win.size()>=2){L c=merge(win.size(),"combo");if(run(c)){done.push_back(c);L r=c;r.v+="_r";if(run(r))done.push_back(r);}}
-    if(win.size()>=3){L c=merge(2,"combo2");if(run(c))done.push_back(c);}
+    if(win.size()>=2){L c=mk("combo",-1);std::string nm="combo";
+        for(int i:win){const L& x=done[size_t(i)];nm+=":"+x.v;if(x.p2)c.p2=x.p2;if(x.p3){c.p3=x.p3;c.p3bx=x.p3bx;c.p3tab=x.p3tab;}}
+        c.v=nm;if(run(c)){done.push_back(c);L r=c;r.v+="_r";if(run(r))done.push_back(r);}}
+    {L x=mk("c_p2k_p3r16h",-1);x.p2=M.fn(m_var,0);x.p3=M.fn(m_var,2);x.p3bx=128;x.p3tab=1;single(x,true);}   // fixed pair (local proxy is P2-memory-bound)
+    // isolated stage throughput (whole-batch graph with FHERMA_STAGE_MASK: only P2 (8) or only P3 (16) launched; outputs not
+    // produced -> ex 0 by design, compare med_us between iso lines of the same stage). FHERMA_P23_ISO=0 off.
+    if(!(std::getenv("FHERMA_P23_ISO")&&*std::getenv("FHERMA_P23_ISO")=='0')){
+        auto iso=[&](const char* v,const char* mask,CUfunction p2,CUfunction p3,unsigned bx,unsigned tab){L x=mk(v,0);x.p2=p2;x.p3=p3;x.p3bx=bx;x.p3tab=tab;x.mask=mask;single(x,false);};
+        iso("iso_p2","8",nullptr,nullptr,0,0);iso("iso_p2k","8",M.fn(m_var,0),nullptr,0,0);
+        iso("iso_p3","16",nullptr,nullptr,0,0);iso("iso_p3r16h","16",nullptr,M.fn(m_var,2),128,1);iso("iso_p3r16t","16",nullptr,M.fn(m_var,3),128,1);
+        iso("iso_p3_e","16",nullptr,nullptr,0,0);iso("iso_p2_e","8",nullptr,nullptr,0,0);}
     single(mk("ctrl_end",0),false);
     std::printf("{\"diag\":\"sw\",\"k\":\"combo_done\",\"s\":%.2f,\"lines\":%zu}\n",el(),done.size());std::fflush(stdout);
     d.cuCtxSynchronize();cmp=nullptr;

@@ -1,0 +1,2 @@
+#pragma once
+static const char P23_SWEEP_SOURCE[] = R"P23SWEEP(@P23_SWEEP_SOURCE@)P23SWEEP";

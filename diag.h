@@ -23,7 +23,7 @@ inline bool diag_env(){const char* e=std::getenv("FHERMA_DIAG");return !e||*e!='
 // round 16 (p1b): bx = block.x substitute (0 = production); xw = P1 output run length L for the P1 TMA map (0 = production map).
 // round 18 (combo, on 88de7fc: h30 prime set is production, the round-17 h30 table swap is gone): env = environment overrides
 // set for the capture only (empty value = unset), crtpf = CRT prefetch items (-1 = production min(p1_grid/2, 2 cols)).
-struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; unsigned bx[4]{}; unsigned xw=0; std::vector<std::pair<std::string,std::string>> env; int crtpf=-1; };
+struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; unsigned bx[4]{}; unsigned xw=0; std::vector<std::pair<std::string,std::string>> env; int crtpf=-1; unsigned p3tab=0; };   // round 20: p3tab 1 = P3 substitute gets the r16 table
 struct BatchRes { bool ok=false; int ex=-1; double vs=0,med=0,prod=0; };   // State::batch_line result (vs = median pair ratio)
 
 template<class C> struct Diag {

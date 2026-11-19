@@ -30,6 +30,9 @@ configure_file(kernel_source.h.in kernel_source.h @ONLY)
 # Exit-time sweep only (diag_sweep.h): CRT diet / P3 evict_last variant kernels appended to the sweep copy of the source, never to the production one.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/crtd_sweep.cuh" CRTD_SWEEP_SOURCE)
 configure_file(crtd_sweep_src.h.in crtd_sweep_src.h @ONLY)
+# Round 20 (p23): P2/P3 variant kernels appended to the combo sweep copy of the source only.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/p23_sweep.cuh" P23_SWEEP_SOURCE)
+configure_file(p23_sweep_src.h.in p23_sweep_src.h @ONLY)
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${CUDA_HEADER_DIR})
 target_link_libraries(solution PRIVATE ${CMAKE_DL_LIBS})
 target_compile_options(solution PRIVATE -Wall -Wextra)
