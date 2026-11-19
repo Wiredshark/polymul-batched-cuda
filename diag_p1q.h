@@ -183,7 +183,7 @@ PQK(pq_ab_h,7,256,true) PQK(pq_a_h,5,256,true) PQK(pq_b_h,6,256,true)
 PQKR(pq_ab_r32,7,256,false,32) PQKR(pq_ab_r64,7,256,false,64) PQKR(pq_ab_h_r64,7,256,true,64) PQKR(pq_ab512_r32,7,512,false,32)
 )PQ";
 
-inline bool p1q_env(){const char* e=std::getenv("FHERMA_DIAG_P1Q");return !e||*e!='0';}
+inline bool p1q_env(){const char* e=std::getenv("FHERMA_DIAG_P1Q");return e&&*e=='1';}   // round 15 (bceil): off by default (measured pv51)
 
 template<class D> inline void run_p1q(D& g){
     auto& d=g.d;auto& kp=g.kp;const int sms=g.sms;

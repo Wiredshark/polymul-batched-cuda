@@ -18,6 +18,8 @@
 // Round 13 (ladder, on 565ec66): P1 only. {"diag":"lad",...} lines = the P1 morph ladder (L0..L5 cumulative, R_* single removals,
 // n_* compute-only fix twins; see ladder()), fx_* = exact fix prototypes with chain lines. Traces come from kprof trace_only
 // mode (kprof off by default: launch parameters copied at graph capture, no event nodes).
+// Round 15 (bceil, on d7918a1 = 565ec66 timed path): default = whole-batch ceiling / sensitivity lines only (see run(): ctrl,
+// rm_*, *_nold/_nost/_nomem, half_*, bd_*); per-kernel / ladder / chain lines with FHERMA_SWEEP_KLINES=1. P1Q probe off.
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -36,6 +38,7 @@ template<class C> struct Sweep {
     struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; std::function<bool(const KProf::Trace&,PB&)> mk; bool skip=false; bool wa=false; bool lad=false; bool pers=false; unsigned gx=0; int p1m=0; bool p1e=false; int gsel=-1; };   // gsel >= 0: chains substitute only the stage trace with that group index   // p1m 1: m16 chain mode, 2: m16a (see run())   // wa: P1 bpt (param 6) = shifted table
     const std::vector<KProf::Trace>* trp=nullptr;
     std::vector<V> vs[4];   // per stage (KProf::P1..CRT)
+    bool klines=false;int triv_k=-1;   // round 15: FHERMA_SWEEP_KLINES=1 = per-kernel / ladder / chain lines (off: batch lines only)
     CUevent ea=nullptr,eb=nullptr,e0=nullptr,e1=nullptr,ej=nullptr;CUdeviceptr ref=0,bad=0,wabpt=0;size_t ref_n=0;CUfunction cmp=nullptr;
     std::vector<unsigned> mprimes,mpos;   // BCRT_PRIMES / BCRT_POS parsed from the source prefix (XG_WA table)
     static std::vector<unsigned> mlist(const std::string& s,const char* name){std::vector<unsigned> v;const std::string k=std::string("#define ")+name+" ";const size_t p=s.find(k);if(p==std::string::npos)return v;
@@ -49,6 +52,55 @@ template<class C> struct Sweep {
         if(const char* e=std::getenv("FHERMA_ARCH"))arch=e;else arch=cc1>=9?"compute_90":"compute_80";   // = production module option
         native="sm_"+std::to_string(cc1*10+cc2);
         std::string s=source;
+        if(const char* e=std::getenv("FHERMA_SWEEP_KLINES"))klines=*e=='1';
+        // launch-bounds twins of the P2 / CRT kernels: a copy of the kernel text as a template over min-blocks (the original
+        // stays, as a template with the production attributes: its <0> instance is the recompiled control)
+        // subs: text substitutions applied to the copy only (each must match exactly once, else the twin is dropped)
+        auto twin=[&](const char* head,const char* nhead,std::initializer_list<std::pair<const char*,const char*>> subs={})->bool{const size_t p=s.find(head);if(p==std::string::npos)return false;const size_t e=s.find("\n}",p);if(e==std::string::npos)return false;
+            std::string k=s.substr(p,e+2-p);k.replace(0,std::strlen(head),nhead);for(size_t q;(q=k.find("#ifdef BPO_SWEEP"))!=std::string::npos;)k.replace(q,16,"#if 1");
+            for(const auto& r:subs){const size_t q=k.find(r.first);if(q==std::string::npos||k.find(r.first,q+1)!=std::string::npos)return false;k.replace(q,std::strlen(r.first),r.second);}
+            s.insert(e+2,"\n"+k+"\n");return true;};
+        const bool has_p2=s.find("extern \"C\" __global__ void __launch_bounds__(128) bpo_middle_r16(")!=std::string::npos;
+        const bool has_crt=s.find("extern \"C\" __global__ void __launch_bounds__(128,3) bpo_crt_lean(")!=std::string::npos;
+        // round 9 (ceil, on 590b89d = pv47): structural-ceiling ablations (wrong values by design, ex 0). Twins of the production
+        // P2 / CRT kernels and of the P3 body by text substitution (each pattern must match exactly once in the copy):
+        //   nold = no global input loads (P2: A/B registers from an index hash; P3: C words from a hash; CRT: no residue cp.async,
+        //          the fragments read whatever is in the smem buffer), dead-line discards off;
+        //   nost = no global output stores (values XOR-folded, one never-taken guarded store keeps the math live);
+        //   nomem = nold + nost (CRT nomem also drops the next-P1 L2 prefetch). Table / twiddle loads stay (L1/L2-resident).
+        // P1 (template flags, batched_p1x.cuh): nost = XABL 8 (no output TMA stores), nomem = XABL 8 + XG_NST (no input staging).
+        static const char* const P2LD="for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}";
+        static const char* const P2LDX="for(u32 c1=0;c1<16;++c1){a[c1]=(c1*0x9e37u+threadIdx.x*7u+g)&0x3fffffffu;b[c1]=(c1*0x7f4bu+s*13u+j)&0x3fffffffu;}(void)a0;(void)b0;";
+        static const char* const P2DS="if(untw&8)bpo_discard(";static const char* const P2DSX="if(false)bpo_discard(";
+        static const char* const P2ST="for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];";
+        static const char* const P2STX="for(u32 c1=0,xs=0;c1<16;++c1){xs^=a[c1];if(c1==15u&&xs==0x9e3779b9u)o[0]=xs;}";
+        static const char* const P3LD="for(u32 d=0;d<8;++d)yv[d]=src[u64(d)*N];";
+        static const char* const P3LDX="for(u32 d=0;d<8;++d)yv[d]=(t*8u+d+c*0x9e37u+prime)&0x3fffffffu;";
+        static const char* const P3DS="if((dfl&1)&&lane<8u)bpo_discard(";static const char* const P3DSX="if(false)bpo_discard(";
+        static const char* const P3ST="for(u32 m=0;m<8;++m)out[32*m]=pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p);";
+        static const char* const P3STX="for(u32 m=0,xs=0;m<8;++m){xs^=pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p);if(m==7u&&xs==0x9e3779b9u)out[0]=xs;}";
+        static const char* const P3EF="}else if((T0&4)&&(dfl&4)){";static const char* const P3EFX="}else if(false){";
+        static const char* const CRLD="swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);";
+        static const char* const CRLDX="(void)r;(void)ch;(void)j;";
+        static const char* const CRDS="if(dfl&1)for(u32 x=lane;";static const char* const CRDSX="if(false)for(u32 x=lane;";
+        static const char* const CRS1="for(u32 rr=0;rr<32;++rr){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}";
+        static const char* const CRS2="for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}";
+        static const char* const CRSX="for(u32 rr=0,xs=0;rr<32;++rr){xs^=st[rr*L+lane];if(lane<L-32)xs^=st[rr*L+32+lane];if(rr==31u&&xs==0x9e3779b9u)ob[0]=xs;}";
+        static const char* const CRPF="if(pfitems){";static const char* const CRPFX="if(false){";
+        static const char* const H2="extern \"C\" __global__ void __launch_bounds__(128) bpo_middle_r16(";
+        static const char* const H3="template<u32 T0>__device__ __forceinline__ void bpo_p3_body(";
+        static const char* const HC="extern \"C\" __global__ void __launch_bounds__(128,3) bpo_crt_lean(";
+        bool tw_ok[10]={};
+        if(has_p2){tw_ok[0]=twin(H2,"extern \"C\" __global__ void __launch_bounds__(128) sw_p2_nold(",{{P2LD,P2LDX},{P2DS,P2DSX}});
+            tw_ok[1]=twin(H2,"extern \"C\" __global__ void __launch_bounds__(128) sw_p2_nost(",{{P2ST,P2STX}});
+            tw_ok[2]=twin(H2,"extern \"C\" __global__ void __launch_bounds__(128) sw_p2_nomem(",{{P2LD,P2LDX},{P2DS,P2DSX},{P2ST,P2STX}});}
+        tw_ok[3]=twin(H3,"template<u32 T0>__device__ __forceinline__ void sw_p3b_nold(",{{P3LD,P3LDX},{P3DS,P3DSX}});
+        tw_ok[4]=twin(H3,"template<u32 T0>__device__ __forceinline__ void sw_p3b_nost(",{{P3ST,P3STX},{P3EF,P3EFX}});
+        tw_ok[5]=twin(H3,"template<u32 T0>__device__ __forceinline__ void sw_p3b_nomem(",{{P3LD,P3LDX},{P3DS,P3DSX},{P3ST,P3STX},{P3EF,P3EFX}});
+        if(has_crt){tw_ok[6]=twin(HC,"extern \"C\" __global__ void __launch_bounds__(128,3) sw_crt_nold(",{{CRLD,CRLDX}});
+            tw_ok[7]=twin(HC,"extern \"C\" __global__ void __launch_bounds__(128,3) sw_crt_nomem(",{{CRLD,CRLDX},{CRDS,CRDSX},{CRS1,CRSX},{CRS2,CRSX},{CRPF,CRPFX}});}
+        {static const char* const tn[8]={"p2_nold","p2_nost","p2_nomem","p3_nold","p3_nost","p3_nomem","crt_nold","crt_nomem"};
+         for(int i=0;i<8;++i)if(!tw_ok[i])std::printf("{\"diag\":\"sw\",\"k\":\"ceil\",\"error\":\"twin %s: pattern mismatch\"}\n",tn[i]);std::fflush(stdout);}
         // round 13 (ladder, on 565ec66 = pv54): P1 morph ladder (batched_p1x.cuh XL_* bits; all ablations, wrong values by design).
         // Rungs L0..L5 remove one more difference between the compute-only production P1 (nomem) and the isolated quad-math probe
         // (diag_p1q.h pq_ab) at each step; R_* lines remove ONE difference from L0 (reverse ladder). Each ladder line is timed in the
@@ -64,11 +116,29 @@ template<class C> struct Sweep {
         {const int c=prog("cmp",arch);progs[size_t(c)].src="typedef unsigned int u32;typedef unsigned long long u64;\n"   // exactness compare kernel (tiny)
             "extern \"C\" __global__ void sw_cmp(const uint4* a,const uint4* b,u64 n,u32* bad){u32 c=0;for(u64 i=u64(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=u64(gridDim.x)*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n";
          addk(c,"sw_cmp",false);}
-        {   // P1: ctrl (recompiled production), nost, nomem
-            const int c=prog("p1",arch);auto& S=progs[size_t(c)].src;
-            S+="SWP1(sw_p1_ctrl,BPO_XF,BPO_XG,BPO_TC_MINB)\nSWP1(sw_p1_nost,(BPO_XF|(8u<<20)),BPO_XG,BPO_TC_MINB)\nSWP1(sw_p1_nomem,(BPO_XF|(8u<<20)),(BPO_XG|1u),BPO_TC_MINB)\n";
-            addv(KProf::P1,"ctrl",c,addk(c,"sw_p1_ctrl",false));addv(KProf::P1,"nost",c,addk(c,"sw_p1_nost",false),-1,0,0,true);addv(KProf::P1,"nomem",c,addk(c,"sw_p1_nomem",false),-1,0,0,true);}
-        {   // ladder: F = nomem flags (XABL 8) or XABL 14 (no proxy fence, with NPF); G = nomem (XG_NST) | XL bits
+        progs[0].src+="extern \"C\" __global__ void sw_triv(){}\n";triv_k=addk(0,"sw_triv",false);   // round 15: trivial body (batch rm_* lines)
+        {   // P1: ctrl (recompiled production), nost, nomem (one program each: parallel compiles)
+            const int c=prog("p1c",arch);progs[size_t(c)].src+="SWP1(sw_p1_ctrl,BPO_XF,BPO_XG,BPO_TC_MINB)\n";addv(KProf::P1,"ctrl",c,addk(c,"sw_p1_ctrl",false));
+            const int c2=prog("p1s",arch);progs[size_t(c2)].src+="SWP1(sw_p1_nost,(BPO_XF|(8u<<20)),BPO_XG,BPO_TC_MINB)\n";addv(KProf::P1,"nost",c2,addk(c2,"sw_p1_nost",false),-1,0,0,true);
+            const int c3=prog("p1m",arch);progs[size_t(c3)].src+="SWP1(sw_p1_nomem,(BPO_XF|(8u<<20)),(BPO_XG|1u),BPO_TC_MINB)\n";addv(KProf::P1,"nomem",c3,addk(c3,"sw_p1_nomem",false),-1,0,0,true);}
+        {   // round 15 (bceil): P2 / P3 / CRT ctrl + ceiling twins (round 9 ceil, 3b8a384; P3 wrappers over the body twins, production BPO_P3T)
+            const int c=prog("p2",arch);
+            addv(KProf::P2,"ctrl",c,addk(c,"bpo_middle_r16<0>",true));
+            if(tw_ok[0])addv(KProf::P2,"nold",c,addk(c,"sw_p2_nold<0>",true),-1,0,0,true);
+            if(tw_ok[1])addv(KProf::P2,"nost",c,addk(c,"sw_p2_nost<0>",true),-1,0,0,true);
+            if(tw_ok[2])addv(KProf::P2,"nomem",c,addk(c,"sw_p2_nomem<0>",true),-1,0,0,true);
+            const int c3=prog("p3",arch);auto& S=progs[size_t(c3)].src;
+            for(const char* n:{"nold","nost","nomem"})S+=std::string("extern \"C\" __global__ void __launch_bounds__(256) sw_p3_")+n+"(const u32* C,u32* D,const u32* primes,const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){"
+                "__shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;sw_p3b_"+n+"<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);}\n";
+            addv(KProf::P3,"ctrl",c3,addk(c3,"bpo_last_cm3<0>",true));
+            if(tw_ok[3])addv(KProf::P3,"nold",c3,addk(c3,"sw_p3_nold",false),-1,0,0,true);
+            if(tw_ok[4])addv(KProf::P3,"nost",c3,addk(c3,"sw_p3_nost",false),-1,0,0,true);
+            if(tw_ok[5])addv(KProf::P3,"nomem",c3,addk(c3,"sw_p3_nomem",false),-1,0,0,true);
+            const int cc=prog("crt",arch);
+            addv(KProf::CRT,"ctrl",cc,addk(cc,"bpo_crt_lean<0>",true));
+            if(tw_ok[6])addv(KProf::CRT,"nold",cc,addk(cc,"sw_crt_nold<0>",true),-1,0,0,true);
+            if(tw_ok[7])addv(KProf::CRT,"nomem",cc,addk(cc,"sw_crt_nomem<0>",true),-1,0,0,true);}
+        if(klines){   // ladder (FHERMA_SWEEP_KLINES=1 only): F = nomem flags (XABL 8) or XABL 14 (no proxy fence, with NPF); G = nomem (XG_NST) | XL bits
             struct A1{const char* n;unsigned xa,g;};
             enum:unsigned{SS=16384u,NPF=32768u,HOT=65536u,NBC=131072u,NAF=262144u,NPRO=524288u,NBV=1048576u,NMMA=4u,NRED=8u,NOBAR=8388608u,TWJ=2097152u,BVH=4194304u};
             static const A1 a1[]={{"L0_ss",8,SS},{"L1_npf",14,SS|NPF},{"L2_hot",14,SS|NPF|HOT},{"L3_nbc",14,SS|NPF|HOT|NBC},{"L4_naf",14,SS|NPF|HOT|NBC|NAF},{"L5_npro",14,SS|NPF|HOT|NBC|NAF|NPRO},
@@ -213,7 +283,7 @@ template<class C> struct Sweep {
         int regs=0,lm=0;if(kp.fattr){kp.fattr(&regs,CU_FUNC_ATTRIBUTE_NUM_REGS,v.fn);kp.fattr(&lm,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,v.fn);}
         std::printf("{\"diag\":\"lad\",\"v\":\"%s\",\"pg_us_pp\":%.2f,\"ss_us_pp\":%.2f,\"geo_us_pp\":%.2f,\"pg_c1_us\":%.2f,\"pg_vs_nomem\":%.4f,\"w1_us\":%.2f,\"wA_us\":%.2f,\"wB_us\":%.2f,\"KA\":%u,\"KB\":%u,\"bps\":%d,\"grid_w\":%u,\"r\":%d,\"lm\":%d}\n",
             v.v.c_str(),v.med/2,ss,v.lad?v.med/2-ss:0.0,v.c1,nomem_med>0?v.med/nomem_med:0.0,w1,wA,wB,KA,KB,bps,gw,regs,lm);std::fflush(stdout);}
-    std::function<void(CUfunction,unsigned,unsigned,const char*)> batch;   // round 14: whole-batch A/B of a P1 substitute (State::batch_line)
+    std::function<void(const BatchOvr&,const char*)> batch;   // round 14/15: whole-batch A/B of a substitution set (State::batch_line)
     template<class D> void run(D& g){
         join();
         {std::printf("{\"diag\":\"sw_info\",\"arch\":\"%s\",\"hw_threads\":%u,\"compile_wall_s\":%.1f,\"progs\":[",arch.c_str(),std::thread::hardware_concurrency(),el());
@@ -246,7 +316,7 @@ template<class C> struct Sweep {
             k0s[st]=k0;k1s[st]=k1;q0s[st]=q0;q1s[st]=q1;
             const auto rg=regions(st,*k0);auto prel=[&,i0](CUstream a){for(size_t j=0;j<i0;++j)if(tr[j].product==0&&!tr[j].pb.empty())g.replay(tr[j],a);};
             const int R=RE>0?RE:(st==KProf::P1?15:25);
-            if(vs[st].empty())continue;   // round 13: P1 only (P2 / P3 / CRT traces kept for the chains)
+            if(vs[st].empty()||!klines)continue;   // round 15: per-kernel lines only with FHERMA_SWEEP_KLINES=1   // round 13: P1 only (P2 / P3 / CRT traces kept for the chains)
             for(auto& v:vs[st])if(v.pers&&v.fn){int bps=0;if(kp.occ)kp.occ(&bps,v.fn,int(k0->bx),size_t(k0->smem));const unsigned Sl=bps>0?unsigned(bps)*unsigned(g.sms):0u;
                 if(!Sl||Sl>=k0->gx||Sl>1023u||k0->gx!=512u){v.ok=false;std::printf("{\"diag\":\"sw\",\"k\":\"p1\",\"v\":\"%s\",\"skipped\":\"no tail (slots %u)\"}\n",v.v.c_str(),Sl);continue;}
                 const unsigned R=512u/Sl,rem=512u-R*Sl,f=rem==0u?1u:(rem*4u<=Sl?4u:(rem*2u<=Sl?2u:1u));v.gx=R*Sl+rem*f;v.pidx=11;v.por=Sl<<16;
@@ -260,6 +330,7 @@ template<class C> struct Sweep {
                     if(st==KProf::P1&&(v.lad||v.v=="nomem"||v.v=="ctrl"))ladder(g,v,*k0,nomem_med);}catch(const std::exception& e){std::printf("{\"diag\":\"sw\",\"k\":\"%s\",\"v\":\"%s\",\"error\":\"%.60s\"}\n",kn[st],v.v.c_str(),e.what());v.ok=false;d.cuCtxSynchronize();continue;}
                 print(kn[st],v);}
         }
+        if(klines){   // round 15: chains only with FHERMA_SWEEP_KLINES=1
         // product chains (products 0 and 1 on two streams from a cold flush) for the best exact combinations
         auto score=[](const V* v){return std::sqrt(v->vs*v->c1vs);};   // rank by the geometric mean of the c2 and c1 ratios
         auto best=[&](int st,size_t rank)->const V*{std::vector<const V*> c;for(auto& v:vs[st])if(v.ok&&v.ex==1&&!v.abl&&v.v!="ctrl"&&v.vs>0&&v.c1vs>0&&score(&v)<0.995)c.push_back(&v);
@@ -308,11 +379,43 @@ template<class C> struct Sweep {
             const double m=med(va)*1e3,pm=med(pa)*1e3;
             bool ab_=false;for(int st=0;st<4;++st)if(c.v[st]&&c.v[st]->abl)ab_=true;
             std::printf("{\"diag\":\"sw\",\"k\":\"chain\",\"v\":\"%s\",\"med_us\":%.1f,\"min_us\":%.1f,\"vs_prod\":%.4f,\"prod_us\":%.1f,\"ex\":%d%s}\n",c.name.c_str(),m,va.empty()?0.0:*std::min_element(va.begin(),va.end())*1e3,med(rr),pm,ex,ab_?",\"abl\":1":"");std::fflush(stdout);}
-        // round 14 (geo): whole-batch lines (full B-product graph, production schedule, P1 substituted): ctrl = production kernel
-        // and grid recaptured (capture noise floor), then every exact persistent P1 variant
+        }
+        // round 15 (bceil): whole-batch ceiling / sensitivity lines (full B-product production graph recaptured with substitutes,
+        // paired alternating reps vs the production exec; State::batch_line). Only ctrl / ctrl_rc / ctrl_end are exact (ex checked);
+        // all others are ablations (wrong values by design, ex 0, abl 1). d_us = med_us - prod_us = the batch-level effect.
+        //   ctrl = production kernels recaptured (noise floor; also at the end: ctrl_end = drift); ctrl_rc = all four stages
+        //          replaced by the sweep's recompiled production kernels (recompile control for the twins)
+        //   rm_<k> = kernel k launched with a trivial body (same grid, graph topology kept): marginal cost of k in the overlapped batch
+        //   <k>_nold / _nost / _nomem = compute-only twins (round 9 ceil): no global input loads / output stores / both
+        //   half_<k> = production kernel k on half its grid (half the work): d batch / d kernel
+        //   bd_p1p2 = P1 nost + P2 nold, bd_p2p3 = P2 nost + P3 nold, bd_p3crt = P3 nost + CRT nold: fused-boundary ceilings
+        // FHERMA_BATCH=0 off, FHERMA_BATCH_R pairs (default 13), FHERMA_BATCH_S = deadline (s since sweep start, default 55).
         if(batch&&k0s[KProf::P1]){
-            if(el()<budget+15){batch(k0s[KProf::P1]->fn,k0s[KProf::P1]->gx,0u,"ctrl");
-                for(const auto& v:vs[KProf::P1])if(v.pers&&v.ok&&v.ex==1&&!v.abl){if(el()>budget+15){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",v.v.c_str());continue;}batch(v.fn,v.gx,v.por,v.v.c_str());}}}
+            const double bdl=std::getenv("FHERMA_BATCH_S")?std::atof(std::getenv("FHERMA_BATCH_S")):55.0;
+            bool prod_ok=true;for(int st=0;st<4;++st)if(!k0s[st])prod_ok=false;
+            CUfunction tf=nullptr;for(auto& P:progs)if(P.name=="cmp"&&triv_k>=0&&size_t(triv_k)<P.fn.size())tf=P.fn[size_t(triv_k)];
+            auto fnv=[&](int st,const char* n)->CUfunction{for(auto& v:vs[st])if(v.v==n&&v.ok&&v.fn)return v.fn;return nullptr;};
+            struct BL{const char* nm;const char* sub[4];unsigned half,triv;bool check;};
+            static const BL bl[]={
+                {"ctrl",{},0,0,true},{"ctrl_rc",{"ctrl","ctrl","ctrl","ctrl"},0,0,true},
+                {"rm_p1",{},0,1,false},{"rm_p2",{},0,2,false},{"rm_p3",{},0,4,false},{"rm_crt",{},0,8,false},
+                {"p1_nost",{"nost"},0,0,false},{"p1_nomem",{"nomem"},0,0,false},
+                {"p2_nold",{nullptr,"nold"},0,0,false},{"p2_nost",{nullptr,"nost"},0,0,false},{"p2_nomem",{nullptr,"nomem"},0,0,false},
+                {"p3_nold",{nullptr,nullptr,"nold"},0,0,false},{"p3_nost",{nullptr,nullptr,"nost"},0,0,false},{"p3_nomem",{nullptr,nullptr,"nomem"},0,0,false},
+                {"crt_nold",{nullptr,nullptr,nullptr,"nold"},0,0,false},{"crt_nomem",{nullptr,nullptr,nullptr,"nomem"},0,0,false},
+                {"half_p1",{},1,0,false},{"half_p2",{},2,0,false},{"half_p3",{},4,0,false},{"half_crt",{},8,0,false},
+                {"bd_p1p2",{"nost","nold"},0,0,false},{"bd_p2p3",{nullptr,"nost","nold"},0,0,false},{"bd_p3crt",{nullptr,nullptr,"nost","nold"},0,0,false},
+                {"ctrl_end",{},0,0,true}};
+            for(const auto& b:bl){
+                if(el()>bdl){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",b.nm);std::fflush(stdout);continue;}
+                BatchOvr o;o.check=b.check;const char* why=nullptr;
+                if((b.half||b.triv||b.sub[1]||b.sub[2]||b.sub[3])&&!prod_ok)why="stage trace missing";
+                for(int st=0;st<4&&!why;++st){
+                    if(b.sub[st]&&!(o.fn[st]=fnv(st,b.sub[st])))why="not compiled";
+                    if(b.triv&(1u<<st)){if(!tf)why="no trivial kernel";o.fn[st]=tf;o.smem0[st]=true;}
+                    if(b.half&(1u<<st))o.gx[st]=std::max(1u,k0s[st]->gx/2);}
+                if(why){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"%s\"}\n",b.nm,why);std::fflush(stdout);continue;}
+                try{batch(o,b.nm);}catch(const std::exception& e){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"error\":\"%.60s\"}\n",b.nm,e.what());std::fflush(stdout);d.cuCtxSynchronize();}}}
         std::printf("{\"diag\":\"sw_done\",\"s\":%.1f}\n",el());std::fflush(stdout);
     }
 };
