@@ -1522,6 +1522,13 @@ template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,
         #pragma unroll
         for(u32 m=0;m<8;++m){const u32 r=(T0&4)?pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p):mul_shoup(v[m],(TN?tv[m]:tn[ts*m]),p);
             asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
+#ifdef BPO_P3EL
+    }else if((T0&4)&&(dfl&8)){   // dfl 8 (BIG_GFLAGS bit 128, default on; group-0 P3 of a prime-grouped product only): residues L2 evict_last, the CRT reads them from L2
+        u64 pol;asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));
+        #pragma unroll
+        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],(TN?tv[m]:tn[ts*m]),p);
+            asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32*m),"r"(r),"l"(pol):"memory");}
+#endif
     }else if((T0&4)&&(dfl&4)){   // dfl 4 (runtime, prime-group P1): residues L2 evict_first (the CRT reads them only after all groups)
         u64 pol;asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
