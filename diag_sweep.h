@@ -33,7 +33,7 @@ template<class C> struct Sweep {
     std::vector<Prog> progs; std::vector<std::thread> th; std::string arch,native;
     struct PB { std::vector<unsigned char> b; std::vector<size_t> o; template<class T> void add(T x){const size_t off=(b.size()+sizeof(T)-1)/sizeof(T)*sizeof(T);b.resize(off+sizeof(T));std::memcpy(b.data()+off,&x,sizeof(T));o.push_back(off);} };
     // mk: kernel with its own parameter list, built from the production trace it replaces (fused variants; no per-stage exactness)
-    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; std::function<bool(const KProf::Trace&,PB&)> mk; bool skip=false; bool wa=false; bool lad=false; int p1m=0; bool p1e=false; int gsel=-1; };   // gsel >= 0: chains substitute only the stage trace with that group index   // p1m 1: m16 chain mode, 2: m16a (see run())   // wa: P1 bpt (param 6) = shifted table
+    struct V { std::string v; int prog=-1,ki=-1; unsigned bx=0; int pidx=-1; unsigned pxor=0,por=0; bool abl=false; CUfunction fn=nullptr; double med=0,mn=0,c1=0,c1vs=0,vs=0; int ex=-1; bool ok=false; std::function<bool(const KProf::Trace&,PB&)> mk; bool skip=false; bool wa=false; bool lad=false; bool pers=false; unsigned gx=0; int p1m=0; bool p1e=false; int gsel=-1; };   // gsel >= 0: chains substitute only the stage trace with that group index   // p1m 1: m16 chain mode, 2: m16a (see run())   // wa: P1 bpt (param 6) = shifted table
     const std::vector<KProf::Trace>* trp=nullptr;
     std::vector<V> vs[4];   // per stage (KProf::P1..CRT)
     CUevent ea=nullptr,eb=nullptr,e0=nullptr,e1=nullptr,ej=nullptr;CUdeviceptr ref=0,bad=0,wabpt=0;size_t ref_n=0;CUfunction cmp=nullptr;
@@ -81,7 +81,14 @@ template<class C> struct Sweep {
             // fix prototypes (exact, production memory path): pg A/B vs production, exactness, then full chains (p1=fx_*, cf: twins)
             const int f=prog("fix",arch);auto& S=progs[size_t(f)].src;
             S+="SWP1(sw_p1_fx_twj,BPO_XF,(BPO_XG|2097152u),BPO_TC_MINB)"+std::string(1,char(10))+"SWP1(sw_p1_fx_bvh,BPO_XF,(BPO_XG|4194304u),BPO_TC_MINB)"+std::string(1,char(10))+"SWP1(sw_p1_fx_twj_bvh,BPO_XF,(BPO_XG|6291456u),BPO_TC_MINB)"+std::string(1,char(10));
-            for(const char* n:{"fx_twj","fx_bvh","fx_twj_bvh"})addv(KProf::P1,n,f,addk(f,std::string("sw_p1_")+n,false));}
+            for(const char* n:{"fx_twj","fx_bvh","fx_twj_bvh"})addv(KProf::P1,n,f,addk(f,std::string("sw_p1_")+n,false));
+            // round 14 (geo): static tail re-split P1 (bpo_first_xs; S = blocks/SM x SMs in pfstep bits 16-25, grid RS + rem f):
+            // fx_rs (prefetch of the block's tail column-op), fx_rs_npf (no in-kernel prefetch), n_rs = compute-only twin
+            // (compare with nomem); whole-batch lines at the end
+            const int pg=prog("pers",arch);auto& P=progs[size_t(pg)].src;const std::string nl(1,char(10));
+            P+="#define SWPP(NAME,F,G,PFN) extern \"C\" __global__ void __launch_bounds__(256,BPO_TC_MINB) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){__shared__ __align__(128) u32 X[BPO_X_SMEM(F)/4];bpo_first_xs<(F),(G),(PFN)>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}"+nl;
+            P+="SWPP(sw_p1_fx_rs,BPO_XF,BPO_XG,1)"+nl+"SWPP(sw_p1_fx_rs_npf,BPO_XF,BPO_XG,0)"+nl+"SWPP(sw_p1_n_rs,(BPO_XF|(8u<<20)),(BPO_XG|1u),1)"+nl;
+            for(const char* n:{"fx_rs","fx_rs_npf","n_rs"}){const bool ab_=n[0]=='n';addv(KProf::P1,n,pg,addk(pg,std::string("sw_p1_")+n,false),-1,0,0,ab_);vs[KProf::P1].back().pers=true;}}
         for(auto& P:progs)P.fn.assign(P.kn.size(),nullptr);
         // worker threads: NVRTC compile + module load (driver JIT for PTX), in program order, until the compile deadline
         const unsigned hw=std::max(2u,std::thread::hardware_concurrency());const size_t nth=std::min<size_t>(progs.size(),std::max(1u,std::min(8u,hw-1)));
@@ -143,7 +150,7 @@ template<class C> struct Sweep {
         if(v&&v->pidx>=0&&size_t(v->pidx)<t.po.size()){unsigned x=0;std::memcpy(&x,b.data()+t.po[size_t(v->pidx)],4);x=(x^v->pxor)|v->por;std::memcpy(b.data()+t.po[size_t(v->pidx)],&x,4);}
         if(v&&v->wa){if(!wabpt||t.po.size()<7)throw std::runtime_error("no wa table");std::memcpy(b.data()+t.po[6],&wabpt,sizeof(wabpt));}
         for(size_t i=0;i<t.po.size();++i)pp[i]=b.data()+t.po[i];
-        d.check(d.cuLaunchKernel(v&&v->fn?v->fn:t.fn,t.gx,t.gy,t.gz,v&&v->bx?v->bx:t.bx,1,1,t.smem,st,pp,nullptr));(void)g;}
+        d.check(d.cuLaunchKernel(v&&v->fn?v->fn:t.fn,v&&v->gx?v->gx:t.gx,t.gy,t.gz,v&&v->bx?v->bx:t.bx,1,1,t.smem,st,pp,nullptr));(void)g;}
     // one timed sample: flush + predecessors (untimed), then k0 on s0 (and k1 on s1), ms between ev0 and the join
     template<class D> float sample(D& g,const KProf::Trace* k0,const KProf::Trace* k1,const KProf::Trace* q0,const KProf::Trace* q1,const V* v){
         CUstream a=g.s[0],b=g.s[1];g.do_flush(a);if(q0)g.replay(*q0,a);
@@ -206,6 +213,7 @@ template<class C> struct Sweep {
         int regs=0,lm=0;if(kp.fattr){kp.fattr(&regs,CU_FUNC_ATTRIBUTE_NUM_REGS,v.fn);kp.fattr(&lm,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,v.fn);}
         std::printf("{\"diag\":\"lad\",\"v\":\"%s\",\"pg_us_pp\":%.2f,\"ss_us_pp\":%.2f,\"geo_us_pp\":%.2f,\"pg_c1_us\":%.2f,\"pg_vs_nomem\":%.4f,\"w1_us\":%.2f,\"wA_us\":%.2f,\"wB_us\":%.2f,\"KA\":%u,\"KB\":%u,\"bps\":%d,\"grid_w\":%u,\"r\":%d,\"lm\":%d}\n",
             v.v.c_str(),v.med/2,ss,v.lad?v.med/2-ss:0.0,v.c1,nomem_med>0?v.med/nomem_med:0.0,w1,wA,wB,KA,KB,bps,gw,regs,lm);std::fflush(stdout);}
+    std::function<void(CUfunction,unsigned,unsigned,const char*)> batch;   // round 14: whole-batch A/B of a P1 substitute (State::batch_line)
     template<class D> void run(D& g){
         join();
         {std::printf("{\"diag\":\"sw_info\",\"arch\":\"%s\",\"hw_threads\":%u,\"compile_wall_s\":%.1f,\"progs\":[",arch.c_str(),std::thread::hardware_concurrency(),el());
@@ -239,6 +247,10 @@ template<class C> struct Sweep {
             const auto rg=regions(st,*k0);auto prel=[&,i0](CUstream a){for(size_t j=0;j<i0;++j)if(tr[j].product==0&&!tr[j].pb.empty())g.replay(tr[j],a);};
             const int R=RE>0?RE:(st==KProf::P1?15:25);
             if(vs[st].empty())continue;   // round 13: P1 only (P2 / P3 / CRT traces kept for the chains)
+            for(auto& v:vs[st])if(v.pers&&v.fn){int bps=0;if(kp.occ)kp.occ(&bps,v.fn,int(k0->bx),size_t(k0->smem));const unsigned Sl=bps>0?unsigned(bps)*unsigned(g.sms):0u;
+                if(!Sl||Sl>=k0->gx||Sl>1023u||k0->gx!=512u){v.ok=false;std::printf("{\"diag\":\"sw\",\"k\":\"p1\",\"v\":\"%s\",\"skipped\":\"no tail (slots %u)\"}\n",v.v.c_str(),Sl);continue;}
+                const unsigned R=512u/Sl,rem=512u-R*Sl,f=rem==0u?1u:(rem*4u<=Sl?4u:(rem*2u<=Sl?2u:1u));v.gx=R*Sl+rem*f;v.pidx=11;v.por=Sl<<16;
+                std::printf("{\"diag\":\"sw\",\"k\":\"p1\",\"v\":\"%s\",\"slots\":%u,\"R\":%u,\"rem\":%u,\"f\":%u,\"grid\":%u}\n",v.v.c_str(),Sl,R,rem,f,v.gx);}
             V prod;prod.v="prod";prod.fn=nullptr;ab(g,prod,k0,k1,q0,q1,R);{V pv=prod;pv.fn=k0->fn;print(kn[st],pv);}
             double nomem_med=0;
             for(auto& v:vs[st]){
@@ -296,6 +308,11 @@ template<class C> struct Sweep {
             const double m=med(va)*1e3,pm=med(pa)*1e3;
             bool ab_=false;for(int st=0;st<4;++st)if(c.v[st]&&c.v[st]->abl)ab_=true;
             std::printf("{\"diag\":\"sw\",\"k\":\"chain\",\"v\":\"%s\",\"med_us\":%.1f,\"min_us\":%.1f,\"vs_prod\":%.4f,\"prod_us\":%.1f,\"ex\":%d%s}\n",c.name.c_str(),m,va.empty()?0.0:*std::min_element(va.begin(),va.end())*1e3,med(rr),pm,ex,ab_?",\"abl\":1":"");std::fflush(stdout);}
+        // round 14 (geo): whole-batch lines (full B-product graph, production schedule, P1 substituted): ctrl = production kernel
+        // and grid recaptured (capture noise floor), then every exact persistent P1 variant
+        if(batch&&k0s[KProf::P1]){
+            if(el()<budget+15){batch(k0s[KProf::P1]->fn,k0s[KProf::P1]->gx,0u,"ctrl");
+                for(const auto& v:vs[KProf::P1])if(v.pers&&v.ok&&v.ex==1&&!v.abl){if(el()>budget+15){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",v.v.c_str());continue;}batch(v.fn,v.gx,v.por,v.v.c_str());}}}
         std::printf("{\"diag\":\"sw_done\",\"s\":%.1f}\n",el());std::fflush(stdout);
     }
 };

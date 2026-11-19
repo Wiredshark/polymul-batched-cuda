@@ -166,12 +166,13 @@ template<class C> struct Diag {
 #include "diag_p1q.h"
 // src: the production NVRTC source (prefix + kernels) for the variant sweep (diag_sweep.h; FHERMA_SWEEP=0 off), l: limbs.
 // The instruction micro-benchmarks (run_mb, measured on the target in pv27) only run with FHERMA_DIAG_MB=1.
-template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes,const std::string& src,unsigned l){
+// batch (round 14): whole-batch A/B callback for P1 substitutes (State::batch_line), optional.
+template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes,const std::string& src,unsigned l,const std::function<void(CUfunction,unsigned,unsigned,const char*)>& batch={}){
     if(!diag_env()||(!c.kp.enabled&&!c.kp.trace_only)||!c.kp.pinfo||!c.diag_bw||c.kp.diag_variant()<0)return;
     std::unique_ptr<Sweep<C>> sw;
     try{if(sweep_env())sw=std::make_unique<Sweep<C>>(c,src,l);}catch(const std::exception& e){std::printf("{\"diag\":\"sw_error\",\"what\":\"%.100s\"}\n",e.what());}
     try{Diag<C> dg(c);if(p1q_env())run_p1q(dg);   // round 10 (cmp): P1 quad-math replica probe (diag_p1q.h), default on
         const char* mb=std::getenv("FHERMA_DIAG_MB");if(mb&&*mb=='1')dg.run_mb();if(mb&&*mb=='2')dg.run_mb(true);   // round 8 correction kernels (measured in pv48): FHERMA_DIAG_MB=2 onlydg.run(in_bytes,out_bytes);
-        if(sw)sw->run(dg);}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+        if(sw){sw->batch=batch;sw->run(dg);}}catch(const std::exception& e){std::printf("{\"diag\":\"error\",\"what\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
     sw.reset();
 }

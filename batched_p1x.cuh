@@ -653,6 +653,8 @@ __device__ __forceinline__ void xrdif16(u32* const base0,const u32 so,const u64*
 //   G 4194304 XF_BVH B fragments of digits 0-1 loaded before the quad barrier (their latency under the barrier wait)
 #define XF_TWJ(G) (((G)>>21)&1u)
 #define XF_BVH(G) (((G)>>22)&1u)
+//   G 16777216 XP_PERS (set by bpo_first_xs only) column-op index from the wrapper instead of blockIdx.x
+#define XP_PERS(G) (((G)>>24)&1u)
 template<u32 G>__device__ __forceinline__ u32 xl_hotq(u32 u){   // XL_HOT: table quad 0 through an opaque per-quad zero (loads stay in the loop)
     if constexpr(XL_HOT(G)!=0){u32 z;asm volatile("mov.u32 %0, 0;":"=r"(z));return z;}else return u;}
 struct XFMaskW{u32 v[8][2][4];};   // XG_WA word masks [digit j][xh][tig]: bits [POS[j]%32-32t, POS[j]%32+D-32t) of word t = tig+4xh
@@ -666,13 +668,13 @@ __host__ __device__ constexpr bool xred5_ok(){constexpr u32 P[BCRT_K]={BCRT_PRIM
 template<u32 F,u32 G=0>
 __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
-    const XTMap* tmA,const XTMap* tmB,u32* X){
+    const XTMap* tmA,const XTMap* tmB,u32* X,u32 idov=0){
     constexpr u32 L=BCRT_L;
     constexpr u32 POS[9]={BCRT_POS,BCRT_W};
     constexpr bool S6=(F&64)!=0;
     constexpr u32 XD=XR16(F)==2?352u:((F&96)?320u:288u),XS=XR16(F)==2?8*352:((F&96)?8*320:8*288+32);   // 128 B aligned (prime,digit) regions
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
-    const u32 id=blockIdx.x,c=id&255u,op=id>>8;
+    const u32 id=XP_PERS(G)?idov:blockIdx.x,c=id&255u,op=id>>8;   // XP_PERS: column-op from the re-split wrapper (bpo_first_xs)
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
     const u32* src=(op?b:a)+u64(XABL(F)==11?0u:c)*L;if(XDIN(F))src=a;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
@@ -1057,6 +1059,27 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
 #endif
 }
 #define BPO_X_SMEM(F) (4*(XR16(F)==2?8*352:(((F)&96)?8*320:8*288+32))*4+(((F)&4)?4*256*8:0)+(XR16(F)==3?4*256*8:0))
+// Round 14 (geo) P1 geometry fix, sweep only (never instantiated by the production module): bpo_first_xs = static tail
+// re-split. S = slots (blocks/SM x SMs) arrives in pfstep bits 16-25 (the sweep / whole-batch launch ORs it in; 0 = no split,
+// production behaviour). The 512 column-ops are run as R = 512/S full rounds (block b < RS: column-op b, all quads, exactly
+// production's first waves) plus the rem = 512-RS remaining column-ops split into f quad ranges (f = 4, 2 or 1, largest with
+// rem f <= S): block RS+i (i < rem f) = column-op RS+i/f, quads [(i%f)Q/f, (i%f+1)Q/f). Grid = RS + rem f (target S = 376:
+// 376 + 272 = 648 blocks, makespan 4+2 quads instead of 2 x 4; +136 prologues). One segment per block (no loop: no extra
+// registers). Same per-element math as production (exact). L2 prefetch (PFN 1): a last-round full block b < rem f prefetches
+// its tail column-op RS+b/f, earlier rounds b+S (production semantics); PFN 0: none. The CRT-side prefetch (items 0..p1_grid/2-1
+// of the next product) matches the first round.
+template<u32 F,u32 G,u32 PFN>
+__device__ __forceinline__ void bpo_first_xs(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,
+    u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const XTMap* tmA,const XTMap* tmB,u32* X){
+    constexpr u32 T=512u;
+    const u32 Sx=(pfstep>>16)&1023u,S=Sx?Sx:T,R=T/S,rem=T-R*S,f=rem==0u?1u:(rem*4u<=S?4u:(rem*2u<=S?2u:1u)),Q=(r1-r0)/4u,bk=blockIdx.x;
+    const u32 pfs=pfstep&~(1023u<<16),pfl=pfs&0xf0000000u;const bool pfon=PFN!=0u&&(pfs&0x0fffffffu)!=0u;
+    u32 id,q0=0,q1=Q,nx=0;
+    if(bk<R*S){id=bk;if(id+S<R*S)nx=id+S;else if(bk-(R-1u)*S<rem*f)nx=R*S+(bk-(R-1u)*S)/f;}
+    else{const u32 i=bk-R*S;id=R*S+i/f;q0=(i%f)*Q/f;q1=(i%f+1u)*Q/f;}
+    const u32 pf=pfon&&nx>id?pfl|(nx-id):pfl;
+    bpo_first_xb<F,G|(1u<<24)>(a,b,A,B,twist,stage_tw,bpt,N,r0+4u*q0,r0+4u*q1,pf,ctab,tmA,tmB,X,id);
+}
 #if !defined(BPO_LEAN)||BPO_LEAN_P1X
 extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_x(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
