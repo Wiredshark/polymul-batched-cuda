@@ -608,7 +608,8 @@ struct State {
     u32 p1s_cols=64,p1s_quads=4,p1s_skip=std::getenv("FHERMA_P1S_SKIP")?u32(std::atoi(std::getenv("FHERMA_P1S_SKIP"))):0u;   // skip: ablation only (1 a, 2 b)
    CUdeviceptr wsT[4]{};
     bool p1split()const{return pox&&!off(2048)&&cuda->bpo_p1a&&cuda->bpo_p1b&&ctab&&tc_bpt&&wsT[cur_ws]&&std::getenv("FHERMA_P1SPLIT");}
-    CUfunction ovr_fn[4]{};u32 ovr_gx[4]{};bool ovr_s0[4]{};u32 p1_ovr_por=0;   // exit-time whole-batch sweep only (batch_line): per stage (P1, P2, P3, CRT) kernel / grid.x substitute, s0 = no dynamic smem (null / 0 = production; never set for the timed graph)
+    CUfunction ovr_fn[4]{};u32 ovr_gx[4]{};bool ovr_s0[4]{};u32 p1_ovr_por=0;u32 ovr_bx[4]{};u32 ovr_xw=0;   // round 16: ovr_bx block.x (P2), ovr_xw P1 output run length (p1x_map)
+      // exit-time whole-batch sweep only (batch_line): per stage (P1, P2, P3, CRT) kernel / grid.x substitute, s0 = no dynamic smem (null / 0 = production; never set for the timed graph)
     bool pox=false;u32 p1x=0,p1_grid=96;   // p1x: P1 kernel 1 bpo_first_x, 2 bpo_first_xv (graph variant 7, A/B FHERMA_P1X), 3 bpo_first_w
       // variant 4: persistent out-of-phase P1
     bool p3r16()const{return cuda->bpo_last_r16&&r16tab&&std::getenv("FHERMA_P3R16")&&std::atoi(std::getenv("FHERMA_P3R16"))!=0;}   // opt-in: neutral-to-slower locally (P3 is latency-bound, not issue-bound)
@@ -639,7 +640,8 @@ struct State {
         if(f&&ga)cuda->check(ga(&v,CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,f));return u32(v>=512?512:256);}   // launch bound 512 -> 512-thread P1
     CUtensorMap p1x_map(CUdeviceptr base){CUtensorMap m{};auto& d=*cuda;
         static auto enc=d.driver.get<decltype(&::cuTensorMapEncodeTiled)>("cuTensorMapEncodeTiled");
-        const cuuint64_t dims[3]={cuuint64_t(n/32),32,cuuint64_t(k)*8},strides[2]={cuuint64_t(n/32)*4,cuuint64_t(n)*4};const cuuint32_t box[3]={8,32,1},es[3]={1,1,1};
+        cuuint64_t dims[3]={cuuint64_t(n/32),32,cuuint64_t(k)*8},strides[2]={cuuint64_t(n/32)*4,cuuint64_t(n)*4};cuuint32_t box[3]={8,32,1};const cuuint32_t es[3]={1,1,1};
+        if(const u32 L=ovr_xw){dims[0]=L;dims[1]=cols;dims[2]=cuuint64_t(rows/L)*k*8;strides[0]=cuuint64_t(L)*4;strides[1]=cuuint64_t(cols)*L*4;box[0]=L;box[1]=1;box[2]=rows/L;}   // round 16 sweep (batch_line only): row runs of L words
         if(enc)d.check(enc(&m,CU_TENSOR_MAP_DATA_TYPE_UINT32,3,reinterpret_cast<void*>(base),dims,strides,box,es,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
         return m;}
     void compute_po(CUdeviceptr a,CUdeviceptr b,CUdeviceptr out){
@@ -675,7 +677,7 @@ struct State {
             const CUdeviceptr pgs_=p+size_t(s0)*4,mug=mu+size_t(s0)*8,itwg=itw+size_t(s0)*root_stride_host*8,invg=invn+size_t(s0)*J*8;
             if(!(which&1)||!(sm&8)){}else if(pox&&!off(16)&&d.bpo_middle_db&&std::getenv("FHERMA_P2DB"))d.launch3(d.bpo_middle_db,32u,J/2,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u));
             else if(fxon)d.launch3(d.bpo_middle_r16x,8u,J,gg,512u,Ag,Bg,C+size_t(s0)*J*n*4,pgs_,r16tab+size_t(s0)*512*8,fxt+size_t(s0)*40*256*8,n,(l2on&&(l2f&1)?4u:0u)|16u);
-            else if(p2r16()&&p3v2()&&mont)d.launch3(ovr_fn[1]?ovr_fn[1]:d.bpo_middle_r16,ovr_gx[1]?ovr_gx[1]:32u,J,gg,128u,Ag,Bg,Cg,pgs_,r16tab+size_t(s0)*512*8,n,(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)&&!std::getenv("FHERMA_P2_NODISCARD")?8u:0u)|(mont?16u:0u));
+            else if(p2r16()&&p3v2()&&mont)d.launch3(ovr_fn[1]?ovr_fn[1]:d.bpo_middle_r16,ovr_gx[1]?ovr_gx[1]:32u,J,gg,ovr_bx[1]?ovr_bx[1]:128u,Ag,Bg,Cg,pgs_,r16tab+size_t(s0)*512*8,n,(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)&&!std::getenv("FHERMA_P2_NODISCARD")?8u:0u)|(mont?16u:0u));
             else d.launch3(p1x==2&&d.bpo_middle_smrv?d.bpo_middle_smrv:pox&&!off(128)&&d.bpo_middle_smr?d.bpo_middle_smr:d.bpo_middle,32u,J,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u)|(mont?16u:0u));mark(3);
             if(!(which&2)||!(sm&16)||fxon){}else if(po==2&&p3v2()&&p3r16()&&!t2n_old())d.launch3(d.bpo_last_r16,cols,gg,1u,128u,Cg,Ag,pgs_,itwg,r16tab+size_t(s0)*512*8,(mont?t2nM:t2n)+size_t(s0)*J*512*8,n,logrows);
             else if(po==2&&p3v2())d.launch3(ovr_fn[2]?ovr_fn[2]:p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2,ovr_gx[2]?ovr_gx[2]:cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));
@@ -864,7 +866,7 @@ struct State {
         CUgraphExec ge=nullptr;
         {   // capture = build_graph's variant-6 body with the P1 override
             const u32 S=std::min(std::max(1u,std::min(default_chains(),4u)),bcount);
-            p23db_now=p23db_env(false);l2on=true;p1x=p1x_default();po=2;pox=true;xoff=0;for(int q=0;q<4;++q){ovr_fn[q]=o.fn[q];ovr_gx[q]=o.gx[q];ovr_s0[q]=o.smem0[q];}p1_ovr_por=o.por;
+            p23db_now=p23db_env(false);l2on=true;p1x=p1x_default();po=2;pox=true;xoff=0;for(int q=0;q<4;++q){ovr_fn[q]=o.fn[q];ovr_gx[q]=o.gx[q];ovr_s0[q]=o.smem0[q];ovr_bx[q]=o.bx[q];}p1_ovr_por=o.por;ovr_xw=o.xw;
             CUstream cs[4]{graph_stream};for(u32 c=1;c<S;++c)cs[c]=chain_streams[c];
             bool cap=false;
             try{
@@ -875,7 +877,7 @@ struct State {
                 for(u32 c=1;c<S;++c){CUevent j=mk();d.check(erecord(j,cs[c]));d.check(swait(graph_stream,j,0));}
                 CUgraph g=nullptr;cap=false;d.check(endc(graph_stream,&g));const CUresult r=inst(&ge,g,0);gdestroy(g);d.check(r);
             }catch(...){if(cap){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}ge=nullptr;}
-            for(int q=0;q<4;++q){ovr_fn[q]=nullptr;ovr_gx[q]=0;ovr_s0[q]=false;}p1_ovr_por=0;d.stream=graph_stream;cur_ws=0;next_a=next_b=0;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;l2on=false;
+            for(int q=0;q<4;++q){ovr_fn[q]=nullptr;ovr_gx[q]=0;ovr_s0[q]=false;ovr_bx[q]=0;}p1_ovr_por=0;ovr_xw=0;d.stream=graph_stream;cur_ws=0;next_a=next_b=0;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;l2on=false;
         }
         if(!ge){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"error\":\"capture failed\"}\n",name);std::fflush(stdout);for(auto e:evs)edestroy(e);return;}
         const double cap_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();

@@ -377,7 +377,7 @@ __device__ __forceinline__ ulonglong2 xct_ldv(const u64* ctg,u32 lane,u32 m2){  
 #define XR16(F) (((F)>>25)&3u)   // sweep phase-B modes (xrdif16 / cts, see below)
 #define XCA(F) (XR16(F)==1?4u:XR16(F)==2?16u:0u)   // phase-A store offset of odd-digit columns (words)
 template<u32 F>__device__ __forceinline__ u64 xstw(const u64* st,u32 i){if constexpr(XNTW(F)!=0)return (u64(0x9e3779b9u*(i+1u))<<32)|u64(i*0x85ebca6bu);else return st[i];}
-template<u32 F,bool H=false>
+template<u32 F,bool H=false,u32 XW=0>   // XW (sweep XG_XW, round 16 p1b): output run length L (TMA coords (0, c, (256/L) plane)); 0 = production map
 __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm,u32 p2=0,u32 n2=0){
     constexpr bool T=(F&1)!=0;
     constexpr u32 XD=320u;
@@ -470,8 +470,8 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
         for(u32 n=0;n<4;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
-            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
-            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa):"memory");}
+            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(XW?0u:c*8u),"r"(XW?c:0u),"r"(XW?(256u/(XW?XW:1u))*(plane0+n):plane0+n),"r"(sa),"l"(pol):"memory");
+            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(XW?0u:c*8u),"r"(XW?c:0u),"r"(XW?(256u/(XW?XW:1u))*(plane0+n):plane0+n),"r"(sa):"memory");}
         asm volatile("cp.async.bulk.commit_group;":::"memory");}
 #endif
 }
@@ -655,6 +655,10 @@ __device__ __forceinline__ void xrdif16(u32* const base0,const u32 so,const u64*
 #define XF_BVH(G) (((G)>>22)&1u)
 //   G 16777216 XP_PERS (set by bpo_first_xs only) column-op index from the wrapper instead of blockIdx.x
 #define XP_PERS(G) (((G)>>24)&1u)
+//   G bits 25-30 XG_XW (round 16 p1b, sweep only; production G = 0): P1 output layout with row runs of L = XG_XW words per column:
+//                  plane word (row/L)*256L + c*L + row%L (production = L 8 with the old 2048 x 32 map); TMA box {L, 1, 256/L}
+//                  (host map State::p1x_map with ovr_xw = L); consumer = sweep P2 bpo_middle_r16w<L> (16L threads, L slots/block)
+#define XG_XW(G) (((G)>>25)&63u)
 template<u32 G>__device__ __forceinline__ u32 xl_hotq(u32 u){   // XL_HOT: table quad 0 through an opaque per-quad zero (loads stay in the loop)
     if constexpr(XL_HOT(G)!=0){u32 z;asm volatile("mov.u32 %0, 0;":"=r"(z));return z;}else return u;}
 struct XFMaskW{u32 v[8][2][4];};   // XG_WA word masks [digit j][xh][tig]: bits [POS[j]%32-32t, POS[j]%32+D-32t) of word t = tig+4xh
@@ -1021,7 +1025,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             const u32 q=warp>>1,r=4*uq+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(XL_HOT(G)?4u*xl_hotq<G>(u)+q:r)*256;const u64* const ct=XR16(F)==3?reinterpret_cast<const u64*>(X+4*XS)+q*256u:ctab+(size_t(r)*256u+cq)*256u;
             if constexpr(XR16(F)==1||XR16(F)==2)xrdif16<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // sweep radix-16 phase B
-            else if(F&131072u)xrdif6q<F,H>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,H?BPR_P2(r):0u,H?BPR_N2(r):0u);   // flag 131072: one pass
+            else if(F&131072u)xrdif6q<F,H,XG_XW(G)>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,H?BPR_P2(r):0u,H?BPR_N2(r):0u);   // flag 131072: one pass
             else{
             #pragma unroll
             for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;

@@ -20,7 +20,8 @@ inline bool diag_env(){const char* e=std::getenv("FHERMA_DIAG");return !e||*e!='
 // round 15 (bceil): whole-batch substitution set for State::batch_line. Per stage (0 P1, 1 P2, 2 P3, 3 CRT): fn = kernel
 // substitute (null = production), gx = grid.x substitute (0 = production), smem0 = launch with no dynamic smem (trivial
 // kernel); por = OR-ed into the P1 pfstep argument; check = exactness vs the production graph (controls only; else ex 0).
-struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; };
+// round 16 (p1b): bx = block.x substitute (0 = production); xw = P1 output run length L for the P1 TMA map (0 = production map).
+struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; unsigned bx[4]{}; unsigned xw=0; };
 
 template<class C> struct Diag {
     C& d; KProf& kp; CUstream s[2]{}; CUevent ev0=nullptr,ev1=nullptr,evj=nullptr;

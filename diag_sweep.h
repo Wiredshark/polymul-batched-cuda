@@ -20,6 +20,10 @@
 // mode (kprof off by default: launch parameters copied at graph capture, no event nodes).
 // Round 15 (bceil, on d7918a1 = 565ec66 timed path): default = whole-batch ceiling / sensitivity lines only (see run(): ctrl,
 // rm_*, *_nold/_nost/_nomem, half_*, bd_*); per-kernel / ladder / chain lines with FHERMA_SWEEP_KLINES=1. P1Q probe off.
+// Round 16 (p1b, on 2ce711b = 565ec66 timed path): P1 -> P2 layout lines (exact, ex checked): the P1 output is stored in row runs of
+// L words (TMA box {L,1,256/L}: 256/L rows of 4L bytes instead of 32 x 32 B) and P2 = bpo_middle_r16w<L> (L slots per block, every warp load
+// = one 128 B line, C warp stores touch 32/L lines instead of 4). Default lines: ctrl, w8 (control), w16, w32m2, repeats, ctrl_rc,
+// ctrl_end; the round-15 ceiling ablations only with FHERMA_BATCH_CEIL=1.
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -108,6 +112,7 @@ template<class C> struct Sweep {
         // differenced: no prologue, no tail): see run().
         {const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
         s+="\n#define SWP1(NAME,F,G,MB) extern \"C\" __global__ void __launch_bounds__(256,MB) NAME(const u32* a,const u32* b,u32* A,u32* B,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){__shared__ __align__(128) u32 X[BPO_X_SMEM(F)/4];bpo_first_xb<(F),(G)>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);}\n";
+        s="#define BPO_SWEEPK 1\n"+s;   // round 16 (p1b): sweep-only kernels in the production source (bpo_middle_r16w)
         const std::string base=s;
         auto prog=[&](const char* name,const std::string& a)->int{Prog P;P.name=name;P.arch=a;P.src=base;progs.push_back(std::move(P));return int(progs.size())-1;};
         auto addk=[&](int pi,const std::string& kn,bool ex)->int{Prog& P=progs[size_t(pi)];P.kn.push_back(kn);P.expr.push_back(ex);return int(P.kn.size())-1;};
@@ -138,6 +143,17 @@ template<class C> struct Sweep {
             addv(KProf::CRT,"ctrl",cc,addk(cc,"bpo_crt_lean<0>",true));
             if(tw_ok[6])addv(KProf::CRT,"nold",cc,addk(cc,"sw_crt_nold<0>",true),-1,0,0,true);
             if(tw_ok[7])addv(KProf::CRT,"nomem",cc,addk(cc,"sw_crt_nomem<0>",true),-1,0,0,true);}
+        {   // round 16 (p1b): P1 output row-run layouts (XG_XW = L, G bits 25-30) + the matching P2 bpo_middle_r16w<L>. w8 = production
+            // layout through the new map / coordinates / generic P2 (exact control of the mechanism); w16 / w32 = 64 / 128 B TMA rows.
+            // P2 twins bpo_middle_r16w<LW,SB,MB> (SB slots per block, MB min blocks/SM; 0 = no min as production). w32 (MB 0: 72 regs,
+            // 1 block/SM of 16 warps) and w32s16 (SB 16, lines shared by 2 blocks: no discard) lost locally (1.06 / 1.02 at B=128): dropped.
+            // w32m2 = 512-thread P2 at 64 regs (2 blocks/SM = 32 warps, no spills).
+            struct WV{const char* n;unsigned lw,sb,mb;};static const WV wv[]={{"w8",8,8,0},{"w16",16,16,0},{"w32m2",32,32,2}};
+            int pc[33]={};
+            for(unsigned L:{8u,16u,32u}){char ln[160];
+                const int c=prog(L==8?"p1w8":L==16?"p1w16":"p1w32",arch);pc[L]=c;std::snprintf(ln,sizeof ln,"SWP1(sw_p1_w%u,BPO_XF,(BPO_XG|(%uu<<25)),BPO_TC_MINB)\n",L,L);progs[size_t(c)].src+=ln;
+                std::snprintf(ln,sizeof ln,"sw_p1_w%u",L);char nm[16];std::snprintf(nm,sizeof nm,"w%u",L);addv(KProf::P1,nm,c,addk(c,ln,false));}
+            for(const auto& w:wv){char ln[64];std::snprintf(ln,sizeof ln,"bpo_middle_r16w<%u,%u,%u>",w.lw,w.sb,w.mb);addv(KProf::P2,w.n,pc[w.lw],addk(pc[w.lw],ln,true),-1,0,0,false,16u*w.sb);}}
         if(klines){   // ladder (FHERMA_SWEEP_KLINES=1 only): F = nomem flags (XABL 8) or XABL 14 (no proxy fence, with NPF); G = nomem (XG_NST) | XL bits
             struct A1{const char* n;unsigned xa,g;};
             enum:unsigned{SS=16384u,NPF=32768u,HOT=65536u,NBC=131072u,NAF=262144u,NPRO=524288u,NBV=1048576u,NMMA=4u,NRED=8u,NOBAR=8388608u,TWJ=2097152u,BVH=4194304u};
@@ -297,6 +313,11 @@ template<class C> struct Sweep {
         d.check(d.cuMemAlloc(&bad,16));
         for(auto& P:progs)if(P.name=="cmp"&&!P.fn.empty())cmp=P.fn[0];
         for(int st=0;st<4;++st)for(auto& v:vs[st]){if(v.prog<0){v.ok=true;continue;}const auto& P=progs[size_t(v.prog)];if(v.ki>=0&&size_t(v.ki)<P.fn.size()&&P.fn[size_t(v.ki)]){v.fn=P.fn[size_t(v.ki)];v.ok=true;}}
+        for(int st=0;st<2;++st)for(auto& v:vs[st])if(v.ok&&v.fn&&(v.v=="ctrl"||v.v[0]=='w')){   // round 16: regs / spills / occupancy of the layout variants
+            int r=0,lm=0,bps=0;const unsigned bx=v.bx?v.bx:(st==0?256u:128u);if(kp.fattr){kp.fattr(&r,CU_FUNC_ATTRIBUTE_NUM_REGS,v.fn);kp.fattr(&lm,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,v.fn);}
+            if(kp.occ&&st==1)kp.occ(&bps,v.fn,int(bx),size_t(0));
+            std::printf("{\"diag\":\"sw\",\"k\":\"%s\",\"v\":\"%s\",\"r\":%d,\"lm\":%d,\"bx\":%u,\"bps\":%d}\n",st?"p2":"p1",v.v.c_str(),r,lm,bx,bps);}
+        std::fflush(stdout);
         // first trace of a stage for products 0 / 1 and the trace just before it in the same product (predecessor)
         auto first=[&](int prod,int st,size_t* pi)->const KProf::Trace*{for(size_t i=0;i<tr.size();++i)if(tr[i].product==prod&&tr[i].stage==st&&!tr[i].pb.empty()){if(pi)*pi=i;return &tr[i];}return nullptr;};
         auto pred=[&](int prod,size_t i)->const KProf::Trace*{for(size_t j=i;j-->0;)if(tr[j].product==prod&&!tr[j].pb.empty())return &tr[j];return nullptr;};
@@ -395,9 +416,15 @@ template<class C> struct Sweep {
             bool prod_ok=true;for(int st=0;st<4;++st)if(!k0s[st])prod_ok=false;
             CUfunction tf=nullptr;for(auto& P:progs)if(P.name=="cmp"&&triv_k>=0&&size_t(triv_k)<P.fn.size())tf=P.fn[size_t(triv_k)];
             auto fnv=[&](int st,const char* n)->CUfunction{for(auto& v:vs[st])if(v.v==n&&v.ok&&v.fn)return v.fn;return nullptr;};
-            struct BL{const char* nm;const char* sub[4];unsigned half,triv;bool check;};
+            struct BL{const char* nm;const char* sub[4];unsigned half,triv;bool check;unsigned xw=0,sb=0;};
+            const bool ceil=std::getenv("FHERMA_BATCH_CEIL")&&*std::getenv("FHERMA_BATCH_CEIL")=='1';   // round 16: ceiling lines (round 15) opt-in
             static const BL bl[]={
-                {"ctrl",{},0,0,true},{"ctrl_rc",{"ctrl","ctrl","ctrl","ctrl"},0,0,true},
+                {"ctrl",{},0,0,true},
+                // round 16 (p1b): P1 output row-run layouts (all exact, ex checked): w8 = control (production layout via the new map +
+                // generic P2), w16 = 64 B TMA rows + 256-thread P2, w32m2 = 128 B TMA rows + 512-thread P2 (64 regs); *b = repeats
+                {"w8",{"w8","w8"},0,0,true,8,8},{"w16",{"w16","w16"},0,0,true,16,16},{"w32m2",{"w32","w32m2"},0,0,true,32,32},
+                {"w32m2b",{"w32","w32m2"},0,0,true,32,32},{"w16b",{"w16","w16"},0,0,true,16,16},{"w8b",{"w8","w8"},0,0,true,8,8},
+                {"ctrl_rc",{"ctrl","ctrl","ctrl","ctrl"},0,0,true},
                 {"rm_p1",{},0,1,false},{"rm_p2",{},0,2,false},{"rm_p3",{},0,4,false},{"rm_crt",{},0,8,false},
                 {"p1_nost",{"nost"},0,0,false},{"p1_nomem",{"nomem"},0,0,false},
                 {"p2_nold",{nullptr,"nold"},0,0,false},{"p2_nost",{nullptr,"nost"},0,0,false},{"p2_nomem",{nullptr,"nomem"},0,0,false},
@@ -407,6 +434,7 @@ template<class C> struct Sweep {
                 {"bd_p1p2",{"nost","nold"},0,0,false},{"bd_p2p3",{nullptr,"nost","nold"},0,0,false},{"bd_p3crt",{nullptr,nullptr,"nost","nold"},0,0,false},
                 {"ctrl_end",{},0,0,true}};
             for(const auto& b:bl){
+                if(!ceil&&!b.check)continue;
                 if(el()>bdl){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",b.nm);std::fflush(stdout);continue;}
                 BatchOvr o;o.check=b.check;const char* why=nullptr;
                 if((b.half||b.triv||b.sub[1]||b.sub[2]||b.sub[3])&&!prod_ok)why="stage trace missing";
@@ -414,6 +442,7 @@ template<class C> struct Sweep {
                     if(b.sub[st]&&!(o.fn[st]=fnv(st,b.sub[st])))why="not compiled";
                     if(b.triv&(1u<<st)){if(!tf)why="no trivial kernel";o.fn[st]=tf;o.smem0[st]=true;}
                     if(b.half&(1u<<st))o.gx[st]=std::max(1u,k0s[st]->gx/2);}
+                if(b.xw&&!why){o.xw=b.xw;o.gx[1]=256u/b.sb;o.bx[1]=16u*b.sb;}   // round 16: P1 map run L = xw; P2 grid.x = 256/SB blocks of 16 SB threads
                 if(why){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"%s\"}\n",b.nm,why);std::fflush(stdout);continue;}
                 try{batch(o,b.nm);}catch(const std::exception& e){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"error\":\"%.60s\"}\n",b.nm,e.what());std::fflush(stdout);d.cuCtxSynchronize();}}}
         std::printf("{\"diag\":\"sw_done\",\"s\":%.1f}\n",el());std::fflush(stdout);
