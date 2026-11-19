@@ -639,7 +639,8 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
 #if !defined(BPO_LEAN)||BPO_LEAN_P1X
 extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_x(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
-    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB TL_PARAM){
+    TL_GUARD
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xb<BPO_XF>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }

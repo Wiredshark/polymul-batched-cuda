@@ -97,7 +97,8 @@ template<u32 T> __device__ __forceinline__ void swc_tile(const u32 (&a)[2][2][4]
     swc_sts<(16*36+4*T)*4>(sb,e[0]+(e[1]<<8));swc_sts<(24*36+4*T)*4>(sb,e[2]+(e[3]<<8));
 }
 extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
- const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
+ const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl TL_PARAM){
+    TL_GUARD
     if(pfitems){
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){

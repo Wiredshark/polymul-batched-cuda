@@ -1025,7 +1025,8 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
-    const u32* primes,const u64* r16,u32 N,u32 untw){
+    const u32* primes,const u64* r16,u32 N,u32 untw TL_PARAM){
+    TL_GUARD
     __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
 #if BPO_NH30   // h30 prime set (default): Harvey-lazy body for the primes < 2^30
     if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true>(TA,A,B,C,primes,r16,N,untw);else
@@ -1543,7 +1544,8 @@ template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,
     }
 }
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
-    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
+    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl TL_PARAM){
+    TL_GUARD
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
 #if BPO_NH30   // h30 prime set (default): Harvey-lazy J-DIT / R-DIT for the primes < 2^30
     if(primes[blockIdx.y]<(1u<<30))bpo_p3_body<BPO_P3T,true>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);else

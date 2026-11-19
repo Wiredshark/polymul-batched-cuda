@@ -1,6 +1,12 @@
 // Original diagnostic CUDA implementation. Exact integer arithmetic throughout.
 typedef unsigned int u32;
 typedef unsigned long long u64;
+// Exit-time timeline probe (tl_probe.h): the TL module defines TL_PARAM / TL_GUARD (per-block %globaltimer start/end + %smid);
+// production: both empty (PTX unchanged).
+#ifndef TL_PARAM
+#define TL_PARAM
+#define TL_GUARD
+#endif
 
 // Packed constant: low word w; high word floor(w*2^32/p). For x,w<p<2^31,
 // the approximate quotient is exact or one low, hence0<=r<2p<2^32. Unsigned
