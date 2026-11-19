@@ -976,6 +976,68 @@ template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],
     #pragma unroll
     for(u32 j=0;j<8;++j){if(j)phdit(v[j],v[j+8],t[16*j],p,p2);else phdit1(v[0],v[8],p2);}
 }
+#ifndef BPO_P2_OLD
+// p2k (default; pv65 on-target whole batch 0.985, round-20 sweep line p2k): same arithmetic as the old body, addressing only:
+// smem transposes as one base pointer + immediates (old: IADD3 + LEA per element, 16 live address registers), A/B/C rows as
+// base + immediates (N = 65536 compile-time; the host runs this kernel only for n = 65536), middle twiddles as one IMAD.WIDE
+// from an opaque table pointer (c2, brev4(i), k1 <= 15: index <= 225, the old "& 255" is a no-op), 2p from a lane-0 shuffle
+// (ptxas cannot fold it into IMAD p*-2; replaces the 16-way bpo_p2_of constant lookup). JIT regs 80 -> 64 (6 -> 8 blocks/SM).
+// FHERMA_P2_OLD=1 compiles the old body (BPO_P2_OLD).
+template<class T>__device__ __forceinline__ T* bpo_opq(T* p){asm("mov.b64 %0, %0;":"+l"(p));return p;}
+__device__ __forceinline__ u64 bpo_tw8(const char* tb,u32 s8,u32 k){return __ldg(reinterpret_cast<const u64*>(tb+u64(s8)*k));}
+template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32,u32 untw){
+    constexpr u32 N=65536u;
+    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
+    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
+    const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
+    const u64 base=u64(prime*8+j)*N;
+    const u32 off=g*2048u+c2*8u+s;
+    u32 a[16],b[16];
+    {   const u32* a0=A+base+off;const u32* b0=B+base+off;
+        #pragma unroll
+        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
+    }
+    const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
+    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
+    u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
+    u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
+    #pragma unroll
+    for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
+    __syncthreads();   // every thread's A/B loads have completed (values consumed above)
+    if(untw&8)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=tr_[i];   // thread row t = c2: k1 = brev4(c2)
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tw_[17*i]=b[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)b[i]=tr_[i];
+    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
+    {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
+    r16_dit16h<H,true>(a,ti,p,p2);
+    {const u32 k8=8u*r16_brev4(c2);
+        #pragma unroll
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);   // natural c2' = i
+        a[0]=H?pxadd(a[0],0u,p2):pzred(a[0],p);}   // all canonical (H: < 2p) for the second DIT16 (CI)
+    __syncthreads();   // forward reads of TA done
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tr_[i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=tw_[17*i];   // register i = row i -> k1 = brev4(i): bit-reversed input
+    r16_dit16h<H,true>(a,ti,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
+    u32* o=C+base+(c2*256u+g*8u+s);
+    #pragma unroll
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+}
+#else
 template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
@@ -1024,6 +1086,7 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
+#endif
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
