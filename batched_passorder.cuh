@@ -1160,6 +1160,65 @@ extern "C" __global__ void __launch_bounds__(128) bpo_last_r16(const u32* C,u32*
     #pragma unroll
     for(u32 h1=0;h1<16;++h1)out[16u*h1]=pxmsh(v[h1],tn[16u*h1],p);
 }
+#ifdef BPO_SWEEPK
+// Round 16 (p1b, exit-time sweep only; BPO_SWEEPK is defined by the sweep programs, never in production): bpo_middle_r16 for the
+// P1 output layout with row runs of L words (plane word (row/L)*256L + x*L + row%L; L = 8 is the production layout). Block = L
+// slots (rows g*L..g*L+L-1) x 16 c2 = 16L threads; warp = L slots x 32/L c2: every A/B warp load is one 128 B line (as
+// production), every C warp store touches 32/L lines (production 4). Same arithmetic per (slot, c2) as bpo_middle_r16:
+// bit-identical C. Slot stride SS = 288 + 32/L (bank 32/L * s + c2: conflict-free stores and loads of the transposes).
+// SB < LW: block = SB slots of a run (16 SB threads; a warp load touches 32/SB lines); 128 B lines are then shared with the
+// other blocks of the run, so no dead-line discard (untw&8 ignored). MB = min blocks/SM of the launch bounds (0 = none, as production).
+template<u32 LW,u32 SB=LW,u32 MB=0>__global__ void __launch_bounds__(16*SB,MB) bpo_middle_r16w(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    constexpr u32 SS=288u+32u/SB;
+    __shared__ u32 TA[SB*SS];
+    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane%SB,c2=(32u/SB)*warp+lane/SB;
+    const u32 rb=(g*SB)/LW*(256u*LW)+(g*SB)%LW;   // word offset of the block's first row: run (g SB)/LW, offset in run
+    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
+    const u64 base=u64(prime*8+j)*N;
+    u32 a[16],b[16];
+    {   const u32* a0=A+base+rb+c2*LW+s;const u32* b0=B+base+rb+c2*LW+s;
+        #pragma unroll
+        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+16u*LW*c1);b[c1]=__ldcs(b0+16u*LW*c1);}else{a[c1]=a0[16u*LW*c1];b[c1]=b0[16u*LW*c1];}}
+    }
+    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    u32* const ta=TA+s*SS;
+    #pragma unroll
+    for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
+    __syncthreads();
+    if(SB==LW&&(untw&8))bpo_discard((threadIdx.x<8u*LW?A:B)+base+g*(256u*LW)+(threadIdx.x%(8u*LW))*32u);   // the block's A/B lines (8L each)
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=ta[17*c2+i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*i+c2]=b[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
+    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    {const u32 pinv=pxinv32(p);
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
+    r16_dit16<true>(a,ti,p);
+    {const u32 k1=r16_brev4(c2);
+        #pragma unroll
+        for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],__ldg(ti+((i*k1)&255u)),p);
+        a[0]=pzred(a[0],p);}
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)ta[17*c2+i]=a[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=ta[17*i+c2];
+    r16_dit16<true>(a,ti,p);
+    u32* o=C+base+c2*256u+g*SB+s;
+    #pragma unroll
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+}
+#endif
 // ---- Fused inverse tail (FHERMA_P3CRT_X=1): P2 bpo_middle_r16x + bpo_p3crt_x replace P2 + P3 + CRT ----
 // Inverse R-transform of 256 = 32 (k_lo) x 8 (k_hi), k = k_lo + 32 k_hi; slot 8g+b holds k = 32 brev3(b) + brev5(g).
 // P2x (block = 4 slot octets g = 4G..4G+3, i.e. 4 k_lo values, all 8 k_hi) does, per octet, the r16 S transforms, then
