@@ -21,7 +21,8 @@ inline bool diag_env(){const char* e=std::getenv("FHERMA_DIAG");return !e||*e!='
 // substitute (null = production), gx = grid.x substitute (0 = production), smem0 = launch with no dynamic smem (trivial
 // kernel); por = OR-ed into the P1 pfstep argument; check = exactness vs the production graph (controls only; else ex 0).
 // round 16 (p1b): bx = block.x substitute (0 = production); xw = P1 output run length L for the P1 TMA map (0 = production map).
-struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; unsigned bx[4]{}; unsigned xw=0; };
+// round 17 (h30b): h30 = capture with the mixed-prime (h30) device tables (State::swap_h30_tables); fn[] then come from the h30 modules.
+struct BatchOvr { CUfunction fn[4]{}; unsigned gx[4]{}; bool smem0[4]{}; unsigned por=0; bool check=false; unsigned bx[4]{}; unsigned xw=0; bool h30=false; };
 
 template<class C> struct Diag {
     C& d; KProf& kp; CUstream s[2]{}; CUevent ev0=nullptr,ev1=nullptr,evj=nullptr;
@@ -172,10 +173,16 @@ template<class C> struct Diag {
 // src: the production NVRTC source (prefix + kernels) for the variant sweep (diag_sweep.h; FHERMA_SWEEP=0 off), l: limbs.
 // The instruction micro-benchmarks (run_mb, measured on the target in pv27) only run with FHERMA_DIAG_MB=1.
 // batch (round 14): whole-batch A/B callback for P1 substitutes (State::batch_line), optional.
-template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes,const std::string& src,unsigned l,const std::function<void(const BatchOvr&,const char*)>& batch={}){
+// h30 (round 17, h30b): builds the mixed-prime table set + its NVRTC source (prefix + kernels); only called when the sweep runs
+// (FHERMA_SWEEP_H30=0 skips it).
+template<class C> inline void run_diag(C& c,size_t in_bytes,size_t out_bytes,const std::string& src,unsigned l,const std::function<void(const BatchOvr&,const char*)>& batch={},const std::function<bool(std::string&)>& h30={}){
     if(!diag_env()||(!c.kp.enabled&&!c.kp.trace_only)||!c.kp.pinfo||!c.diag_bw||c.kp.diag_variant()<0)return;
+    std::string hsrc;
+    if(sweep_env()&&h30&&!(std::getenv("FHERMA_SWEEP_H30")&&*std::getenv("FHERMA_SWEEP_H30")=='0')){const auto th=std::chrono::steady_clock::now();
+        try{const bool ok=h30(hsrc);if(!ok)hsrc.clear();std::printf("{\"diag\":\"sw_h30\",\"tables_s\":%.2f,\"ok\":%d}\n",std::chrono::duration<double>(std::chrono::steady_clock::now()-th).count(),int(ok));}
+        catch(const std::exception& e){hsrc.clear();std::printf("{\"diag\":\"sw_h30\",\"error\":\"%.100s\"}\n",e.what());}std::fflush(stdout);}
     std::unique_ptr<Sweep<C>> sw;
-    try{if(sweep_env())sw=std::make_unique<Sweep<C>>(c,src,l);}catch(const std::exception& e){std::printf("{\"diag\":\"sw_error\",\"what\":\"%.100s\"}\n",e.what());}
+    try{if(sweep_env())sw=std::make_unique<Sweep<C>>(c,src,l,hsrc);}catch(const std::exception& e){std::printf("{\"diag\":\"sw_error\",\"what\":\"%.100s\"}\n",e.what());}
     try{Diag<C> dg(c);if(p1q_env())run_p1q(dg);   // round 15: FHERMA_DIAG_P1Q=1 only (default off)
           // round 10 (cmp): P1 quad-math replica probe (diag_p1q.h), default on
         const char* mb=std::getenv("FHERMA_DIAG_MB");if(mb&&*mb=='1')dg.run_mb();if(mb&&*mb=='2')dg.run_mb(true);   // round 8 correction kernels (measured in pv48): FHERMA_DIAG_MB=2 onlydg.run(in_bytes,out_bytes);

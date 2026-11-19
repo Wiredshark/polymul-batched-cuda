@@ -65,6 +65,20 @@
 #define BPO_P1_MINB 2
 #endif
 __constant__ u32 bpo_wt[BCRT_K*8*BPR_DT]={BPO_WEIGHTS};   // digit weight * per-digit factor (mod p)
+#ifndef BPO_NH30
+#define BPO_NH30 0   // > 0 only in the exit-time h30 sweep module (mixed prime set: Harvey-lazy butterflies for primes < 2^30)
+#endif
+#if BPO_NH30
+struct BpoP2{u32 v[BCRT_K];};__host__ __device__ constexpr BpoP2 bpo_p2_make(){BpoP2 a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=2u*P[i];return a;}
+__constant__ BpoP2 bpo_p2c=bpo_p2_make();   // 2p from constant memory: computed 2p is folded by ptxas into IMAD p*-2+s + VIMNMX per correction
+// 2p of a block-uniform prime p (the kernel's prime pointer may be group-offset): constant-table lookup by value
+__device__ __forceinline__ u32 bpo_p2_of(u32 p){u32 r=0;
+    #pragma unroll
+    for(u32 i=0;i<BCRT_K;++i)if(bpr_pr[i]==p)r=bpo_p2c.v[i];
+    return r;}
+#else
+__device__ __forceinline__ u32 bpo_p2_of(u32){return 0u;}   // H paths not instantiated
+#endif
 // grid (256 columns, 2 operands), 256 threads: thread h owns coefficient i=256h+c.
 #ifndef BPO_LEAN
 extern "C" __global__ void __launch_bounds__(256,BPO_P1_MINB) bpo_first(const u32* a,const u32* b,u32* A,u32* B,
@@ -781,6 +795,48 @@ template<bool CI>__device__ __forceinline__ void pzdit_smr(u32* base,u32 (&v)[8]
     #pragma unroll
     for(u32 m=0;m<4;++m)pzdit(v[m],v[m+4],sit[lane+32u*m],p);
 }
+__device__ __forceinline__ u32 pxmshl(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u32(c>>32));return x*u32(c)-q*p;}
+template<bool H>__device__ __forceinline__ u32 pxmshh(u32 x,u64 c,u32 p){return H?pxmshl(x,c,p):pxmsh(x,c,p);}
+__device__ __forceinline__ void phdit(u32& x,u32& y,u64 w,u32 p,u32 p2){const u32 a=pxadd(x,0u,p2),t=pxmshl(y,w,p);x=a+t;y=a+p2-t;}
+__device__ __forceinline__ void phdit1(u32& x,u32& y,u32 p2){const u32 a=pxadd(x,0u,p2),t=pxadd(y,0u,p2);x=a+t;y=a+p2-t;}
+__device__ __forceinline__ void phdit1c(u32& x,u32& y,u32 p2){const u32 a=x,t=y;x=a+t;y=a+p2-t;}   // inputs < 2p
+// Harvey-lazy variant of pzdit_smr (p < 2^30): words in [0,4p) (phdit: one correction per butterfly); inputs < 4p
+template<bool CI>__device__ __forceinline__ void phdit_smr(u32* base,u32 (&v)[8],const u64* sit,u32 p,u32 p2,u32 lane){
+    {const u64 w=sit[254u];
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2){(void)w;if(CI)phdit1c(v[lo],v[lo+1],p2);else phdit1(v[lo],v[lo+1],p2);}}
+    {const u64 w0=sit[252u],w1=sit[253u];
+     (void)w0;phdit1(v[0],v[2],p2);phdit(v[1],v[3],w1,p,p2);phdit1(v[4],v[6],p2);phdit(v[5],v[7],w1,p,p2);}
+    __syncwarp();
+    {uint4* p4=reinterpret_cast<uint4*>(base+8*lane+4*(lane>>2));
+     p4[0]=make_uint4(v[0],v[1],v[2],v[3]);p4[1]=make_uint4(v[4],v[5],v[6],v[7]);}
+    __syncwarp();
+    const u32 b2=(lane&3u)+36u*(lane>>2);
+    #pragma unroll
+    for(u32 m=0;m<8;++m)v[m]=base[b2+4*m];
+    {const u64 w=sit[248u+(lane&3u)];
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2)phdit(v[lo],v[lo+1],w,p,p2);}
+    #pragma unroll
+    for(u32 k=0;k<4;++k){const u32 lo=(k&1)+4*(k>>1);phdit(v[lo],v[lo+2],sit[240u+(lane&3u)+4*(lo&1)],p,p2);}
+    #pragma unroll
+    for(u32 lo=0;lo<4;++lo)phdit(v[lo],v[lo+4],sit[224u+(lane&3u)+4*lo],p,p2);
+    __syncwarp();
+    #pragma unroll
+    for(u32 m=0;m<8;++m)base[b2+4*m]=v[m];
+    __syncwarp();
+    #pragma unroll
+    for(u32 m=0;m<8;++m)v[m]=base[lane+36*m];
+    {const u64 w=sit[192u+lane];
+        #pragma unroll
+        for(u32 m=0;m<8;m+=2)phdit(v[m],v[m+1],w,p,p2);}
+    #pragma unroll
+    for(u32 qq=0;qq<2;++qq){const u64 w=sit[128u+lane+32u*qq];
+        #pragma unroll
+        for(u32 hh=0;hh<2;++hh){const u32 m=qq+4*hh;phdit(v[m],v[m+2],w,p,p2);}}
+    #pragma unroll
+    for(u32 m=0;m<4;++m)phdit(v[m],v[m+4],sit[lane+32u*m],p,p2);
+}
 // P2 flags F (bpo_middle_smr: BPO_P2F, A/B twin bpo_middle_smrv: BPO_P2FV):
 //   1 lean arithmetic + psi^0 stages as add/sub (S-DIF, S-DIT), 2 (with 1) A and B S-DIF interleaved,
 //   4 (with 1) lazy S-DIT: C words in [0,2p) (consumer: bpo_last_cm3 Shoup F product, exact for any u32)
@@ -890,9 +946,38 @@ template<bool CI>__device__ __forceinline__ void r16_dit16(u32 (&v)[16],const u6
     for(u32 j=0;j<8;++j){if(j)pzdit(v[j],v[j+8],t[16*j],p);else pzdit1(v[0],v[8],0,p);}
 }
 __device__ __forceinline__ constexpr u32 r16_brev4(u32 i){return ((i&1u)<<3)|((i&2u)<<1)|((i&4u)>>1)|((i&8u)>>3);}
-extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
+// Harvey-lazy radix-16 (H, p < 2^30): DIF words in [0,2p) (sum min(s,s-2p), difference Shoup(a+2p-b) unreduced);
+// DIT words in [0,4p): a = min(x,x-2p), t = Shoup(y) lazy, x' = a+t, y' = a+2p-t (one correction per multiplied butterfly).
+template<bool H>__device__ __forceinline__ void r16_dif16h(u32 (&v)[16],const u64* t,u32 p,u32 p2){
+    if(!H){r16_dif16(v,t,p);return;}
+    #pragma unroll
+    for(u32 j=0;j<8;++j){const u32 a=v[j],b=v[j+8];v[j]=pxadd(a,b,p2);v[j+8]=j?pxmshl(a+p2-b,t[16*j],p):pxadd(a,p2-b,p2);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=8)
+        #pragma unroll
+        for(u32 j=0;j<4;++j){const u32 a=v[h+j],b=v[h+j+4];v[h+j]=pxadd(a,b,p2);v[h+j+4]=j?pxmshl(a+p2-b,t[32*j],p):pxadd(a,p2-b,p2);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=4){
+        {const u32 a=v[h],b=v[h+2];v[h]=pxadd(a,b,p2);v[h+2]=pxadd(a,p2-b,p2);}
+        {const u32 a=v[h+1],b=v[h+3];v[h+1]=pxadd(a,b,p2);v[h+3]=pxmshl(a+p2-b,t[64],p);}}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=2){const u32 a=v[h],b=v[h+1];v[h]=pxadd(a,b,p2);v[h+1]=pxadd(a,p2-b,p2);}
+}
+template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],const u64* t,u32 p,u32 p2){
+    if(!H){r16_dit16<CI>(v,t,p);return;}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=2){if(CI)phdit1c(v[h],v[h+1],p2);else phdit1(v[h],v[h+1],p2);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=4){phdit1(v[h],v[h+2],p2);phdit(v[h+1],v[h+3],t[64],p,p2);}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=8)
+        #pragma unroll
+        for(u32 j=0;j<4;++j){if(j)phdit(v[h+j],v[h+j+4],t[32*j],p,p2);else phdit1(v[h],v[h+4],p2);}
+    #pragma unroll
+    for(u32 j=0;j<8;++j){if(j)phdit(v[j],v[j+8],t[16*j],p,p2);else phdit1(v[0],v[8],p2);}
+}
+template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
-    __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
@@ -902,10 +987,11 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
         #pragma unroll
         for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
     }
-    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    const u32 p2=H?bpo_p2_of(p):0u;(void)p2;
+    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
     u32* const ta=TA+s*292u;
     #pragma unroll
-    for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmsh(a[i],w,p);b[i]=pxmsh(b[i],w,p);}
+    for(u32 i=1;i<16;++i){const u64 w=__ldg(tf+((c2*r16_brev4(i))&255u));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
     #pragma unroll
     for(u32 i=0;i<16;++i)ta[17*i+c2]=a[i];
     __syncthreads();   // every thread's A/B loads have completed (values consumed above)
@@ -918,25 +1004,33 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
     __syncthreads();
     #pragma unroll
     for(u32 i=0;i<16;++i)b[i]=ta[17*c2+i];
-    r16_dif16(a,tf,p);r16_dif16(b,tf,p);
+    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
     {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
         #pragma unroll
         for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
-    r16_dit16<true>(a,ti,p);
+    r16_dit16h<H,true>(a,ti,p,p2);
     {const u32 k1=r16_brev4(c2);
         #pragma unroll
-        for(u32 i=1;i<16;++i)a[i]=pxmsh(a[i],__ldg(ti+((i*k1)&255u)),p);   // natural c2' = i
-        a[0]=pzred(a[0],p);}   // all canonical for the second DIT16 (CI)
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],__ldg(ti+((i*k1)&255u)),p);   // natural c2' = i
+        a[0]=H?pxadd(a[0],0u,p2):pzred(a[0],p);}   // all canonical (H: < 2p) for the second DIT16 (CI)
     __syncthreads();   // forward reads of TA done
     #pragma unroll
     for(u32 i=0;i<16;++i)ta[17*c2+i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
     __syncthreads();
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=ta[17*i+c2];   // register i = row i -> k1 = brev4(i): bit-reversed input
-    r16_dit16<true>(a,ti,p);
+    r16_dit16h<H,true>(a,ti,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
     u32* o=C+base+c2*256u+g*8u+s;
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+}
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
+#if BPO_NH30   // h30 exit-time sweep module only (mixed prime set): Harvey-lazy body for the primes < 2^30
+    if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true>(TA,A,B,C,primes,r16,N,untw);else
+#endif
+    bpo_r16_body<false>(TA,A,B,C,primes,r16,N,untw);
 }
 // P3 radix-16 (bpo_last_r16, FHERMA_P3R16): same values as bpo_last_cm3 (BPO_P3T 260). Block (column c, prime), 128 threads.
 // Phase J: thread t owns slots t and t+128: 8 digit words each (coalesced), F (cross untwiddle * t1) Shoup product,
@@ -1381,7 +1475,7 @@ __device__ __forceinline__ void bpo_bar_wait(u64* bar,u32 parity){
 #define BPO_P3TV BPO_P3T
 #endif
 // P3 with the shuffle-free DIT (skewed exchange tile, layout-3 entry); same values as bpo_last_cm2.
-template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,const u32* C,u32* D,const u32* primes,
+template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     constexpr u32 T=BPO_HAS_BULK?T0:0u;   // T0&16: ablation, no arithmetic (wrong values)
     const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
@@ -1419,8 +1513,18 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
     }
     if((BPO_P3ABL!=1&&!(T0&16))&&(T0&4)){
         #pragma unroll
-        for(u32 d=0;d<8;++d)yv[d]=pxmsh(yv[d],F,p);
-        if(T0&256){   // lazy J-DIT: len 2 on canonical inputs (no corrections), outputs in [0,2p)
+        for(u32 d=0;d<8;++d)yv[d]=pxmshh<H&&(T0&256)!=0>(yv[d],F,p);   // H: [0,2p)
+        if(H&&(T0&256)){   // Harvey J-DIT: len 2 on inputs < 2p, words in [0,4p)
+            const u32 p2=bpo_p2_of(p);
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=2)phdit1c(yv[d0],yv[d0+1],p2);
+            #pragma unroll
+            for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+                #pragma unroll
+                for(u32 d0=0;d0<8;d0+=len){
+                    #pragma unroll
+                    for(u32 jj=0;jj<half;++jj){if(jj==0)phdit1(yv[d0],yv[d0+half],p2);else phdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p,p2);}}}
+        }else if(T0&256){   // lazy J-DIT: len 2 on canonical inputs (no corrections), outputs in [0,2p)
             #pragma unroll
             for(u32 d0=0;d0<8;d0+=2)pzdit1c(yv[d0],yv[d0+1],p);
             #pragma unroll
@@ -1453,7 +1557,7 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
     u32* base=X+warp*288;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+8*lane+4*(lane>>2));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
-    if((BPO_P3ABL!=1&&!(T0&16))){if(T0&128){}else if((T0&4)&&(T0&256))pzdit_smr<false>(base,v,sit,p,lane);else if(T0&4)pxdit_smr<true>(base,v,sit,p,lane);else bpo_dit_smr(base,v,sit,p,lane);}
+    if((BPO_P3ABL!=1&&!(T0&16))){if(T0&128){}else if(H&&(T0&4)&&(T0&256))phdit_smr<false>(base,v,sit,p,bpo_p2_of(p),lane);else if((T0&4)&&(T0&256))pzdit_smr<false>(base,v,sit,p,lane);else if(T0&4)pxdit_smr<true>(base,v,sit,p,lane);else bpo_dit_smr(base,v,sit,p,lane);}
     const u64* tn=(dfl&2)?t2n+u64(prime*8+warp)*512u+(c>>7)+2u*lane:t2n+u64(prime*8+warp)*512u+(c>>7)*256u+lane;const u32 ts=(dfl&2)?64u:32u;   // dfl 2: old interleaved layout (A/B only)
     if(TN==1){
         #pragma unroll
@@ -1500,6 +1604,9 @@ template<u32 T0>__device__ __forceinline__ void bpo_p3_body(u32* X,u64* bar,cons
 extern "C" __global__ void __launch_bounds__(256) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
+#if BPO_NH30   // h30 exit-time sweep module only: Harvey-lazy J-DIT / R-DIT for the primes < 2^30
+    if(primes[blockIdx.y]<(1u<<30))bpo_p3_body<BPO_P3T,true>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);else
+#endif
     bpo_p3_body<BPO_P3T>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);
 }
 #if !defined(BPO_LEAN)

@@ -24,6 +24,13 @@
 // L words (TMA box {L,1,256/L}: 256/L rows of 4L bytes instead of 32 x 32 B) and P2 = bpo_middle_r16w<L> (L slots per block, every warp load
 // = one 128 B line, C warp stores touch 32/L lines instead of 4). Default lines: ctrl, w8 (control), w16, w32m2, repeats, ctrl_rc,
 // ctrl_end; the round-15 ceiling ablations only with FHERMA_BATCH_CEIL=1.
+// Round 17 (h30b, on aa4a0c6 = 565ec66 timed path): whole-batch lines with the h30 prime set (9d2a5bd: 12 primes < 2^30 + 4 of 31 bits,
+// tight CRT bound, tensor CRT F = 45) everywhere: the batch is recaptured with every prime table swapped to the h30 set
+// (State::swap_h30_tables) and the stage kernels from two h30 modules (h30 prefix + production kernels): "h30" (BPO_NH30 12:
+// Harvey-lazy butterflies for the primes < 2^30) and "h30sh" (BPO_NH30 0: production Shoup butterflies; BPO_MIXED P1 Barrett
+// shift in both). Lines (all exact: final CRT outputs of all B products bit-identical to the production graph):
+//   h30sh_all = h30 primes, Shoup everywhere; h30p2 = Shoup P1 / P3 / CRT + Harvey P2; h30p23 = + Harvey P3; *b = repeats.
+// The round-16 layout programs / lines only with FHERMA_SWEEP_OLD=1 (or KLINES / BATCH_CEIL).
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -35,7 +42,7 @@ inline bool sweep_env(){const char* e=std::getenv("FHERMA_SWEEP");return !e||*e!
 template<class C> struct Sweep {
     C& d; KProf& kp; const unsigned L;
     std::chrono::steady_clock::time_point t0=std::chrono::steady_clock::now();double budget=40.0;   // exit-time sweep budget (s), compiles included
-    struct Prog { std::string name,arch,src; std::vector<std::string> kn; std::vector<bool> expr; CUmodule mod=nullptr; std::vector<CUfunction> fn; std::string err; double t_rtc=0,t_jit=0; bool done=false; };
+    struct Prog { std::string name,arch,src; std::vector<std::string> kn; std::vector<bool> expr; CUmodule mod=nullptr; std::vector<CUfunction> fn; std::string err; double t_rtc=0,t_jit=0; bool done=false; bool dd=false; };   // dd: -default-device (h30 modules, as h30s)
     std::vector<Prog> progs; std::vector<std::thread> th; std::string arch,native;
     struct PB { std::vector<unsigned char> b; std::vector<size_t> o; template<class T> void add(T x){const size_t off=(b.size()+sizeof(T)-1)/sizeof(T)*sizeof(T);b.resize(off+sizeof(T));std::memcpy(b.data()+off,&x,sizeof(T));o.push_back(off);} };
     // mk: kernel with its own parameter list, built from the production trace it replaces (fused variants; no per-stage exactness)
@@ -49,7 +56,8 @@ template<class C> struct Sweep {
         const size_t e=s.find('\n',p);std::string x=s.substr(p+k.size(),e-p-k.size());for(char& ch:x)if(ch==','||ch=='u')ch=' ';std::istringstream is(x);unsigned long long y;while(is>>y)v.push_back(unsigned(y));return v;}
     decltype(&::cuMemcpyDtoDAsync) dtod=nullptr; decltype(&::cuMemsetD32Async) memset32=nullptr;
     double el()const{return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();}
-    Sweep(C& c,const std::string& source,unsigned l):d(c),kp(c.kp),L(l){
+    std::string h30info;
+    Sweep(C& c,const std::string& source,unsigned l,const std::string& h30src={}):d(c),kp(c.kp),L(l){
         if(const char* e=std::getenv("FHERMA_SWEEP_S"))budget=std::atof(e);
         mprimes=mlist(source,"BCRT_PRIMES");mpos=mlist(source,"BCRT_POS");
         int cc1=0,cc2=0;if(kp.dattr){kp.dattr(&cc1,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,0);kp.dattr(&cc2,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,0);}
@@ -104,7 +112,7 @@ template<class C> struct Sweep {
         if(has_crt){tw_ok[6]=twin(HC,"extern \"C\" __global__ void __launch_bounds__(128,3) sw_crt_nold(",{{CRLD,CRLDX}});
             tw_ok[7]=twin(HC,"extern \"C\" __global__ void __launch_bounds__(128,3) sw_crt_nomem(",{{CRLD,CRLDX},{CRDS,CRDSX},{CRS1,CRSX},{CRS2,CRSX},{CRPF,CRPFX}});}
         {static const char* const tn[8]={"p2_nold","p2_nost","p2_nomem","p3_nold","p3_nost","p3_nomem","crt_nold","crt_nomem"};
-         for(int i=0;i<8;++i)if(!tw_ok[i])std::printf("{\"diag\":\"sw\",\"k\":\"ceil\",\"error\":\"twin %s: pattern mismatch\"}\n",tn[i]);std::fflush(stdout);}
+         for(int i=0;i<8;++i)if(!tw_ok[i]&&(klines||std::getenv("FHERMA_BATCH_CEIL")))std::printf("{\"diag\":\"sw\",\"k\":\"ceil\",\"error\":\"twin %s: pattern mismatch\"}\n",tn[i]);std::fflush(stdout);}
         // round 13 (ladder, on 565ec66 = pv54): P1 morph ladder (batched_p1x.cuh XL_* bits; all ablations, wrong values by design).
         // Rungs L0..L5 remove one more difference between the compute-only production P1 (nomem) and the isolated quad-math probe
         // (diag_p1q.h pq_ab) at each step; R_* lines remove ONE difference from L0 (reverse ladder). Each ladder line is timed in the
@@ -122,6 +130,21 @@ template<class C> struct Sweep {
             "extern \"C\" __global__ void sw_cmp(const uint4* a,const uint4* b,u64 n,u32* bad){u32 c=0;for(u64 i=u64(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=u64(gridDim.x)*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n";
          addk(c,"sw_cmp",false);}
         progs[0].src+="extern \"C\" __global__ void sw_triv(){}\n";triv_k=addk(0,"sw_triv",false);   // round 15: trivial body (batch rm_* lines)
+        // round 17 (h30b): h30 modules (h30 prefix + production kernels, every extern "C" kernel templatized; name-expression instances)
+        if(!h30src.empty()){
+            {const auto pr=mlist(h30src,"BCRT_PRIMES"),f=mlist(h30src,"BTC_F");unsigned n30=0;for(auto q:pr)n30+=q<(1u<<30);
+             h30info="\"h30_primes\":"+std::to_string(pr.size())+",\"lt2^30\":"+std::to_string(n30)+",\"btc_f\":"+std::to_string(f.empty()?0u:f[0])+",";}
+            std::string hs=h30src;{const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t q=0;while((q=hs.find(a,q))!=std::string::npos){hs.replace(q,a.size(),b);q+=b.size();}}
+            const std::string key="#define BPO_NH30 ";const size_t q=hs.find(key);
+            if(q!=std::string::npos){
+                auto hprog=[&](const char* name,std::string src)->int{Prog P;P.name=name;P.arch=arch;P.src=std::move(src);P.dd=true;progs.push_back(std::move(P));return int(progs.size())-1;};
+                std::string s0=hs;s0.replace(q,s0.find('\n',q)-q,key+"0");
+                const int ps=hprog("h30sh",s0);static const char* const k4[4]={"bpo_first_x<0>","bpo_middle_r16<0>","bpo_last_cm3<0>","bpo_crt_lean<0>"};
+                for(int st=0;st<4;++st)addv(st,"h30sh",ps,addk(ps,k4[st],true));
+                const int ph=hprog("h30",hs);addv(KProf::P2,"h30",ph,addk(ph,k4[1],true));addv(KProf::P3,"h30",ph,addk(ph,k4[2],true));}
+            else std::printf("{\"diag\":\"sw\",\"k\":\"h30\",\"error\":\"no BPO_NH30 in the h30 prefix\"}\n");}
+        const bool old16=klines||(std::getenv("FHERMA_SWEEP_OLD")&&*std::getenv("FHERMA_SWEEP_OLD")=='1')||(std::getenv("FHERMA_BATCH_CEIL")&&*std::getenv("FHERMA_BATCH_CEIL")=='1');
+        if(old16){
         {   // P1: ctrl (recompiled production), nost, nomem (one program each: parallel compiles)
             const int c=prog("p1c",arch);progs[size_t(c)].src+="SWP1(sw_p1_ctrl,BPO_XF,BPO_XG,BPO_TC_MINB)\n";addv(KProf::P1,"ctrl",c,addk(c,"sw_p1_ctrl",false));
             const int c2=prog("p1s",arch);progs[size_t(c2)].src+="SWP1(sw_p1_nost,(BPO_XF|(8u<<20)),BPO_XG,BPO_TC_MINB)\n";addv(KProf::P1,"nost",c2,addk(c2,"sw_p1_nost",false),-1,0,0,true);
@@ -154,6 +177,7 @@ template<class C> struct Sweep {
                 const int c=prog(L==8?"p1w8":L==16?"p1w16":"p1w32",arch);pc[L]=c;std::snprintf(ln,sizeof ln,"SWP1(sw_p1_w%u,BPO_XF,(BPO_XG|(%uu<<25)),BPO_TC_MINB)\n",L,L);progs[size_t(c)].src+=ln;
                 std::snprintf(ln,sizeof ln,"sw_p1_w%u",L);char nm[16];std::snprintf(nm,sizeof nm,"w%u",L);addv(KProf::P1,nm,c,addk(c,ln,false));}
             for(const auto& w:wv){char ln[64];std::snprintf(ln,sizeof ln,"bpo_middle_r16w<%u,%u,%u>",w.lw,w.sb,w.mb);addv(KProf::P2,w.n,pc[w.lw],addk(pc[w.lw],ln,true),-1,0,0,false,16u*w.sb);}}
+        }   // old16
         if(klines){   // ladder (FHERMA_SWEEP_KLINES=1 only): F = nomem flags (XABL 8) or XABL 14 (no proxy fence, with NPF); G = nomem (XG_NST) | XL bits
             struct A1{const char* n;unsigned xa,g;};
             enum:unsigned{SS=16384u,NPF=32768u,HOT=65536u,NBC=131072u,NAF=262144u,NPRO=524288u,NBV=1048576u,NMMA=4u,NRED=8u,NOBAR=8388608u,TWJ=2097152u,BVH=4194304u};
@@ -190,7 +214,7 @@ template<class C> struct Sweep {
             auto setctx=d.driver.template get<decltype(&::cuCtxSetCurrent)>("cuCtxSetCurrent");
             nvrtcProgram pr=nullptr;if(d.nvrtcCreateProgram(&pr,P.src.c_str(),"sweep.cu",0,nullptr,nullptr)!=NVRTC_SUCCESS)throw std::runtime_error("create");
             for(size_t k=0;k<P.kn.size();++k)if(P.expr[k])addn(pr,P.kn[k].c_str());
-            const std::string a="--gpu-architecture="+P.arch;const char* op[]={a.c_str(),"--std=c++17","-default-device"};const int nop=P.src.rfind("#define BPO_X_QL",0)==0?3:2;   // p1h: generic-lambda quad body needs -default-device (as h30s)
+            const std::string a="--gpu-architecture="+P.arch;const char* op[]={a.c_str(),"--std=c++17","-default-device"};const int nop=(P.dd||P.src.rfind("#define BPO_X_QL",0)==0)?3:2;   // p1h: generic-lambda quad body needs -default-device (as h30s)
             if(d.nvrtcCompileProgram(pr,nop,op)!=NVRTC_SUCCESS){size_t n=0;d.nvrtcGetProgramLogSize(pr,&n);std::string l(n,'\0');d.nvrtcGetProgramLog(pr,l.data());d.nvrtcDestroyProgram(&pr);
                 const size_t e=l.find("error");throw std::runtime_error("nvrtc: "+l.substr(e==std::string::npos?0:e,160));}
             std::vector<char> img;const bool cub=P.arch.rfind("sm_",0)==0;
@@ -302,7 +326,7 @@ template<class C> struct Sweep {
     std::function<void(const BatchOvr&,const char*)> batch;   // round 14/15: whole-batch A/B of a substitution set (State::batch_line)
     template<class D> void run(D& g){
         join();
-        {std::printf("{\"diag\":\"sw_info\",\"arch\":\"%s\",\"hw_threads\":%u,\"compile_wall_s\":%.1f,\"progs\":[",arch.c_str(),std::thread::hardware_concurrency(),el());
+        {std::printf("{\"diag\":\"sw_info\",\"round\":\"h30b\",\"arch\":\"%s\",\"hw_threads\":%u,\"compile_wall_s\":%.1f,%s\"progs\":[",arch.c_str(),std::thread::hardware_concurrency(),el(),h30info.c_str());
          for(size_t i=0;i<progs.size();++i)std::printf("%s[\"%s\",%zu,%.1f,%.1f%s%s%s]",i?",":"",progs[i].name.c_str(),progs[i].kn.size(),progs[i].t_rtc,progs[i].t_jit,
              progs[i].err.empty()?"":",\"",progs[i].err.empty()?"":progs[i].err.substr(0,120).c_str(),progs[i].err.empty()?"":"\"");
          std::printf("]}\n");std::fflush(stdout);}
@@ -313,10 +337,11 @@ template<class C> struct Sweep {
         d.check(d.cuMemAlloc(&bad,16));
         for(auto& P:progs)if(P.name=="cmp"&&!P.fn.empty())cmp=P.fn[0];
         for(int st=0;st<4;++st)for(auto& v:vs[st]){if(v.prog<0){v.ok=true;continue;}const auto& P=progs[size_t(v.prog)];if(v.ki>=0&&size_t(v.ki)<P.fn.size()&&P.fn[size_t(v.ki)]){v.fn=P.fn[size_t(v.ki)];v.ok=true;}}
-        for(int st=0;st<2;++st)for(auto& v:vs[st])if(v.ok&&v.fn&&(v.v=="ctrl"||v.v[0]=='w')){   // round 16: regs / spills / occupancy of the layout variants
-            int r=0,lm=0,bps=0;const unsigned bx=v.bx?v.bx:(st==0?256u:128u);if(kp.fattr){kp.fattr(&r,CU_FUNC_ATTRIBUTE_NUM_REGS,v.fn);kp.fattr(&lm,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,v.fn);}
-            if(kp.occ&&st==1)kp.occ(&bps,v.fn,int(bx),size_t(0));
-            std::printf("{\"diag\":\"sw\",\"k\":\"%s\",\"v\":\"%s\",\"r\":%d,\"lm\":%d,\"bx\":%u,\"bps\":%d}\n",st?"p2":"p1",v.v.c_str(),r,lm,bx,bps);}
+        for(int st=0;st<4;++st)for(auto& v:vs[st])if(v.ok&&v.fn&&((st<2&&(v.v=="ctrl"||v.v[0]=='w'))||v.v.rfind("h30",0)==0)){   // round 16/17: regs / spills / occupancy of the layout and h30 variants
+            static const char* const sn[4]={"p1","p2","p3","crt"};static const unsigned bxs[4]={256u,128u,256u,128u};
+            int r=0,lm=0,bps=0;const unsigned bx=v.bx?v.bx:bxs[st];if(kp.fattr){kp.fattr(&r,CU_FUNC_ATTRIBUTE_NUM_REGS,v.fn);kp.fattr(&lm,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,v.fn);}
+            if(kp.occ&&st>=1)kp.occ(&bps,v.fn,int(bx),size_t(0));
+            std::printf("{\"diag\":\"sw\",\"k\":\"%s\",\"v\":\"%s\",\"r\":%d,\"lm\":%d,\"bx\":%u,\"bps\":%d}\n",sn[st],v.v.c_str(),r,lm,bx,bps);}
         std::fflush(stdout);
         // first trace of a stage for products 0 / 1 and the trace just before it in the same product (predecessor)
         auto first=[&](int prod,int st,size_t* pi)->const KProf::Trace*{for(size_t i=0;i<tr.size();++i)if(tr[i].product==prod&&tr[i].stage==st&&!tr[i].pb.empty()){if(pi)*pi=i;return &tr[i];}return nullptr;};
@@ -416,10 +441,15 @@ template<class C> struct Sweep {
             bool prod_ok=true;for(int st=0;st<4;++st)if(!k0s[st])prod_ok=false;
             CUfunction tf=nullptr;for(auto& P:progs)if(P.name=="cmp"&&triv_k>=0&&size_t(triv_k)<P.fn.size())tf=P.fn[size_t(triv_k)];
             auto fnv=[&](int st,const char* n)->CUfunction{for(auto& v:vs[st])if(v.v==n&&v.ok&&v.fn)return v.fn;return nullptr;};
-            struct BL{const char* nm;const char* sub[4];unsigned half,triv;bool check;unsigned xw=0,sb=0;};
+            struct BL{const char* nm;const char* sub[4];unsigned half,triv;bool check;unsigned xw=0,sb=0;bool h30=false;};
+            const bool old16=klines||(std::getenv("FHERMA_SWEEP_OLD")&&*std::getenv("FHERMA_SWEEP_OLD")=='1');   // round 17: round-16 layout lines opt-in
             const bool ceil=std::getenv("FHERMA_BATCH_CEIL")&&*std::getenv("FHERMA_BATCH_CEIL")=='1';   // round 16: ceiling lines (round 15) opt-in
             static const BL bl[]={
                 {"ctrl",{},0,0,true},
+                // round 17 (h30b): h30 prime set everywhere (exact, ex checked); P2 / P3 Harvey from the BPO_NH30 12 module
+                {"h30sh_all",{"h30sh","h30sh","h30sh","h30sh"},0,0,true,0,0,true},{"h30p2",{"h30sh","h30","h30sh","h30sh"},0,0,true,0,0,true},
+                {"h30p23",{"h30sh","h30","h30","h30sh"},0,0,true,0,0,true},
+                {"h30p2b",{"h30sh","h30","h30sh","h30sh"},0,0,true,0,0,true},{"h30sh_allb",{"h30sh","h30sh","h30sh","h30sh"},0,0,true,0,0,true},
                 // round 16 (p1b): P1 output row-run layouts (all exact, ex checked): w8 = control (production layout via the new map +
                 // generic P2), w16 = 64 B TMA rows + 256-thread P2, w32m2 = 128 B TMA rows + 512-thread P2 (64 regs); *b = repeats
                 {"w8",{"w8","w8"},0,0,true,8,8},{"w16",{"w16","w16"},0,0,true,16,16},{"w32m2",{"w32","w32m2"},0,0,true,32,32},
@@ -435,8 +465,9 @@ template<class C> struct Sweep {
                 {"ctrl_end",{},0,0,true}};
             for(const auto& b:bl){
                 if(!ceil&&!b.check)continue;
+                if(!old16&&(b.xw||std::strcmp(b.nm,"ctrl_rc")==0))continue;   // round 17: layout lines + ctrl_rc need the round-16 programs
                 if(el()>bdl){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",b.nm);std::fflush(stdout);continue;}
-                BatchOvr o;o.check=b.check;const char* why=nullptr;
+                BatchOvr o;o.check=b.check;o.h30=b.h30;const char* why=nullptr;
                 if((b.half||b.triv||b.sub[1]||b.sub[2]||b.sub[3])&&!prod_ok)why="stage trace missing";
                 for(int st=0;st<4&&!why;++st){
                     if(b.sub[st]&&!(o.fn[st]=fnv(st,b.sub[st])))why="not compiled";

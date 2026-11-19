@@ -31,6 +31,9 @@
 #ifndef BPO_XA
 #define BPO_XA 0
 #endif
+#ifndef BPO_MIXED
+#define BPO_MIXED 0   // 1 only in the exit-time h30 batch module (primes < 2^30 present: per-prime P1 Barrett shift)
+#endif
 // Diagnostic ablations in template flag bits >= 20 (BPO_DIAG kernels / exit-time sweep only; production F has none set;
 // XABL 12 = no phase A + no stores, 13 = no phase A + no phase B: sweep round 5 compute-only breakdown):
 // bits 20-23 override BPO_XA, bit 24 inputs from column 0 of a (L2-resident).
@@ -895,7 +898,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(XABL(F)!=4&&XABL(F)!=5&&XABL(F)!=12&&XABL(F)!=13){   // ablation 4/5: no phase A (12: and no stores, 13: no phase A, no phase B)
-            const u32 r=4*uq+tig,p=bpr_pr[r];const u32 m62=u32(bpr_mu[r]>>2);   // floor(2^62/p)
+            const u32 r=4*uq+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;   // floor(2^(64-msh)/p) < 2^32 (h30 sweep module: BPO_MIXED)
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
             const u32 m48=XG_RED5(G)?u32(bpr_mu[r]>>16):0u;   // floor(2^48/p)
             const u32 rt=XL_HOT(G)?4u*xl_hotq<G>(u)+tig:r;   // ladder XL_HOT: prime-quad-0 tables
@@ -950,19 +953,19 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                     for(u32 hf=0;hf<2;++hf){
                         const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];   // each < 2^21
                         if constexpr(XG_NRED(G)!=0)res[2*mt+hf][j]=y0^y1^y2^y3;else
-                        if constexpr(XG_RED5(G)!=0&&(F&4096)!=0){static_assert(xred5_ok(),"XG_RED5 needs 2^30 < p < 2^31");
+                        if constexpr(XG_RED5(G)!=0&&(F&4096)!=0){static_assert(XG_RED5(G)==0||xred5_ok(),"XG_RED5 needs 2^30 < p < 2^31");
                             const u32 w=y0+(y1<<8),z=y2+(y3<<8);
                             res[2*mt+hf][j]=(w+(z<<16))+__umulhi(z,m48)*np;
                         }else
                         if(F&4096){   // x = w + 2^16 z (w, z < 2^30): hi = floor(x/2^14) exactly, r = lo + q(-p)
                             const u32 w=y0+(y1<<8),z=y2+(y3<<8);
                             const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
-                            const u32 q=__umulhi(hi,m62)>>16;
+                            const u32 q=__umulhi(hi,m62)>>qsh;
                             res[2*mt+hf][j]=lo+q*np;
                         }else{
                         const u32 lo=y0+(y1<<8)+(y2<<16)+(y3<<24);
                         const u32 hi=(y0>>14)+(y1>>6)+(y2<<2)+(y3<<10);
-                        const u32 q=__umulhi(hi,m62)>>16;
+                        const u32 q=__umulhi(hi,m62)>>qsh;
                         res[2*mt+hf][j]=lo-q*p;}
                         if constexpr(XF_TWJ(G)!=0&&S6&&MT==2)res[2*mt+hf][j]=xmshh<H>(res[2*mt+hf][j],tj[2*mt+hf],p);   // fix XF_TWJ
                     }
