@@ -27,6 +27,15 @@ foreach(WEIGHTED_HEADER weighted_prepare.cuh weighted_ntt.cuh weighted_crt.cuh c
   endif()
 endforeach()
 configure_file(kernel_source.h.in kernel_source.h @ONLY)
+# Exit-time sweep only (diag_sweep.h): CRT diet / P3 evict_last variant kernels appended to the sweep copy of the source, never to the production one.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/crtd_sweep.cuh" CRTD_SWEEP_SOURCE)
+configure_file(crtd_sweep_src.h.in crtd_sweep_src.h @ONLY)
+# Round 21 (clean): P3 / CRT / P1 variant kernels appended to the combo sweep copy of the source only.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/clean_sweep.cuh" CL_SWEEP_SOURCE)
+configure_file(clean_sweep_src.h.in clean_sweep_src.h @ONLY)
+# Round 24 (ceil2): standalone clean NTT pipeline (ntt_clean lines), its own NVRTC module.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/ntt_clean.cuh" NC_CLEAN_SOURCE)
+configure_file(nc_clean_src.h.in nc_clean_src.h @ONLY)
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${CUDA_HEADER_DIR})
 target_link_libraries(solution PRIVATE ${CMAKE_DL_LIBS})
 target_compile_options(solution PRIVATE -Wall -Wextra)

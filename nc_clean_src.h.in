@@ -1,0 +1,2 @@
+#pragma once
+static const char NC_CLEAN_SOURCE[] = R"NCCLEAN(@NC_CLEAN_SOURCE@)NCCLEAN";
