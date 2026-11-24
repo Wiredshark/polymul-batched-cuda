@@ -8,8 +8,7 @@
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
 #include "kprof.h"
-#include "j1_path.h"
-#include "j1_bdiag.h"
+#include "j1_diag_run.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -201,14 +200,8 @@ struct State {
         return driver.cuMemHostUnregister&&driver.cuMemHostUnregister(address)==CUDA_SUCCESS;
     }
     ~State(){
-        if(j1&&j1->fuse&&std::getenv("FHERMA_J1_FUSECYC"))try{j1->fuse_cycles(a_all,b_all,out_all,stderr,"diag");}catch(const std::exception& e){std::fprintf(stderr,"j1 fusecyc: %s\n",e.what());}
-        if(j1&&std::getenv("FHERMA_J1_STAGES"))try{j1->report_stages(a_all,b_all,out_all,"diag");}catch(const std::exception& e){std::fprintf(stderr,"j1 stages: %s\n",e.what());}
         if(cuda)cuda->kp.report();
-        if(cuda&&graph_stream&&(graph_exec||graph_execs[6])&&bcount>=1)try{   // exit-time J=1 whole-batch diag (j1_bdiag.h; FHERMA_J1_BDIAG=0 off)
-            run_j1_bdiag(*cuda,graph_stream,[this]{auto& d=*cuda;static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-                int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;
-                d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));},a_all,b_all,out_all,n,w,l,delta,bcount);
-        }catch(const std::exception& e){std::printf("{\"diag\":\"j1b\",\"error\":\"%.100s\"}\n",e.what());std::fflush(stdout);}
+        if(cuda)try{run_j1_diag(*cuda);}catch(const std::exception& e){std::printf("{\"diag\":\"j1ntt\",\"error\":\"%.100s\"}\n",e.what());std::fflush(stdout);}   // exit-time J=1 NTT chain diag (FHERMA_J1_DIAG=0 off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -226,7 +219,6 @@ struct State {
             (unsigned long long)stats.prepared_hits,(unsigned long long)stats.prepared_misses);
         output_pool.reset();
     }
-    std::unique_ptr<J1Path<Cuda>> j1;   // FHERMA_J1=1: pure-RNS J=1 path (j1_path.h); destroyed before cuda
     size_t host_page_size=0;u32 bcount=1;CUdeviceptr a_all=0,b_all=0,out_all=0;
     void alloc_batch(){auto& d=*cuda;const size_t bytes=size_t(bcount)*n*l*4;a_all=d.alloc(bytes);b_all=d.alloc(bytes);out_all=d.alloc(bytes);
         // Three page-locked host slots of exactly one batch tensor: the harness's
@@ -867,8 +859,7 @@ struct State {
         (void)in;  // inputs already on the device (h2d)
         auto& d=*cuda;const size_t stride=size_t(n)*l*4,count=size_t(bcount)*n*l;
         d.kp.collect();  // previous call not yet read (no d2h in between)
-        if(j1)j1->run(a_all,b_all,out_all);   // FHERMA_J1=1
-        else if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
+        if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
             static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
             int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));d.kp.run_launched(graph_stream);
         }else for(u32 i=0;i<bcount;++i){po=po_available()?std::min(want_po(),2):0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);if(prof){d.check(d.cuCtxSynchronize());prof_collect();}}
@@ -905,7 +896,6 @@ void* fherma_init(const fherma::Point& point){
     owning_pinned_vector::Bypass bypass;
     auto state=std::make_unique<State>(point);
     state->build_graph();
-    if(const char* e=std::getenv("FHERMA_J1"))if(std::atoi(e)==1)state->j1=std::make_unique<J1Path<Cuda>>(*state->cuda,state->n,state->w,state->l,state->delta,state->bcount);
     if(state->output_pool)state->output_pool->activate_prepared_reserve();
     return state.release();
 }
