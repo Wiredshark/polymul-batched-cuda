@@ -1613,7 +1613,7 @@ template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,
 // bpo_p2_of lookup), one t2n layout; kernel __maxnreg__(32) (40 -> 32 regs, 0 spill; P3 blocks pack better next to P1 / P2
 // blocks). sm_90 SASS 1423 -> 1198 instr. The kernel falls back to bpo_p3_body when N != 65536, logR != 8 or dfl 2 (old t2n
 // layout). FHERMA_P3_OLD=1 compiles the old kernel (BPO_P3_OLD).
-template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u32* primes,
+template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,u64* TS,const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 dfl){
     constexpr u32 N=65536u,logR=8u;
     const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
@@ -1625,6 +1625,12 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
     {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
+#ifndef BPO_P3_OLDTW
+    TS[t]=__ldg(sit+t);   // R-DIT twiddles staged in smem (visible after the X barrier)
+    const u64* const rsit=TS;
+#else
+    const u64* const rsit=sit;(void)TS;
+#endif
     u64 F;{
         const u32 k1=__brev(t)>>(32-logR);
         const u32 wv=mul_shoup(u32(bm_root(itw,2u*c*k1,N,p)),itw[1+(c&127u)],p);
@@ -1665,7 +1671,7 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
     u32* const base=X+warp*288u;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
-    if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
+    if(H)phdit_smr<false>(base,v,rsit,p,p2,lane);else pzdit_smr<false>(base,v,rsit,p,lane);
     u32* const out=D+(u64(prime*8u+warp)*N+(c*256u+lane));
 #ifdef BPO_P3EL
     const u32 pm=12u;   // dfl 8: group-0 residues L2 evict_last; dfl 4: evict_first (bpo_p3_body order)
@@ -1684,11 +1690,16 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
 extern "C" __global__ void __maxnreg__(32) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
+#ifndef BPO_P3_OLDTW
+    __shared__ __align__(16) u64 TS[256];   // stage_itw of the prime (twiddle staging; 11264 B smem total, 32 regs, 6 blocks/SM; FHERMA_P3_OLDTW=1 off)
+#else
+    u64* const TS=nullptr;
+#endif
     if(N==65536u&&logR==8u&&!(dfl&2u)){
 #if BPO_NH30
-        if(primes[blockIdx.y]<(1u<<30))bpo_p3b_body<true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
+        if(primes[blockIdx.y]<(1u<<30))bpo_p3b_body<true>(X,TS,C,D,primes,untwist,stage_itw,t2n,dfl);else
 #endif
-        bpo_p3b_body<false>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
+        bpo_p3b_body<false>(X,TS,C,D,primes,untwist,stage_itw,t2n,dfl);
         return;}
 #if BPO_NH30
     if(primes[blockIdx.y]<(1u<<30))bpo_p3_body<BPO_P3T,true>(X,&bar,C,D,primes,untwist,stage_itw,t2n,N,logR,dfl);else
