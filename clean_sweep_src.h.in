@@ -1,2 +1,0 @@
-#pragma once
-static const char CL_SWEEP_SOURCE[] = R"CLSWEEP(@CL_SWEEP_SOURCE@)CLSWEEP";
