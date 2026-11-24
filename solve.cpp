@@ -125,6 +125,7 @@ struct Cuda {
         }catch(...){nvrtcDestroyProgram(&program);throw;}rcheck(nvrtcDestroyProgram(&program));
         };
         if(const char* e=std::getenv("FHERMA_ARCH"))build(e);
+        else if(ccmaj>=12){try{build("compute_120");}catch(const std::exception&){module=nullptr;try{build("compute_90");}catch(const std::exception&){module=nullptr;build("compute_80");}}}
         else if(ccmaj>=9){try{build("compute_90");}catch(const std::exception&){module=nullptr;build("compute_80");}}
         else build("compute_80");
         getfn(&prepare,module,"prepare");getfn(&forward,module,"forward");getfn(&pointwise,module,"pointwise");
