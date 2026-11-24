@@ -8,7 +8,7 @@
 #include "column_pipeline_graph.h"
 #include "root_cache_policy.h"
 #include "kprof.h"
-#include "ovl_diag_run.h"
+#include "j1_diag_run.h"
 #include <cuda.h>
 #include <nvrtc.h>
 #include <algorithm>
@@ -201,7 +201,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
-        if(cuda)try{run_ovl_diag(*cuda);}catch(const std::exception& e){std::printf("{\"diag\":\"ovl\",\"error\":\"%.100s\"}\n",e.what());std::fflush(stdout);}   // exit-time tensor/integer overlap diag (FHERMA_OVL_DIAG=0 off)
+        if(cuda)try{run_j1_diag(*cuda);}catch(const std::exception& e){std::printf("{\"diag\":\"j1ntt\",\"error\":\"%.100s\"}\n",e.what());std::fflush(stdout);}   // exit-time J=1 NTT chain diag (FHERMA_J1_DIAG=0 off)
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
