@@ -120,7 +120,11 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     auto prefetch=[&](u32 j){
         #pragma unroll
         for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
+#ifdef BPO_HALF
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"::"r"(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3)))))),"l"(reinterpret_cast<const unsigned short*>(residues)+(u64(r)*8+j)*N+i0+4*ch):"memory");}   // l2bw: 8 of 16 B at half the byte offset
+#else
             swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
+#endif
         swc_commit();};
     prefetch(0);
     for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
