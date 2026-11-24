@@ -1,2 +1,0 @@
-#pragma once
-static const char CRTD_SWEEP_SOURCE[] = R"CRTDSWEEP(@CRTD_SWEEP_SOURCE@)CRTDSWEEP";
