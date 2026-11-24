@@ -72,30 +72,6 @@ template<u32 F>__device__ __forceinline__ void xjdif(u32 (&x8)[8],const u64* st,
     xbft<T>(x8[0],x8[2],w0,p);xbf(x8[1],x8[3],w64,p);xbft<T>(x8[4],x8[6],w0,p);xbf(x8[5],x8[7],w64,p);
     xbft<T>(x8[0],x8[1],w0,p);xbft<T>(x8[2],x8[3],w0,p);xbft<T>(x8[4],x8[5],w0,p);xbft<T>(x8[6],x8[7],w0,p);
 }
-// p1il (stack, p1x2 round-25 "il", default ON; FHERMA_P1_NOIL=1 compiles the row-major order, BPO_P1_NOIL): phase A twist +
-// J-DIF stage-major over the 4 rows (16 independent Shoup chains per stage instead of 4), same values.
-// p1pr (stack, p1x2 "pr", default ON; FHERMA_P1_NOPR=1 off, BPO_P1_NOPR): base-conversion y1<<8, y3<<8 (y < 2^21) as a byte
-// permute + IADD instead of IMAD x*256+y (off the IMAD pipe), same values.
-#ifndef BPO_P1_NOIL
-template<u32 F>__device__ __forceinline__ void xjdif4(u32 (&x)[4][8],const u64* st,u32 p){
-    constexpr bool T=(F&1)!=0;
-    const u64 w32=st[32],w96=st[96];const u64 w0=st[0],w64=st[64];
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr)xbft<T>(x[rr][0],x[rr][4],w0,p);
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr)xbf(x[rr][1],x[rr][5],w32,p);
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr)xbf(x[rr][2],x[rr][6],w64,p);
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr)xbf(x[rr][3],x[rr][7],w96,p);
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr){xbft<T>(x[rr][0],x[rr][2],w0,p);xbft<T>(x[rr][4],x[rr][6],w0,p);}
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr){xbf(x[rr][1],x[rr][3],w64,p);xbf(x[rr][5],x[rr][7],w64,p);}
-    #pragma unroll
-    for(u32 rr=0;rr<4;++rr){xbft<T>(x[rr][0],x[rr][1],w0,p);xbft<T>(x[rr][2],x[rr][3],w0,p);xbft<T>(x[rr][4],x[rr][5],w0,p);xbft<T>(x[rr][6],x[rr][7],w0,p);}
-}
-#endif
 // R-DIF of one (prime,digit) column in its 288-word skewed region + cross twiddle (ctab row from L1/L2).
 template<u32 F>
 __device__ __forceinline__ void xrdif(u32* const base0,const u32 so,const u64* st,const u64* ct,u32 p,u32* outp,u32 lane,const XTMap* tm,u32 c,u32 plane){
@@ -579,11 +555,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                     for(u32 hf=0;hf<2;++hf){
                         const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];   // each < 2^21
                         if(F&4096){   // x = w + 2^16 z (w, z < 2^30): hi = floor(x/2^14) exactly, r = lo + q(-p)
-#ifndef BPO_P1_NOPR
-                            const u32 w=y0+__byte_perm(y1,0u,0x2104u),z=y2+__byte_perm(y3,0u,0x2104u);   // p1pr: y<<8 as a byte permute
-#else
                             const u32 w=y0+(y1<<8),z=y2+(y3<<8);
-#endif
                             const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
                             const u32 q=__umulhi(hi,m62)>>qsh;
                             res[2*mt+hf][j]=lo+q*np;
@@ -598,16 +570,6 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
-#ifndef BPO_P1_NOIL
-                {u64 t2v[4];   // p1il: stage-major over the 4 rows
-                    #pragma unroll
-                    for(u32 rr=0;rr<4;++rr)t2v[rr]=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
-                    #pragma unroll
-                    for(u32 j=0;j<8;++j)
-                        #pragma unroll
-                        for(u32 rr=0;rr<4;++rr)res[rr][j]=xmsh(res[rr][j],t2v[rr],p);
-                    xjdif4<F>(res,st,p);}
-#else
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
@@ -615,7 +577,6 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                     for(u32 j=0;j<8;++j)res[rr][j]=xmsh(res[rr][j],t2,p);
                     xjdif<F>(res[rr],st,p);
                 }
-#endif
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
