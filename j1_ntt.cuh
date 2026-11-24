@@ -107,7 +107,7 @@ template<bool SIN=false>__device__ __forceinline__ void j1_colfwd_body(u32 colbl
     #pragma unroll
     for(u32 r2=0;r2<16;++r2)y[256u*r2]=v[r2];
 }
-template<bool SOUT=false>__device__ __forceinline__ void j1_colinv_body(u32 colblk,u32 prime,u32 tid,u32 bar_id,u32* S,
+template<bool SOUT=false,bool CG=false>__device__ __forceinline__ void j1_colinv_body(u32 colblk,u32 prime,u32 tid,u32 bar_id,u32* S,
     const u32* X,u32* Y,const u32* primes,const u64* tw1){
     const u32 p=primes[prime],p2=j1_opq2(p);
     const u32 hi=tid>>3,cl=tid&7u,c=colblk*8u+cl;
@@ -117,7 +117,7 @@ template<bool SOUT=false>__device__ __forceinline__ void j1_colinv_body(u32 colb
     u32* const sB=S+136u*hi+cl;    // r1 = hi
     u32 v[16];
     #pragma unroll
-    for(u32 r2=0;r2<16;++r2)v[r2]=x[256u*r2];   // r1 = hi
+    for(u32 r2=0;r2<16;++r2)v[r2]=CG?__ldcg(x+256u*r2):x[256u*r2];   // r1 = hi (CG: L2 load, data written by other SMs in the same launch)
     {   u64 w[15];
         w[0]=__ldg(t+16u+hi);
         j1_ld2(t+32u+2u*hi,w[1],w[2]);

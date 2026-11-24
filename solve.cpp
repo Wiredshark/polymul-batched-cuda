@@ -201,6 +201,7 @@ struct State {
         return driver.cuMemHostUnregister&&driver.cuMemHostUnregister(address)==CUDA_SUCCESS;
     }
     ~State(){
+        if(j1&&j1->fuse&&std::getenv("FHERMA_J1_FUSECYC"))try{j1->fuse_cycles(a_all,b_all,out_all,stderr,"diag");}catch(const std::exception& e){std::fprintf(stderr,"j1 fusecyc: %s\n",e.what());}
         if(j1&&std::getenv("FHERMA_J1_STAGES"))try{j1->report_stages(a_all,b_all,out_all,"diag");}catch(const std::exception& e){std::fprintf(stderr,"j1 stages: %s\n",e.what());}
         if(cuda)cuda->kp.report();
         if(cuda&&graph_stream&&(graph_exec||graph_execs[6])&&bcount>=1)try{   // exit-time J=1 whole-batch diag (j1_bdiag.h; FHERMA_J1_BDIAG=0 off)
