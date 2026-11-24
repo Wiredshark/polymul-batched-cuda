@@ -6,6 +6,7 @@
 //   ctrl (production vs production), j1_if1 / j1_if2 / j1_if3 (J=1 path, 1 / 2 / 3 products in flight), one repeat of
 //   each J=1 line (_r), ctrl_end.  Then per-stage lines for one product (k "stage", 3 repeats): fwd_a, fwd_b, colfwd,
 //   row, colinv, back (us, SMSP cycles, IMMA x 16 share of the SMSP cycles for the conversions).
+//   Variant lines (fd7da47 + B2 / group mode): see the variant table below; back = 2 is wt-j1conv 5f0a0cc back2.
 //   Fused lines (j1ntt-fdiag, FHERMA_J1_FUSE kernels of j1_fused.cuh; own J1Path per split, built and freed in turn):
 //   j1f16 / j1f12 / j1f20 (+ _r) = fused path with X split 16+16 / 12+20 / 20+12 tensor+integer warps (Y always 16+16),
 //   then k "cycles" lines per split and kernel (X, Y): median block span in SM clock64 cycles (= SMSP cycles) with only
@@ -47,7 +48,7 @@ template<class C> void run_j1_bdiag(C& d,CUstream gs,const std::function<void()>
     J1Path<C>* fz=nullptr;   // fused instance for the j1f lines
     auto line=[&](const char* name,uint32_t sflight){   // sflight 0 = production (control)
         const auto tl=std::chrono::steady_clock::now();
-        J1Path<C>* jp=fz?fz:j1.get();const uint32_t sf=fz?0u:sflight;
+        J1Path<C>* jp=fz?fz:j1.get();const uint32_t sf=fz&&fz->fuse?0u:sflight;
         std::function<void()> var=(sflight||fz)?std::function<void()>([&]{jp->run(a_all,b_all,out_all,gs,sf);}):std::function<void()>(prodf);
         d.check(mset(out_all,0xA5A5A5A5u,count));d.check(d.cuCtxSynchronize());timed(var);
         const unsigned nb=j1->compare(out_all,ref,count,bad,gs);const int ex=nb?0:1;
@@ -60,22 +61,35 @@ template<class C> void run_j1_bdiag(C& d,CUstream gs,const std::function<void()>
     try{
         line("ctrl",0);line("j1_if1",1);line("j1_if2",2);line("j1_if3",3);
         line("j1_if1_r",1);line("j1_if2_r",2);line("j1_if3_r",3);
-        {   std::vector<typename J1Path<C>::FuseCyc> cy[3];const uint32_t xts[3]={16,12,20};uint32_t qgs[3]={0,0,0};
-            for(int k=0;k<3;++k){char nm[32];std::unique_ptr<J1Path<C>> f;
-                try{f=std::make_unique<J1Path<C>>(d,n,w,l,delta,B,2u,1,xts[k]);}catch(const std::exception& e){std::printf("{\"diag\":\"j1b\",\"error\":\"fused init %u: %.100s\"}\n",xts[k],e.what());std::fflush(stdout);continue;}
-                fz=f.get();std::snprintf(nm,32,"j1f%u",xts[k]);line(nm,0);std::snprintf(nm,32,"j1f%u_r",xts[k]);line(nm,0);
-                fz=nullptr;std::snprintf(nm,32,"j1_if1_x%u",xts[k]);line(nm,1);   // unfused line next to it (same pairing)
-                cy[k]=f->fuse_cycle_data(a_all,b_all,out_all,3);qgs[k]=f->qg;f.reset();}
-            line("j1_if1_r2",1);
-            for(int k=0;k<3;++k)for(const auto& r:cy[k]){const double* c=r.c;char key[48],sp[16];
-                std::snprintf(sp,16,"%u+%u",r.kind?16u:xts[k],r.kind?16u:32u-xts[k]);std::snprintf(key,48,"%s%u",r.kind?"Y":"X",xts[k]);
-                auto lk=[&](const char* f){static char b[64];std::snprintf(b,64,"%s.%s",key,f);return j1bd::local(b);};
-                const double lT=lk("tensor_alone"),lI=lk("int_alone"),lB=lk("both"),lE=lk("eff");
-                std::printf("{\"diag\":\"j1b\",\"k\":\"cycles\",\"kernel\":\"%s\",\"x_split\":\"%u+%u\",\"split\":\"%s\",\"qg\":%u,\"tensor_alone\":%.0f,\"int_alone\":%.0f,\"both\":%.0f,"
-                    "\"tensor_in_both\":%.0f,\"int_in_both\":%.0f,\"eff\":%.3f,\"cyc_per_imma_alone\":%.2f,\"cyc_per_imma_both\":%.2f,\"cyc_per_pt_int_alone\":%.3f,\"cyc_per_pt_int_both\":%.3f,"
-                    "\"local_tensor_alone\":%.0f,\"local_int_alone\":%.0f,\"local_both\":%.0f,\"local_eff\":%.3f}\n",
-                    r.kind?"Y":"X",xts[k],32u-xts[k],sp,qgs[k],c[0],c[1],c[2],c[3],c[4],r.eff,c[0]/(r.imma/r.per),c[2]/(r.imma/r.per),c[1]/(r.ipt/r.per),c[2]/(r.ipt/r.per),lT,lI,lB,lE);}
-            std::fflush(stdout);}
+        // variants (own J1Path each, built and freed in turn): unfused old back; fused whole-set (X splits, back2 / old back);
+        // fused group mode (G primes per group).  Per variant: info line (k "variant"), VAR, VAR_r, j1_if1_xVAR (unfused
+        // back2 line next to it); fused variants then give k "cycles" lines (X, Y) after all batch lines.
+        // fwd 3 / 1 = j1_fwd3 (bc485ca) / j1_fwd (4e0ea38); back 3 / 2 / 1 = back3 (bc485ca) / back2 (5f0a0cc) / j1_back (4e0ea38)
+        struct Var{const char* tag;int fuse;uint32_t xt,fwd,back;int grp;};
+        const Var vars[]={{"j1_if1_b2",0,16,3,2,0},{"j1_if1_f1b1",0,16,1,1,0},
+                          {"j1f16",1,16,3,3,0},{"j1f16_b2",1,16,3,2,0},{"j1f16_f1b1",1,16,1,1,0},{"j1f12",1,12,3,3,0},{"j1f20",1,20,3,3,0},
+                          {"j1g60",1,16,3,3,60},{"j1g40",1,16,3,3,40},{"j1g24",1,16,3,3,24},{"j1g24_x20",1,20,3,3,24},{"j1g20_x20",1,20,3,3,20},
+                          {"j1g60_b2",1,16,3,2,60},{"j1g60_f1b1",1,16,1,1,60}};
+        struct Cy{const Var* v;uint32_t qg;double live;std::vector<typename J1Path<C>::FuseCyc> c;};std::vector<Cy> cys;
+        for(const Var& v:vars){char nm[48];std::unique_ptr<J1Path<C>> f;
+            try{f=std::make_unique<J1Path<C>>(d,n,w,l,delta,B,v.fuse?2u:1u,v.fuse,v.fuse?v.xt:0u,v.back,v.grp,v.fwd);}
+            catch(const std::exception& e){std::printf("{\"diag\":\"j1b\",\"error\":\"variant %s init: %.100s\"}\n",v.tag,e.what());std::fflush(stdout);continue;}
+            std::printf("{\"diag\":\"j1b\",\"k\":\"variant\",\"v\":\"%s\",\"fuse\":%d,\"split\":\"%u+%u\",\"fwd\":%u,\"back\":%u,\"group\":%d,\"qg\":%u,\"units_per_product\":%u,\"x_smem\":%u,\"y_smem\":%u,\"live_residue_mb\":%.1f}\n",
+                v.tag,v.fuse,f->xT,32u-f->xT,f->fwd,f->back,v.grp,f->qg,f->NG,f->xsm,f->back>=2?f->y2sm:f->ysm,f->fuse?f->live_mb:double(f->S)*2*118*n*4/1048576.0);std::fflush(stdout);
+            fz=f.get();line(v.tag,1);std::snprintf(nm,48,"%s_r",v.tag);line(nm,1);
+            fz=nullptr;std::snprintf(nm,48,"j1_if1_x%s",v.tag+2);line(nm,1);
+            if(v.fuse)cys.push_back({&v,f->qg,f->live_mb,f->fuse_cycle_data(a_all,b_all,out_all,3)});
+            f.reset();}
+        line("j1_if1_r2",1);
+        for(const Cy& cy:cys)for(const auto& r:cy.c){const double* c=r.c;const Var& v=*cy.v;char sp[16];
+            std::snprintf(sp,16,"%u+%u",r.kind?16u:v.xt,r.kind?16u:32u-v.xt);const char* kn=r.kind?"Y":"X";
+            auto lk=[&](const char* f){char b[96];std::snprintf(b,96,"%s.%s.%s",v.tag,kn,f);return j1bd::local(b);};
+            std::printf("{\"diag\":\"j1b\",\"k\":\"cycles\",\"v\":\"%s\",\"kernel\":\"%s\",\"x_split\":\"%u+%u\",\"split\":\"%s\",\"fwd\":%u,\"back\":%u,\"group\":%d,\"qg\":%u,\"tensor_alone\":%.0f,\"int_alone\":%.0f,\"both\":%.0f,"
+                "\"tensor_in_both\":%.0f,\"int_in_both\":%.0f,\"eff\":%.3f,\"cyc_per_imma_alone\":%.2f,\"cyc_per_imma_both\":%.2f,\"cyc_per_pt_int_alone\":%.3f,\"cyc_per_pt_int_both\":%.3f,"
+                "\"local_tensor_alone\":%.0f,\"local_int_alone\":%.0f,\"local_both\":%.0f,\"local_eff\":%.3f,\"local_cyc_per_imma_alone\":%.2f,\"local_cyc_per_imma_both\":%.2f,\"local_cyc_per_pt_int_alone\":%.3f,\"local_cyc_per_pt_int_both\":%.3f}\n",
+                v.tag,kn,v.xt,32u-v.xt,sp,v.fwd,v.back,v.grp,cy.qg,c[0],c[1],c[2],c[3],c[4],r.eff,c[0]/(r.imma/r.per),c[2]/(r.imma/r.per),c[1]/(r.ipt/r.per),c[2]/(r.ipt/r.per),
+                lk("tensor_alone"),lk("int_alone"),lk("both"),lk("eff"),lk("cyc_per_imma_alone"),lk("cyc_per_imma_both"),lk("cyc_per_pt_int_alone"),lk("cyc_per_pt_int_both"));}
+        std::fflush(stdout);
         line("ctrl_end",0);
         // per-stage lines, one product (inputs: product 0 of the batch)
         const char* nm[6]={"fwd_a","fwd_b","colfwd","row","colinv","back"};

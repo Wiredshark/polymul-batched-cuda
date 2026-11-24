@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -32,8 +33,16 @@ template<class C> struct J1Path {
     CUmodule mod=nullptr;CUfunction fF=nullptr,fR=nullptr,fI=nullptr,fCF=nullptr,fCB=nullptr,fTF=nullptr,fTB=nullptr,fCmp=nullptr;
     CUdeviceptr dP=0,dPi=0,dT1=0,dTh=0,dTl=0,dBmB=0,dR=0,dFA=0,dFB=0,dBM=0,dTabA=0,dTabB=0,dPm=0,dTm=0,dTf=0;
     bool tc=true;u32 fsm=0,bsm=0,fgx=1,bgx=1,nsm=0,clk=0;
+    // back conversion: back = 2 (default, wt-j1conv 5f0a0cc j1_back2_range + j1_back2_fin, side buffer n x 16 words) or 1
+    // (FHERMA_J1_BACK=1: 4e0ea38 j1_back)
+    // back = 3 (default, wt-j1conv bc485ca j1_back3_range + j1_back3_fin, side rows 80 B), 2 (5f0a0cc back2), 1 (4e0ea38);
+    // fwd = 3 (default, bc485ca j1_fwd3) or 1 (FHERMA_J1_FWD=1: 4e0ea38 j1_fwd).  Main and fused modules: J1C_N = 65536.
+    u32 fwd=3,b3gx=1,f3gx=1;CUfunction fTF3=nullptr,fB3R=nullptr,fB3F=nullptr,fY3=nullptr;CUdeviceptr dT3=0;
+    u32 back=3,b2sm=0,b2gx=1;CUfunction fB2R=nullptr,fB2F=nullptr;CUdeviceptr dT2=0,dSide=0;std::vector<CUdeviceptr> sides;double imma_back=0,b3_smax=0;   // sides: back2 side buffer per stream (dSide = sides[0])
     // fused path (FHERMA_J1_FUSE=1; j1_fused.cuh): module compiled with J1X_T / J1F_QG, X / Y kernels, counters, clock records
-    bool fuse=false,xtf=false;u32 xT=16,qg=15,xsm=0,ysm=0;CUmodule fmod=nullptr;CUfunction fX=nullptr,fY=nullptr;CUdeviceptr dDone=0,dRec=0;
+    bool fuse=false,xtf=false;u32 xT=16,qg=15,xsm=0,ysm=0;CUmodule fmod=nullptr;CUfunction fX=nullptr,fY=nullptr,fY2=nullptr;CUdeviceptr dDone=0,dRec=0;
+    // group mode (FHERMA_J1_GROUP = primes per group, 60 / 40 / 24 / 20 = 4 x QG; 0 = whole-set mode): units (product, group)
+    u32 grp=0,NG=1,y2sm=0;std::vector<CUdeviceptr> gA,gB;CUdeviceptr dY=0;double live_mb=0;
     CUmodule compile(const std::vector<std::string>& defs){
         nvrtcProgram prog=nullptr;d.rcheck(d.nvrtcCreateProgram(&prog,J1_KERNEL_SOURCE,"j1_kernels.cu",0,nullptr,nullptr));
         std::vector<std::string> o={"--gpu-architecture=compute_90","--std=c++17"};for(auto& x:defs)o.push_back("-D"+x);
@@ -43,19 +52,25 @@ template<class C> struct J1Path {
         CUmodule m=nullptr;d.check(d.cuModuleLoadData(&m,ptx.data()));return m;}
     std::vector<CUdeviceptr> ra,rb;std::vector<CUstream> st;
     decltype(&::cuStreamCreate) screate;decltype(&::cuStreamDestroy_v2) sdestroy;
-    J1Path(C& d_,u32 N_,u32 W,u32 L_,u32 delta_,u32 B_,u32 S_force=0,int fuse_force=-1,u32 xt_force=0):d(d_),N(N_),K(118),L(L_),delta(delta_),B(B_){
+    J1Path(C& d_,u32 N_,u32 W,u32 L_,u32 delta_,u32 B_,u32 S_force=0,int fuse_force=-1,u32 xt_force=0,u32 back_force=0,int grp_force=-1,u32 fwd_force=0):d(d_),N(N_),K(118),L(L_),delta(delta_),B(B_){
         if(N!=65536u||W!=1747u||L!=55u)throw std::runtime_error("FHERMA_J1: only the N=65536, W=1747 point");
         const char* e=std::getenv("FHERMA_J1_INFLIGHT");S=S_force?S_force:e?u32(std::atoi(e)):2u;if(S<1)S=1;if(S>4)S=4;if(S>B)S=B;
         T=j1t::make_tables(N,K,W,delta);
         // module
         nvrtcProgram prog=nullptr;d.rcheck(d.nvrtcCreateProgram(&prog,J1_KERNEL_SOURCE,"j1_kernels.cu",0,nullptr,nullptr));
-        const char* opts[]={"--gpu-architecture=compute_90","--std=c++17"};
-        if(d.nvrtcCompileProgram(prog,2,opts)!=NVRTC_SUCCESS){size_t n=0;d.nvrtcGetProgramLogSize(prog,&n);std::string log(n,'\0');d.nvrtcGetProgramLog(prog,log.data());d.nvrtcDestroyProgram(&prog);throw std::runtime_error("J1 NVRTC: "+log);}
+        const char* opts[]={"--gpu-architecture=compute_90","--std=c++17","-DJ1C_N=65536"};
+        if(d.nvrtcCompileProgram(prog,3,opts)!=NVRTC_SUCCESS){size_t n=0;d.nvrtcGetProgramLogSize(prog,&n);std::string log(n,'\0');d.nvrtcGetProgramLog(prog,log.data());d.nvrtcDestroyProgram(&prog);throw std::runtime_error("J1 NVRTC: "+log);}
         size_t n=0;d.rcheck(d.nvrtcGetPTXSize(prog,&n));std::vector<char> ptx(n);d.rcheck(d.nvrtcGetPTX(prog,ptx.data()));d.rcheck(d.nvrtcDestroyProgram(&prog));
         d.check(d.cuModuleLoadData(&mod,ptx.data()));
         d.check(d.cuModuleGetFunction(&fF,mod,"j1_colfwd"));d.check(d.cuModuleGetFunction(&fR,mod,"j1_row"));d.check(d.cuModuleGetFunction(&fI,mod,"j1_colinv"));
         d.check(d.cuModuleGetFunction(&fCF,mod,"j1c_fwd_ref"));d.check(d.cuModuleGetFunction(&fCB,mod,"j1c_back_ref"));
         d.check(d.cuModuleGetFunction(&fTF,mod,"j1_fwd"));d.check(d.cuModuleGetFunction(&fCmp,mod,"j1d_cmp"));d.check(d.cuModuleGetFunction(&fTB,mod,"j1_back"));
+        d.check(d.cuModuleGetFunction(&fB2R,mod,"j1_back2_range"));d.check(d.cuModuleGetFunction(&fB2F,mod,"j1_back2_fin"));
+        d.check(d.cuModuleGetFunction(&fTF3,mod,"j1_fwd3"));d.check(d.cuModuleGetFunction(&fB3R,mod,"j1_back3_range"));d.check(d.cuModuleGetFunction(&fB3F,mod,"j1_back3_fin"));
+        if(const char* c=std::getenv("FHERMA_J1_BACK")){const int v=std::atoi(c);back=v==1?1u:v==2?2u:3u;}
+        if(const char* c=std::getenv("FHERMA_J1_FWD"))fwd=std::atoi(c)==1?1u:3u;
+        if(fwd_force)fwd=fwd_force;
+        if(back_force)back=back_force;
         if(const char* c=std::getenv("FHERMA_J1_CONV"))tc=std::string(c)!="ref";
         {   auto fset=d.driver.template get<decltype(&::cuFuncSetAttribute)>("cuFuncSetAttribute");
             auto occ=d.driver.template get<decltype(&::cuOccupancyMaxActiveBlocksPerMultiprocessor)>("cuOccupancyMaxActiveBlocksPerMultiprocessor");
@@ -65,105 +80,172 @@ template<class C> struct J1Path {
             fsm=15u*7u*512u+15u*32u;bsm=2u*7680u+3840u+8u*(3u*16u*20u*4u+512u);   // J1F_SMEM (QG 15), J1B_SMEM
             d.check(fset(fTF,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(fsm)));d.check(fset(fTB,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(bsm)));
             int bf=0,bb=0;d.check(occ(&bf,fTF,512,fsm));d.check(occ(&bb,fTB,512,bsm));
-            fgx=std::max(1u,nsm*u32(std::max(1,bf))/2u);bgx=nsm*u32(std::max(1,bb));}   // as wt-j1conv test_conv.py (2 prime groups of 15 quads)
+            fgx=std::max(1u,nsm*u32(std::max(1,bf))/2u);bgx=nsm*u32(std::max(1,bb));
+            b2sm=15u*4u*512u+16u*16u*30u*4u;int b2=0;   // J1C_SMEM (J1C_W 16)
+            d.check(fset(fB2R,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(b2sm)));d.check(occ(&b2,fB2R,512,b2sm));
+            b2gx=std::max(1u,nsm*u32(std::max(1,b2))/4u);
+            int b3=0,f3=0;d.check(fset(fB3R,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(b2sm)));d.check(occ(&b3,fB3R,512,b2sm));
+            d.check(fset(fTF3,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(fsm)));d.check(occ(&f3,fTF3,512,fsm));
+            b3gx=std::max(1u,nsm*u32(std::max(1,b3))/4u);f3gx=std::max(1u,nsm*u32(std::max(1,f3))/2u);}   // as wt-j1conv 5f0a0cc test_conv.py: grid (b2gx, 4 ranges)
+        imma_back=back>=2?4096.0*4*120:imma_back1;   // as wt-j1conv test_conv.py (2 prime groups of 15 quads)
         // tables and buffers
-        dP=d.upload(T.primes);dPi=d.upload(T.pinv);dT1=d.upload(T.tw1);dTh=d.upload(T.thi);dTl=d.upload(T.tlo);dBmB=d.upload(T.bm);dR=d.upload(T.R);
-        dFA=d.upload(T.fwdA);dFB=d.upload(T.fwdB);dBM=d.upload(T.backM);
+        dP=upload_(T.primes);dPi=upload_(T.pinv);dT1=upload_(T.tw1);dTh=upload_(T.thi);dTl=upload_(T.tlo);dBmB=upload_(T.bm);dR=upload_(T.R);
+        dFA=upload_(T.fwdA);dFB=upload_(T.fwdB);dBM=upload_(T.backM);
         {   auto ftab=[&](const std::vector<u32>& f){std::vector<u32> o(size_t(30)*7*32*4);   // [7][60][32][2] -> [30][7][32][4]
                 for(u32 q=0;q<30;++q)for(u32 ks=0;ks<7;++ks)for(u32 ln=0;ln<32;++ln)for(u32 t=0;t<2;++t)for(u32 h=0;h<2;++h)
                     o[((size_t(q)*7+ks)*32+ln)*4+2*t+h]=f[((size_t(ks)*60+2*q+t)*32+ln)*2+h];return o;};
-            dTabA=d.upload(ftab(T.fragA));dTabB=d.upload(ftab(T.fragB));
+            dTabA=upload_(ftab(T.fragA));dTabB=upload_(ftab(T.fragB));
             std::vector<u32> m(size_t(14)*15*32*4);   // [15][28][32][2] -> [14][15][32][4]
             for(u32 c=0;c<14;++c)for(u32 ks=0;ks<15;++ks)for(u32 ln=0;ln<32;++ln)for(u32 t=0;t<2;++t)for(u32 h=0;h<2;++h)
                 m[((size_t(c)*15+ks)*32+ln)*4+2*t+h]=T.fragM[((size_t(ks)*28+2*c+t)*32+ln)*2+h];
-            dTm=d.upload(m);dTf=d.upload(T.fragF);
-            std::vector<u32> pm(240,0);for(u32 k=0;k<K;++k){pm[2*k]=T.primes[k];pm[2*k+1]=T.bm[k];}dPm=d.upload(pm);}
+            dTm=upload_(m);dTf=upload_(T.fragF);
+            std::vector<u32> t2(size_t(4)*15*4*32*4,0);   // [4 r][15 ks][4 pairs][32][4]: pairs (0,1) (2,3) (4,5) (6,F) of range r
+            auto fm=[&](u32 ks,u32 c,u32 ln,u32 h){return T.fragM[((size_t(ks)*28+c)*32+ln)*2+h];};
+            for(u32 r=0;r<4;++r)for(u32 ks=0;ks<15;++ks)for(u32 j=0;j<4;++j)for(u32 ln=0;ln<32;++ln)for(u32 h=0;h<2;++h){
+                const size_t o=(((size_t(r)*15+ks)*4+j)*32+ln)*4;
+                t2[o+h]=fm(ks,7*r+2*j,ln,h);
+                t2[o+2+h]=j<3?fm(ks,7*r+2*j+1,ln,h):T.fragF[(size_t(ks)*32+ln)*2+h];}
+            dT2=upload_(t2);
+            {   // tab3 = wt-j1conv bc485ca test_conv.back3_tab: per range r, columns permuted so that tile pair p < 3 = (A_p: planes 0, 1 of
+                // limbs 4p + tg, B_p: planes 2, 3), pair 3 = (tile 6 unchanged, backF); refrag = pack_b of the permuted [480][56] matrix
+                unsigned long long smax=0;for(u32 c=0;c<224;++c){unsigned long long t=0;for(u32 k=0;k<480;++k)t+=T.backM[size_t(k)*224+c];smax=std::max(smax,t);}
+                for(u32 c=0;c<8;++c){unsigned long long t=0;for(u32 k=0;k<480;++k)t+=T.backF[size_t(k)*8+c];smax=std::max(smax,t);}
+                smax*=255;if(257ull*smax>=(1ull<<32))throw std::runtime_error("J1 back3 table: accumulator bound 257 x Smax >= 2^32");
+                b3_smax=double(smax);
+                std::vector<u32> t3(size_t(4)*15*4*32*4,0);
+                for(u32 r=0;r<4;++r){std::vector<u32> cols;
+                    for(u32 pp=0;pp<3;++pp){for(u32 c=0;c<8;++c)cols.push_back(56*r+4*(4*pp+(c>>1))+(c&1));for(u32 c=0;c<8;++c)cols.push_back(56*r+4*(4*pp+(c>>1))+2+(c&1));}
+                    for(u32 c=0;c<8;++c)cols.push_back(56*r+48+c);
+                    std::vector<uint8_t> Mp(size_t(480)*56);for(u32 k=0;k<480;++k)for(u32 c=0;c<56;++c)Mp[size_t(k)*56+c]=T.backM[size_t(k)*224+cols[c]];
+                    const std::vector<u32> fr=j1t::pack_b(Mp,480,56);   // [15][7][32][2]
+                    for(u32 ks=0;ks<15;++ks)for(u32 j=0;j<4;++j)for(u32 ln=0;ln<32;++ln)for(u32 h=0;h<2;++h){
+                        const size_t o=(((size_t(r)*15+ks)*4+j)*32+ln)*4;
+                        t3[o+h]=fr[((size_t(ks)*7+(j<3?2*j:6))*32+ln)*2+h];
+                        t3[o+2+h]=j<3?fr[((size_t(ks)*7+2*j+1)*32+ln)*2+h]:T.fragF[(size_t(ks)*32+ln)*2+h];}}
+                dT3=upload_(t3);}
+            std::vector<u32> pm(240,0);for(u32 k=0;k<K;++k){pm[2*k]=T.primes[k];pm[2*k+1]=T.bm[k];}dPm=upload_(pm);}
         screate=d.driver.template get<decltype(&::cuStreamCreate)>("cuStreamCreate");sdestroy=d.driver.template get<decltype(&::cuStreamDestroy_v2)>("cuStreamDestroy_v2");
         if(const char* f=std::getenv("FHERMA_J1_FUSE"))fuse=std::atoi(f)==1;
         if(fuse_force>=0)fuse=fuse_force==1;
         if(xt_force){xT=xt_force;xtf=true;}
+        if(const char* g=std::getenv("FHERMA_J1_GROUP"))grp=u32(std::atoi(g));
+        if(grp_force>=0)grp=u32(grp_force);
         if(fuse)init_fused();
-        for(u32 c=0;c<std::max(S,fuse?2u:1u);++c){ra.push_back(d.alloc(size_t(K)*N*4));rb.push_back(d.alloc(size_t(K)*N*4));CUstream s=nullptr;d.check(screate(&s,CU_STREAM_NON_BLOCKING));st.push_back(s);}
-        std::fprintf(stderr,"{\"j1\":true,\"K\":%u,\"inflight\":%u,\"conv\":\"%s\",\"fwd_grid\":[%u,2],\"back_grid\":%u}\n",K,S,tc?"tc":"ref",fgx,bgx);
+        for(u32 c=0;c<std::max(S,fuse&&!grp?2u:1u);++c){ra.push_back(alloc_(size_t(K)*N*4));rb.push_back(alloc_(size_t(K)*N*4));CUstream s=nullptr;d.check(screate(&s,CU_STREAM_NON_BLOCKING));st.push_back(s);sides.push_back(alloc_(size_t(N)*80));}dSide=sides[0];
+        std::fprintf(stderr,"{\"j1\":true,\"K\":%u,\"inflight\":%u,\"conv\":\"%s\",\"fwd\":%u,\"b3_smax_log2\":%.2f,\"back\":%u,\"fwd_grid\":[%u,2],\"back_grid\":%u,\"back2_grid\":[%u,4]}\n",K,S,tc?"tc":"ref",fwd,std::log2(b3_smax),back,fgx,bgx,b2gx);
     }
-    ~J1Path(){for(auto s:st)if(s)sdestroy(s);if(mod)d.cuModuleUnload(mod);if(fmod)d.cuModuleUnload(fmod);}
+    // own device allocations (freed by the destructor; Cuda::alloc would keep them until the context goes)
+    std::vector<CUdeviceptr> mine;
+    CUdeviceptr alloc_(size_t bytes){CUdeviceptr p=0;d.check(d.cuMemAlloc(&p,bytes));mine.push_back(p);return p;}
+    template<class T>CUdeviceptr upload_(const std::vector<T>& v){auto p=alloc_(v.size()*sizeof(T));d.check(d.cuMemcpyHtoD(p,v.data(),v.size()*sizeof(T)));return p;}
+    ~J1Path(){d.cuCtxSynchronize();for(auto p:mine)d.cuMemFree(p);for(auto s:st)if(s)sdestroy(s);if(mod)d.cuModuleUnload(mod);if(fmod)d.cuModuleUnload(fmod);}
     void init_fused(){
         if(const char* e=std::getenv("FHERMA_J1_XT"))if(!xtf)xT=u32(std::atoi(e));if(xT<4||xT>28||(32-xT)%4)throw std::runtime_error("FHERMA_J1_XT: 4..28, 32 - XT a multiple of 4");
         if(const char* e=std::getenv("FHERMA_J1_QG"))qg=u32(std::atoi(e));
         auto xs=[&](u32 g){return g*7u*512u+g*32u+(32u-xT)*2688u;};
-        if(!std::getenv("FHERMA_J1_QG")&&xs(qg)>101376u)qg=10;   // 99 KB block limit: QG 10 = 3 prime groups of 10 quads
+        if(grp){if(grp%4||(grp/4!=15&&grp/4!=10&&grp/4!=6&&grp/4!=5))throw std::runtime_error("FHERMA_J1_GROUP: 60, 40, 24 or 20 primes (4 x QG, QG | 30)");qg=grp/4;}
+        else if(!std::getenv("FHERMA_J1_QG")&&xs(qg)>101376u)qg=10;   // 99 KB block limit: QG 10 = 3 prime groups of 10 quads
         if(qg!=15&&qg!=10&&qg!=6&&qg!=5)throw std::runtime_error("FHERMA_J1_QG must divide 30 (15, 10, 6, 5)");
-        xsm=xs(qg);ysm=2u*7680u+3840u+8u*(3u*16u*20u*4u+512u)+4u*8704u;
-        fmod=compile({"J1X_T="+std::to_string(xT),"J1F_QG="+std::to_string(qg)});
-        d.check(d.cuModuleGetFunction(&fX,fmod,"j1_fuse_x"));d.check(d.cuModuleGetFunction(&fY,fmod,"j1_fuse_y"));
+        if(xs(qg)>101376u)throw std::runtime_error("J1 fused X: shared memory over 99 KB for this split / group");
+        NG=grp?30u/qg:1u;
+        xsm=xs(qg);ysm=2u*7680u+3840u+8u*(3u*16u*20u*4u+512u)+4u*8704u;y2sm=15u*4u*512u+16u*16u*30u*4u+4u*8704u;
+        fmod=compile({"J1X_T="+std::to_string(xT),"J1F_QG="+std::to_string(qg),"J1X_F="+std::to_string(fwd),std::getenv("FHERMA_J1_FUSE_NOCN")?"J1C_NOCN=1":"J1C_N=65536"});   // FHERMA_J1_FUSE_NOCN: runtime n in the fused module
+        d.check(d.cuModuleGetFunction(&fX,fmod,"j1_fuse_x"));d.check(d.cuModuleGetFunction(&fY,fmod,"j1_fuse_y"));d.check(d.cuModuleGetFunction(&fY2,fmod,"j1_fuse_y2"));d.check(d.cuModuleGetFunction(&fY3,fmod,"j1_fuse_y3"));
         auto fset=d.driver.template get<decltype(&::cuFuncSetAttribute)>("cuFuncSetAttribute");
         auto occ=d.driver.template get<decltype(&::cuOccupancyMaxActiveBlocksPerMultiprocessor)>("cuOccupancyMaxActiveBlocksPerMultiprocessor");
         auto fattr=d.driver.template get<decltype(&::cuFuncGetAttribute)>("cuFuncGetAttribute");
-        d.check(fset(fX,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(xsm)));d.check(fset(fY,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(ysm)));
-        int ox=0,oy=0,rx=0,ry=0,lx=0,ly=0;d.check(occ(&ox,fX,1024,xsm));d.check(occ(&oy,fY,1024,ysm));
-        fattr(&rx,CU_FUNC_ATTRIBUTE_NUM_REGS,fX);fattr(&ry,CU_FUNC_ATTRIBUTE_NUM_REGS,fY);fattr(&lx,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,fX);fattr(&ly,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,fY);
+        CUfunction fy=back==3?fY3:back==2?fY2:fY;const u32 ys=back>=2?y2sm:ysm;
+        d.check(fset(fX,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(xsm)));d.check(fset(fy,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(ys)));
+        int ox=0,oy=0,rx=0,ry=0,lx=0,ly=0;d.check(occ(&ox,fX,1024,xsm));d.check(occ(&oy,fy,1024,ys));
+        fattr(&rx,CU_FUNC_ATTRIBUTE_NUM_REGS,fX);fattr(&ry,CU_FUNC_ATTRIBUTE_NUM_REGS,fy);fattr(&lx,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,fX);fattr(&ly,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,fy);
         if(ox<1||oy<1)throw std::runtime_error("J1 fused kernels do not fit an SM");
-        dDone=d.alloc(K*4);dRec=d.alloc(size_t(nsm)*32*2*8);
-        std::fprintf(stderr,"{\"j1_fuse\":true,\"xT\":%u,\"xI\":%u,\"qg\":%u,\"x_smem\":%u,\"y_smem\":%u,\"x_regs_local\":[%d,%d],\"y_regs_local\":[%d,%d],\"blocks_per_sm\":[%d,%d]}\n",xT,32-xT,qg,xsm,ysm,rx,lx,ry,ly,ox,oy);}
-    // fused launches: X(fp = product whose forward conversion runs, ip = product whose row + colinv run), Y(bp back, cp colfwd); -1 = role idle
-    void launch_x(CUdeviceptr a_all,CUdeviceptr b_all,int fp,int ip,CUstream s,bool recd=false){
+        dDone=alloc_(K*4);dRec=alloc_(size_t(nsm)*32*2*8);
+        const double rowmb=double(N)*4/1048576.0;   // one prime row of one operand
+        if(grp){for(int c=0;c<2;++c){gA.push_back(alloc_(size_t(grp)*N*4));gB.push_back(alloc_(size_t(grp)*N*4));}dY=alloc_(size_t(K)*N*4);
+            live_mb=2*2*grp*rowmb+K*rowmb;}
+        else live_mb=2*2*K*rowmb;
+        if(back>=2)live_mb+=N*(back==3?80:64)/1048576.0;
+        std::fprintf(stderr,"{\"j1_fuse\":true,\"xT\":%u,\"xI\":%u,\"qg\":%u,\"group\":%u,\"units_per_product\":%u,\"back\":%u,\"x_smem\":%u,\"y_smem\":%u,\"x_regs_local\":[%d,%d],\"y_regs_local\":[%d,%d],\"blocks_per_sm\":[%d,%d],\"live_residue_mb\":%.1f,\"io_mb_per_product\":%.1f}\n",
+            xT,32-xT,qg,grp,NG,back,xsm,ys,rx,lx,ry,ly,ox,oy,live_mb,3.0*N*L*4/1048576.0);}
+    // fused units: u = product * NG + group; whole-set mode NG = 1 (unit = product, residues ra / rb[u % 2], all primes)
+    u32 up0(int u)const{return grp?u32(u%int(NG))*grp:0u;}
+    u32 unp(int u)const{return grp?std::min(grp,K-up0(u)):K;}
+    CUdeviceptr ubase(const std::vector<CUdeviceptr>& v,int u)const{return v[u%2]-CUdeviceptr(up0(u))*N*4;}   // base for global prime index
+    CUdeviceptr ures(int u,int op)const{return grp?ubase(op?gB:gA,u):(op?rb:ra)[u%2];}
+    CUdeviceptr uy(int u)const{return grp?dY:ra[u%2];}   // y of the unit's product (colinv output, back input)
+    // X(fu: unit whose forward conversion runs | iu: unit whose row + colinv run); -1 = role idle
+    void launch_x(CUdeviceptr a_all,CUdeviceptr b_all,int fu,int iu,CUstream s,bool recd=false){
         const size_t stride=size_t(N)*L*4;auto msa=d.driver.template get<decltype(&::cuMemsetD32Async)>("cuMemsetD32Async");
-        CUdeviceptr xa=fp>=0?a_all+fp*stride:0,xb=fp>=0?b_all+fp*stride:0,fra=fp>=0?ra[fp%2]:0,frb=fp>=0?rb[fp%2]:0;
-        CUdeviceptr A=ip>=0?ra[ip%2]:0,Bv=ip>=0?rb[ip%2]:0,rec=recd?dRec:0;
-        if(ip>=0)d.check(msa(dDone,0u,K,s));
-        void* a[]={&xa,&xb,&fra,&frb,&dTabA,&dTabB,&dPm,&A,&Bv,&dP,&dPi,&dTh,&dTl,&dT1,&dDone,&rec};
+        const int fp=fu>=0?fu/int(NG):0;
+        CUdeviceptr xa=fu>=0?a_all+fp*stride:0,xb=fu>=0?b_all+fp*stride:0,fra=fu>=0?ures(fu,0):0,frb=fu>=0?ures(fu,1):0;
+        u32 g0=grp&&fu>=0?u32(fu%int(NG)):0u,ngr=grp?1u:30u/qg,p0=iu>=0?up0(iu):0u,np=iu>=0?unp(iu):0u;
+        CUdeviceptr A=iu>=0?ures(iu,0):0,Bv=iu>=0?ures(iu,1):0,Yo=iu>=0?uy(iu):0,rec=recd?dRec:0;
+        if(iu>=0)d.check(msa(dDone,0u,K,s));
+        void* a[]={&xa,&xb,&fra,&frb,&dTabA,&dTabB,&dPm,&g0,&ngr,&p0,&np,&Yo,&A,&Bv,&dP,&dPi,&dTh,&dTl,&dT1,&dDone,&rec};
         d.check(d.cuLaunchKernel(fX,nsm,1,1,1024,1,1,xsm,s,a,nullptr));}
-    void launch_y(CUdeviceptr out_all,int bp,int cp,CUstream s,bool recd=false){
+    // Y(bp: product whose back conversion runs | cu: unit whose colfwd runs)
+    void launch_y(CUdeviceptr out_all,int bp,int cu,CUstream s,bool recd=false){
         const size_t stride=size_t(N)*L*4;
-        CUdeviceptr y=bp>=0?ra[bp%2]:0,out=bp>=0?out_all+bp*stride:0,fA=cp>=0?ra[cp%2]:0,fB=cp>=0?rb[cp%2]:0,rec=recd?dRec:0;
-        void* a[]={&y,&out,&dTm,&dTf,&fA,&fB,&dP,&dT1,&rec};
-        d.check(d.cuLaunchKernel(fY,nsm,1,1,1024,1,1,ysm,s,a,nullptr));}
-    // whole batch, one stream: X(F0) Y(C0) then per i: X(F i+1 | I i) Y(B i | C i+1)
+        CUdeviceptr y=bp>=0?uy(bp*int(NG)):0,out=bp>=0?out_all+bp*stride:0,fA=cu>=0?ures(cu,0):0,fB=cu>=0?ures(cu,1):0,rec=recd?dRec:0;
+        u32 p0=cu>=0?up0(cu):0u,np=cu>=0?unp(cu):0u;
+        if(back>=2){CUdeviceptr tb=back==3?dT3:dT2;void* a[]={&y,&out,&dSide,&tb,&fA,&fB,&p0,&np,&dP,&dT1,&rec};d.check(d.cuLaunchKernel(back==3?fY3:fY2,nsm,1,1,1024,1,1,y2sm,s,a,nullptr));
+            if(bp>=0&&!recd)back2_fin(out,s);}
+        else{void* a[]={&y,&out,&dTm,&dTf,&fA,&fB,&p0,&np,&dP,&dT1,&rec};d.check(d.cuLaunchKernel(fY,nsm,1,1,1024,1,1,ysm,s,a,nullptr));}}
+    // whole batch, one stream: X(F u0) Y(C u0), then per unit u: X(F u+1 | I u) Y(B product(u) if u ends its product | C u+1)
     void run_fused(CUdeviceptr a_all,CUdeviceptr b_all,CUdeviceptr out_all,CUstream join=nullptr){
         auto erec=d.driver.template get<decltype(&::cuEventRecord)>("cuEventRecord");auto swait=d.driver.template get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        CUstream s=st[0];const int nb=int(B);
+        CUstream s=st[0];const int U=int(B*NG);
         if(join){if(jev.empty()){auto ec=d.driver.template get<decltype(&::cuEventCreate)>("cuEventCreate");jev.resize(S+1);for(auto& e:jev)d.check(ec(&e,CU_EVENT_DISABLE_TIMING));}
             d.check(erec(jev[S],join));d.check(swait(s,jev[S],0));}
         launch_x(a_all,b_all,0,-1,s);launch_y(out_all,-1,0,s);
-        for(int i=0;i<nb;++i){launch_x(a_all,b_all,i+1<nb?i+1:-1,i,s);launch_y(out_all,i,i+1<nb?i+1:-1,s);}
+        for(int u=0;u<U;++u){launch_x(a_all,b_all,u+1<U?u+1:-1,u,s);launch_y(out_all,(u+1)%int(NG)==0?u/int(NG):-1,u+1<U?u+1:-1,s);}
         if(join){d.check(erec(jev[0],s));d.check(swait(join,jev[0],0));}}
-    // clock64 overlap of the fused kernels (product 0 / 1 data): per role and together, median block span over SMs
+    // clock64 overlap of the fused kernels: per role and together, median block span over SMs.  Data: units of products
+    // 0 and 1 (product 0 complete in y first).  X = F(unit NG+1) | I(unit NG); Y = B(product 0) | C(unit NG+1).
     struct FuseCyc{int kind;double c[5]={0,0,0,0,0};double imma,ipt,per,eff;};   // c: tensor alone, int alone, both, tensor in both, int in both
     std::vector<FuseCyc> fuse_cycle_data(CUdeviceptr a_all,CUdeviceptr b_all,CUdeviceptr out_all,int reps=3){
         std::vector<unsigned long long> h(size_t(nsm)*64);
         auto span=[&](int which)->double{   // 0 tensor warps, 1 integer warps, 2 all; median over blocks
-            const u32 t=0;(void)t;std::vector<double> v;
+            std::vector<double> v;
             for(u32 b=0;b<nsm;++b){unsigned long long lo=~0ull,hi=0;
                 for(u32 w=0;w<32;++w){const bool ten=w<(cur_kind?16u:xT);if(which==0&&!ten)continue;if(which==1&&ten)continue;
                     lo=std::min(lo,h[(b*32+w)*2]);hi=std::max(hi,h[(b*32+w)*2+1]);}
                 v.push_back(double(hi-lo));}
             std::sort(v.begin(),v.end());return v[v.size()/2];};
-        // prepare product 0 / 1 intermediates (unfused-equivalent sequence on the fused kernels)
-        CUstream s=st[0];launch_x(a_all,b_all,0,-1,s);launch_y(out_all,-1,0,s);launch_x(a_all,b_all,1,0,s);d.check(d.cuCtxSynchronize());
+        const int ng=int(NG),U=int(B*NG);if(ng+2>U)throw std::runtime_error("fuse_cycles: batch too small");
+        CUstream s=st[0];launch_x(a_all,b_all,0,-1,s);launch_y(out_all,-1,0,s);
+        for(int u=0;u<ng;++u){launch_x(a_all,b_all,u+1,u,s);launch_y(out_all,-1,u+1,s);}
+        d.check(d.cuCtxSynchronize());
+        const int fu=ng+1,iu=ng;
         std::vector<FuseCyc> res;
         for(int kind=0;kind<2;++kind){cur_kind=kind;FuseCyc r;r.kind=kind;double* c=r.c;
             for(int mode=0;mode<3;++mode){double best=-1;   // mode 0 tensor alone, 1 integer alone, 2 both
                 for(int rp=0;rp<reps;++rp){
-                    if(kind==0)launch_x(a_all,b_all,mode!=1?1:-1,mode!=0?0:-1,s,true);   // X: F(1) | row+colinv(0)
-                    else launch_y(out_all,mode!=1?0:-1,mode!=0?1:-1,s,true);              // Y: B(0) | colfwd(1)
+                    if(kind==0)launch_x(a_all,b_all,mode!=1?fu:-1,mode!=0?iu:-1,s,true);
+                    else launch_y(out_all,mode!=1?0:-1,mode!=0?fu:-1,s,true);
                     d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(h.data(),dRec,h.size()*8));
                     const double sp=span(mode==0?0:mode==1?1:2);if(best<0||sp<best){best=sp;if(mode==2){c[3]=span(0);c[4]=span(1);}}}
                 c[mode]=best;}
-            r.imma=kind==0?2.0*imma_fwd:imma_back;r.ipt=double(K)*N;r.per=4.0*nsm;r.eff=(c[0]+c[1]-c[2])/std::min(c[0],c[1]);res.push_back(r);}
+            r.imma=kind==0?2.0*4096.0*(grp?qg:30u)*14:imma_back;r.ipt=double(unp(kind?fu:iu))*N;r.per=4.0*nsm;r.eff=(c[0]+c[1]-c[2])/std::min(c[0],c[1]);res.push_back(r);}
         cur_kind=0;return res;}
     void fuse_cycles(CUdeviceptr a_all,CUdeviceptr b_all,CUdeviceptr out_all,FILE* f,const char* tag,int reps=3){
         for(const FuseCyc& r:fuse_cycle_data(a_all,b_all,out_all,reps)){const double* c=r.c;const double imma=r.imma,ipt=r.ipt,per=r.per,eff=r.eff;const int kind=r.kind;
-            std::fprintf(f,"{\"%s\":\"j1_fuse_cycles\",\"kernel\":\"%s\",\"split\":\"%u+%u\",\"qg\":%u,\"tensor_alone\":%.0f,\"int_alone\":%.0f,\"both\":%.0f,\"tensor_in_both\":%.0f,\"int_in_both\":%.0f,\"eff\":%.3f,"
+            std::fprintf(f,"{\"%s\":\"j1_fuse_cycles\",\"kernel\":\"%s\",\"split\":\"%u+%u\",\"qg\":%u,\"group\":%u,\"fwd\":%u,\"back\":%u,\"tensor_alone\":%.0f,\"int_alone\":%.0f,\"both\":%.0f,\"tensor_in_both\":%.0f,\"int_in_both\":%.0f,\"eff\":%.3f,"
                 "\"cyc_per_imma_alone\":%.2f,\"cyc_per_imma_both\":%.2f,\"cyc_per_pt_int_alone\":%.3f,\"cyc_per_pt_int_both\":%.3f}\n",
-                tag,kind?"Y":"X",kind?16u:xT,kind?16u:32u-xT,qg,c[0],c[1],c[2],c[3],c[4],eff,c[0]/(imma/per),c[2]/(imma/per),c[1]/(ipt/per),c[2]/(ipt/per));std::fflush(f);}
+                tag,kind?"Y":"X",kind?16u:xT,kind?16u:32u-xT,qg,grp,fwd,back,c[0],c[1],c[2],c[3],c[4],eff,c[0]/(imma/per),c[2]/(imma/per),c[1]/(ipt/per),c[2]/(ipt/per));std::fflush(f);}
     }
     int cur_kind=0;
     void L_(CUfunction f,u32 gx,u32 gy,u32 gz,u32 bx,CUstream s,void** a){d.check(d.cuLaunchKernel(f,gx,gy,gz,bx,1,1,0,s,a,nullptr));}
     // ---- interface (replaceable conversions) ----
     void forward_convert(CUdeviceptr limbs,CUdeviceptr res,int operand,CUstream s){
-        if(tc){CUdeviceptr tb=operand?dTabB:dTabA;u32 n=N;void* a[]={&limbs,&res,&tb,&dPm,&n};d.check(d.cuLaunchKernel(fTF,fgx,2,1,512,1,1,fsm,s,a,nullptr));return;}
+        if(tc){CUdeviceptr tb=operand?dTabB:dTabA;u32 n=N;void* a[]={&limbs,&res,&tb,&dPm,&n};
+            if(fwd==3)d.check(d.cuLaunchKernel(fTF3,f3gx,2,1,512,1,1,fsm,s,a,nullptr));else d.check(d.cuLaunchKernel(fTF,fgx,2,1,512,1,1,fsm,s,a,nullptr));return;}
         CUdeviceptr tb=operand?dFB:dFA;u32 k=K,n=N;void* a[]={&limbs,&res,&tb,&dP,&dBmB,&k,&n};L_(fCF,N/16u,1,1,128,s,a);}
+    CUdeviceptr side_of(CUstream s)const{for(size_t c=0;c<st.size();++c)if(st[c]==s)return sides[c];return sides[0];}
+    void back2_fin(CUdeviceptr out,CUstream s){u32 n=N;CUdeviceptr sd=side_of(s);void* a[]={&out,&sd,&n};d.check(d.cuLaunchKernel(back==3?fB3F:fB2F,(N+127)/128,1,1,128,1,1,0,s,a,nullptr));}
     void back_convert(CUdeviceptr y,CUdeviceptr out,CUstream s){
+        if(tc&&back==3){u32 n=N;CUdeviceptr sd=side_of(s);void* a[]={&y,&out,&sd,&dT3,&n};d.check(d.cuLaunchKernel(fB3R,b3gx,4,1,512,1,1,b2sm,s,a,nullptr));back2_fin(out,s);return;}
+        if(tc&&back==2){u32 n=N;CUdeviceptr sd=side_of(s);void* a[]={&y,&out,&sd,&dT2,&n};d.check(d.cuLaunchKernel(fB2R,b2gx,4,1,512,1,1,b2sm,s,a,nullptr));back2_fin(out,s);return;}
         if(tc){u32 n=N;void* a[]={&y,&out,&dTm,&dTf,&n};d.check(d.cuLaunchKernel(fTB,bgx,1,1,512,1,1,bsm,s,a,nullptr));return;}
         u32 k=K,n=N,dl=delta;void* a[]={&y,&out,&dBM,&dR,&k,&n,&dl};L_(fCB,N/32u,1,1,224,s,a);}
     // ---- integer transform chain: ra, rb (conversion outputs) -> y in ra ----
@@ -191,7 +273,7 @@ template<class C> struct J1Path {
             if(rep&&(r[stg]<0||us<r[stg]))r[stg]=us;}
         edes(e0);edes(e1);return r;}
     // IMMAs per product: forward 4096 m-tiles x 30 quads x 14 per operand; back 4096 x (15 + 14 x 30)
-    static constexpr double imma_fwd=4096.0*30*14,imma_back=4096.0*(15+14*30);
+    static constexpr double imma_fwd=4096.0*30*14,imma_back1=4096.0*(15+14*30);   // back2: 4096 x 4 ranges x 120
     // one JSON line per stage; share = IMMAs x 16 cycles / SMSP cycles of the stage
     void report_stages(CUdeviceptr a,CUdeviceptr b,CUdeviceptr out,const char* tag,FILE* f=stderr){
         const char* nm[6]={"fwd_a","fwd_b","colfwd","row","colinv","back"};
