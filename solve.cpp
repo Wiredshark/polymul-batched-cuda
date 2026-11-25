@@ -89,9 +89,12 @@ inline std::string g_kernel_prefix;  // point-specific NVRTC macros, set before 
 // lines; production 3140af3: 16 lines x 32 B). Separate device copies (ctab_wl, tc_bpt_wl) feed only the bpo_first_x launch;
 // every other kernel keeps the original tables. FHERMA_P1WL=0 restores the 3140af3 module (no BPO_P1WL) and tables.
 static bool p1wl_env(){const char* e=std::getenv("FHERMA_P1WL");return !(e&&*e=='0');}
-// Candidate 2 (pv93 on-target wl2 diag, paired whole batch: p1tw 0.9897, p2mt 0.9898, p3f 0.9927): input-independent
-// per-(prime, index) values read as whole-line tables built once at init (outside run). Each lever has its own switch
-// (FHERMA_P1TW=0 / FHERMA_P2MT=0 / FHERMA_P3F=0); all three off + FHERMA_P1WL=0 compiles the 3140af3 module.
+// Candidate 3 (levers of pv93 on-target wl2 diag, paired whole batch: p1tw 0.9897, p2mt 0.9898, p3f 0.9927): input-independent
+// per-(prime, index) values read as whole-line tables. Each lever is its own kernel entry (bpo_first_xt, bpo_middle_r16m,
+// bpo_last_cm3f) next to the unchanged production kernel; its table is built on the device once, before the graph capture
+// (outside run). If a lever's table cannot be built or its precondition fails, its launches keep the production kernel (the
+// lever's off path, identical results) and the reason is printed in one exit line {"diag":"tabs",...}; nothing aborts.
+// Switches (module): FHERMA_P1TW=0 / FHERMA_P2MT=0 / FHERMA_P3F=0; all three off + FHERMA_P1WL=0 compiles the 3140af3 module.
 //  p1tw: bpo_first_x S6 twist t2 = tw[1+128+((64rr+rl)256+c)/128] (2 primes x 32 rows per warp request, 8 lines) from
 //        T1[((u*2+c/128)*256+64rr+rl)*4+tig] (256 contiguous bytes per request); 64 KB.
 //  p2mt: bpo_middle_r16 middle twiddles w^(c2 brev4(i)) / w^-(brev4(c2) i) (index math + 8-byte gathers) from per-prime
@@ -129,7 +132,7 @@ struct Cuda {
     std::unique_ptr<L2RootCachePolicy> root_cache;
     CUfunction prepare,forward,pointwise,inverse,finish,reconstruct,transpose_inputs,transpose_output,reconstruct_explicit,middle_local,inverse_finish,fourstep_forward,fourstep_middle,fourstep_inverse;
     CUfunction weighted_prepare,weighted_forward,weighted_middle,weighted_inverse,reconstruct_weighted8,reconstruct_weighted8_subwarp16;
-    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_p1tw_on=nullptr,bpo_p2mt_on=nullptr,bpo_ftab_init=nullptr,bpo_p3crt_x=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
+    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_first_xt=nullptr,bpo_middle_r16m=nullptr,bpo_last_cm3f=nullptr,bpo_t1_init=nullptr,bpo_r16x_init=nullptr,bpo_ftab_init=nullptr,bpo_p3crt_x=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
     void getfn(CUfunction* f,CUmodule m,const char* name){CUresult r=cuModuleGetFunction(f,m,name);if(r==CUDA_ERROR_NOT_FOUND){*f=nullptr;return;}check(r);kp.add_name(*f,name);}
     void check(CUresult r){if(r!=CUDA_SUCCESS){const char* message=nullptr;cuGetErrorString(r,&message);throw std::runtime_error(message?message:"CUDA error");}}
     void rcheck(nvrtcResult r){if(r!=NVRTC_SUCCESS)throw std::runtime_error("NVRTC error "+std::to_string(int(r)));}
@@ -158,7 +161,7 @@ struct Cuda {
         getfn(&batched_prepare_fused,module,"batched_prepare_fused");
         getfn(&batched_middle,module,"batched_middle");
         getfn(&batched_forward,module,"batched_forward");getfn(&batched_inverse,module,"batched_inverse");
-        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_p1tw_on,module,"bpo_p1tw_on");getfn(&bpo_p2mt_on,module,"bpo_p2mt_on");getfn(&bpo_ftab_init,module,"bpo_ftab_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");}
+        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_first_xt,module,"bpo_first_xt");getfn(&bpo_middle_r16m,module,"bpo_middle_r16m");getfn(&bpo_last_cm3f,module,"bpo_last_cm3f");getfn(&bpo_t1_init,module,"bpo_t1_init");getfn(&bpo_r16x_init,module,"bpo_r16x_init");getfn(&bpo_ftab_init,module,"bpo_ftab_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");}
         getfn(&transpose_inputs_columns,module,"transpose_inputs_columns");
         getfn(&weighted_prepare_columns,module,"weighted_prepare_columns");
         getfn(&weighted_forward_columns,module,"weighted_forward_columns");
@@ -221,6 +224,7 @@ struct State {
     }
     ~State(){
         if(cuda)cuda->kp.report();
+        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p2mt\":%d,\"p3f\":%d,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p2mt_r16x!=0),int(p3f_ftab!=0),tabs_ms,tabs_why.c_str());
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -355,9 +359,9 @@ struct State {
             if(h30)m+="#define BPO_MIXED 1"+nl+"#define BPO_NH30 "+std::to_string(nh30)+nl;
             if(std::getenv("FHERMA_P2_OLD"))m+="#define BPO_P2_OLD 1"+nl;   // opt-out: pre-p2k bpo_middle_r16 addressing (pv65 p2k 0.985 on target)
             if(p1wl_env())m+="#define BPO_P1WL 1"+nl;
-            if(n==65536&&compact_roots&&k%4==0&&tabs_env("FHERMA_P1TW"))m+="#define BPO_P1TW 1"+nl;   // candidate 2 p1tw (T1 twist table)
-            if(n==65536&&tabs_env("FHERMA_P2MT"))m+="#define BPO_P2MT 1"+nl;   // candidate 2 p2mt (r16x middle twiddles)
-            if(n==65536&&tabs_env("FHERMA_P3F"))m+="#define BPO_P3F 1"+nl;   // candidate 2 p3f (F factor table)   // p1wl (default): bpo_first_x whole-line ctab / bpt layouts
+            if(n==65536&&compact_roots&&k%4==0&&tabs_env("FHERMA_P1TW"))m+="#define BPO_P1TW 1"+nl;   // p1tw (T1 twist table, kernel bpo_first_xt)
+            if(n==65536&&tabs_env("FHERMA_P2MT"))m+="#define BPO_P2MT 1"+nl;   // p2mt (r16x middle twiddles, kernel bpo_middle_r16m)
+            if(n==65536&&tabs_env("FHERMA_P3F"))m+="#define BPO_P3F 1"+nl;   // p3f (F factor table, kernel bpo_last_cm3f)
             if(std::getenv("FHERMA_P3_OLD"))m+="#define BPO_P3_OLD 1"+nl;   // opt-out: pre-p3b bpo_last_cm3 (pv67 p3b 0.994 on target)
             if(!compact_roots)m+="#define WROOT_COMPACT 0"+nl;
             if(k==16&&short_words==16&&!std::getenv("FHERMA_NO_TCCRT")){
@@ -480,24 +484,6 @@ struct State {
         if(!tc_bfrag_host.empty())tc_bfrag=device.upload(tc_bfrag_host);
         if(!tc_bpt_host.empty()){tc_bpt=device.upload(tc_bpt_host);if(p1wl_env())tc_bpt_wl=device.upload(bpt_wl_of(tc_bpt_host));}   // p1wl: whole-line copy for bpo_first_x
         if(!tc_rtw_host.empty())tc_rtw=device.upload(tc_rtw_host);
-        if(device.bpo_p1tw_on||device.bpo_p2mt_on||device.bpo_ftab_init){   // candidate 2 tables (init, outside run); a module that has a lever needs its table
-            const auto t0=std::chrono::steady_clock::now();
-            if(device.bpo_p1tw_on){const size_t RS=root_stride_host;
-                if(!tw||RS!=641||k%4!=0)throw std::runtime_error("p1tw table");
-                std::vector<u64> h(size_t(k)*RS);device.check(device.cuMemcpyDtoH(h.data(),tw,h.size()*8));std::vector<u64> o(size_t(k/4)*2*256*4);
-                for(u32 u=0;u<k/4;++u)for(u32 hh=0;hh<2;++hh)for(u32 rr=0;rr<4;++rr)for(u32 rl=0;rl<64;++rl)for(u32 tg=0;tg<4;++tg)
-                    o[((size_t(u)*2+hh)*256+64*rr+rl)*4+tg]=h[size_t(4*u+tg)*RS+129+2*(64*rr+rl)+hh];
-                p1tw_t1=device.upload(o);}
-            if(device.bpo_p2mt_on){if(!r16tab)throw std::runtime_error("p2mt table");
-                std::vector<u64> h(size_t(k)*512);device.check(device.cuMemcpyDtoH(h.data(),r16tab,h.size()*8));std::vector<u64> o(size_t(k)*1024);
-                auto b4=[](u32 i){return ((i&1u)<<3)|((i&2u)<<1)|((i&4u)>>1)|((i&8u)>>3);};
-                for(u32 r=0;r<k;++r){for(u32 x=0;x<512;++x)o[size_t(r)*1024+x]=h[size_t(r)*512+x];
-                    for(u32 i=0;i<16;++i)for(u32 c2=0;c2<16;++c2){o[size_t(r)*1024+512+16*i+c2]=h[size_t(r)*512+((c2*b4(i))&255u)];o[size_t(r)*1024+768+16*i+c2]=h[size_t(r)*512+256+((b4(c2)*i)&255u)];}}
-                p2mt_r16x=device.upload(o);}
-            if(device.bpo_ftab_init){if(!itw||!compact_roots)throw std::runtime_error("p3f table");
-                p3f_ftab=device.alloc(size_t(k)*65536*8);device.launch3(device.bpo_ftab_init,256u,k,1u,256u,itw,p,p3f_ftab);device.check(device.cuCtxSynchronize());}
-            if(std::getenv("FHERMA_TABS_TIME"))std::fprintf(stderr,"tabs init: p1tw %d p2mt %d p3f %d, %.3f ms\n",int(p1tw_t1!=0),int(p2mt_r16x!=0),int(p3f_ftab!=0),
-                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());}
         a=device.alloc(size_t(n)*l*4);b=device.alloc(size_t(n)*l*4);out=device.alloc(size_t(n)*l*4);at=device.alloc(size_t(n)*l*4);bt=device.alloc(size_t(n)*l*4);
         A=device.alloc(size_t(k)*J*n*4);B=device.alloc(size_t(k)*J*n*4);C=device.alloc(size_t(k)*J*n*4);
         if(n==65536&&k==16&&r16tab&&device.bpo_fxt_init&&device.bpo_middle_r16x&&device.bpo_p3crt_x){   // fused P3+CRT: F factor tables TH/TL
@@ -724,7 +710,7 @@ struct State {
                 for(u32 c0=0;c0<cols;c0+=p1s_cols)for(u32 u0=0;u0<k/4;u0+=p1s_quads){
                     if(!(p1s_skip&1))d.launch_ntt(d.bpo_p1a,2u*p1s_cols,1u,256u,0u,a,b,T,tw,stage_tw,tc_bpt,n,c0,p1s_cols,u0,u0+p1s_quads,pfs);
                     if(!(p1s_skip&2))d.launch3(d.bpo_p1b,p1s_cols,4u*p1s_quads,2u,256u,T,A,B,stage_tw,ctab,n,c0,p1s_cols,4u*u0,u32(off(4096)?1u:0u));}}
-            else if(!(sm&2)){}else if(pox&&!off(32)&&!off(512)&&(p1k=(p1x==2&&d.bpo_first_xv&&ctab)?d.bpo_first_xv:(p1x==1&&d.bpo_first_x&&ctab)?d.bpo_first_x:(p1x==3&&d.bpo_first_w&&ctab)?d.bpo_first_w:(!off(4096)&&!off(1024)&&ctab&&d.bpo_first_tc2g&&!std::getenv("FHERMA_P1_CTSMEM"))?d.bpo_first_tc2g:d.bpo_first_tc2n)&&tc_bpt&&r0%4==0&&pg%4==0){if(p1k&&(p1k==d.bpo_first_x||p1k==d.bpo_first_xv)){const bool wl=(p1k==d.bpo_first_x||p1k==d.bpo_first_xv)&&ctab_wl&&tc_bpt_wl;const CUtensorMap ta=p1x_map(A),tb=p1x_map(B);d.launch_ntt(p1k,cols*2u,1u,p1_threads(p1k),p1_pad(),a,b,A,B,p1tw_t1?p1tw_t1:tw,stage_tw,wl?tc_bpt_wl:tc_bpt,n,logrows,r0,p1r1,u32(!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0)|((gfl&1)?(1u<<29):(gfl&2)?(2u<<29):0u)|((gfl&4)&&p1r1<k?(1u<<28):0u)|(l2on&&(l2f&32)&&p1k==d.bpo_first_tc2g?0x80000000u:0u),(off(1024)||!ctab)?CUdeviceptr(0):(wl?ctab_wl:ctab),ta,tb);}else d.launch_ntt(p1k,cols*2u,1u,p1_threads(p1k),p1_pad(),a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,p1r1,u32(!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0)|(l2on&&(l2f&32)&&p1k==d.bpo_first_tc2g?0x80000000u:0u),(off(1024)||!ctab)?CUdeviceptr(0):ctab);}
+            else if(!(sm&2)){}else if(pox&&!off(32)&&!off(512)&&(p1k=(p1x==2&&d.bpo_first_xv&&ctab)?d.bpo_first_xv:(p1x==1&&d.bpo_first_x&&ctab)?d.bpo_first_x:(p1x==3&&d.bpo_first_w&&ctab)?d.bpo_first_w:(!off(4096)&&!off(1024)&&ctab&&d.bpo_first_tc2g&&!std::getenv("FHERMA_P1_CTSMEM"))?d.bpo_first_tc2g:d.bpo_first_tc2n)&&tc_bpt&&r0%4==0&&pg%4==0){if(p1k&&(p1k==d.bpo_first_x||p1k==d.bpo_first_xv)){const bool wl=(p1k==d.bpo_first_x||p1k==d.bpo_first_xv)&&ctab_wl&&tc_bpt_wl;const CUtensorMap ta=p1x_map(A),tb=p1x_map(B);const bool t1=p1tw_t1&&p1k==d.bpo_first_x;d.launch_ntt(t1?d.bpo_first_xt:p1k,cols*2u,1u,p1_threads(p1k),p1_pad(),a,b,A,B,t1?p1tw_t1:tw,stage_tw,wl?tc_bpt_wl:tc_bpt,n,logrows,r0,p1r1,u32(!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0)|((gfl&1)?(1u<<29):(gfl&2)?(2u<<29):0u)|((gfl&4)&&p1r1<k?(1u<<28):0u)|(l2on&&(l2f&32)&&p1k==d.bpo_first_tc2g?0x80000000u:0u),(off(1024)||!ctab)?CUdeviceptr(0):(wl?ctab_wl:ctab),ta,tb);}else d.launch_ntt(p1k,cols*2u,1u,p1_threads(p1k),p1_pad(),a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,p1r1,u32(!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0)|(l2on&&(l2f&32)&&p1k==d.bpo_first_tc2g?0x80000000u:0u),(off(1024)||!ctab)?CUdeviceptr(0):ctab);}
             else if(pox&&std::getenv("FHERMA_P1P")&&d.bpo_first_tcp&&tc_bpt&&r0%4==0&&pg%4==0)d.launch3(d.bpo_first_tcp,p1_grid,1u,1u,256u,a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,p1r1,p1_grid,2u*cols);
             else if(d.bpo_first_tc&&tc_bpt&&r0%4==0&&pg%4==0&&!std::getenv("FHERMA_PO_NOTC"))d.launch_ntt(pox&&!off(64)&&std::getenv("FHERMA_TC3")&&d.bpo_first_tc3?d.bpo_first_tc3:pox&&!off(32)&&!off(512)&&d.bpo_first_tc2n?d.bpo_first_tc2n:pox&&!off(32)&&d.bpo_first_tc2?d.bpo_first_tc2:d.bpo_first_tc,cols*2u,1u,256u,p1_pad(),a,b,A,B,tw,stage_tw,tc_bpt,n,logrows,r0,p1r1,u32(pox&&!off(2)&&!std::getenv("FHERMA_NO_L2PF")?(std::getenv("FHERMA_PF_STEP")?std::atoi(std::getenv("FHERMA_PF_STEP")):int(p1_grid)):0));
             else d.launch3(d.bpo_first,cols,2u,1u,256u,a,b,A,B,tw,stage_tw,n,logrows,r0,p1r1);mark(1);
@@ -735,12 +721,12 @@ struct State {
             const CUdeviceptr pgs_=p+size_t(s0)*4,mug=mu+size_t(s0)*8,itwg=itw+size_t(s0)*root_stride_host*8,invg=invn+size_t(s0)*J*8;
             if(!(which&1)||!(sm&8)){}else if(pox&&!off(16)&&d.bpo_middle_db&&std::getenv("FHERMA_P2DB"))d.launch3(d.bpo_middle_db,32u,J/2,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u));
             else if(fxon)d.launch3(d.bpo_middle_r16x,8u,J,gg,512u,Ag,Bg,C+size_t(s0)*J*n*4,pgs_,r16tab+size_t(s0)*512*8,fxt+size_t(s0)*40*256*8,n,(l2on&&(l2f&1)?4u:0u)|16u);
-            else if(p2r16()&&p3v2()&&mont)d.launch3(d.bpo_middle_r16,32u,J,gg,128u,Ag,Bg,Cg,pgs_,p2mt_r16x?p2mt_r16x+size_t(s0)*1024*8:r16tab+size_t(s0)*512*8,n,(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)&&!std::getenv("FHERMA_P2_NODISCARD")?8u:0u)|(mont?16u:0u));
+            else if(p2r16()&&p3v2()&&mont)d.launch3(p2mt_r16x?d.bpo_middle_r16m:d.bpo_middle_r16,32u,J,gg,128u,Ag,Bg,Cg,pgs_,p2mt_r16x?p2mt_r16x+size_t(s0)*1024*8:r16tab+size_t(s0)*512*8,n,(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)&&!std::getenv("FHERMA_P2_NODISCARD")?8u:0u)|(mont?16u:0u));
             else d.launch3(p1x==2&&d.bpo_middle_smrv?d.bpo_middle_smrv:pox&&!off(128)&&d.bpo_middle_smr?d.bpo_middle_smr:d.bpo_middle,32u,J,gg,256u,Ag,Bg,Cg,pgs_,mug,itwg,stage_tw+size_t(s0)*256*8,stage_itw+size_t(s0)*256*8,n,logrows,u32(!(p3v2()))|(pox&&std::getenv("FHERMA_P2ABL")?2u:0u)|(l2on&&(l2f&1)?4u:0u)|(l2on&&(l2f&2)?8u:0u)|(mont?16u:0u));mark(3);
             if(!(which&2)||!(sm&16)||fxon){}else if(po==2&&p3v2()&&p3r16()&&!t2n_old())d.launch3(d.bpo_last_r16,cols,gg,1u,128u,Cg,Ag,pgs_,itwg,r16tab+size_t(s0)*512*8,(mont?t2nM:t2n)+size_t(s0)*J*512*8,n,logrows);
             else if(po==2&&p3v2()){const CUfunction p3k=p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2;
                 const bool f3=p3f_ftab&&p3k==d.bpo_last_cm3&&n==65536&&logrows==8&&!(t2n_old()&&t2nO);
-                d.launch3(p3k,cols,gg,1u,256u,Cg,Ag,pgs_,f3?p3f_ftab+size_t(s0)*65536*8:itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));}
+                d.launch3(f3?d.bpo_last_cm3f:p3k,cols,gg,1u,256u,Cg,Ag,pgs_,f3?p3f_ftab+size_t(s0)*65536*8:itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));}
             else if(po==2)d.launch3(d.bpo_last_cm,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);
             else d.launch3(d.bpo_last,64u/p3h,gg,1u,256u*p3h,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);mark(4);};
             if(g2<pg&&p23db_now&&wsG2[cur_ws]&&side_streams[cur_ws]){   // P3(g) on a side stream overlaps P2(g+1); C double-buffered
@@ -830,7 +816,30 @@ struct State {
         if(d.cuDeviceGet(&dev,0)==CUDA_SUCCESS&&attr(&v,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev)==CUDA_SUCCESS&&v>0&&v<=64)return 2u;return 4u;}
     CUgraphExec graph_exec=nullptr,graph_execs[8]{};CUstream chain_streams[4]{};CUstream graph_stream=nullptr;
     // Whole batch as one CUDA graph (pointers are fixed at init): one launch per run.
+    // Candidate 3 tables (once, before the graph capture, outside run; device-side init kernels, no host copies). Any failed
+    // precondition / allocation / launch leaves that lever's pointer 0: its launch sites keep the production kernel.
+    // FHERMA_TABS_FAIL=mask (test only): forced failure, 1 p1tw, 2 p2mt, 4 p3f.
+    bool tabs_done=false,tabs_any=false;double tabs_ms=0;std::string tabs_why;
+    void build_tabs(){
+        if(tabs_done||!cuda){return;}tabs_done=true;auto& d=*cuda;
+        tabs_any=d.bpo_first_xt||d.bpo_middle_r16m||d.bpo_last_cm3f;if(!tabs_any){return;}
+        const auto t0=std::chrono::steady_clock::now();
+        const char* fe=std::getenv("FHERMA_TABS_FAIL");const unsigned long fail=fe?std::strtoul(fe,nullptr,0):0ul;
+        auto why=[&](const char* x){if(!tabs_why.empty())tabs_why+=' ';tabs_why+=x;};
+        auto make=[&](CUfunction f,u32 gx,u32 gy,u32 bx,size_t words,CUdeviceptr src,bool two,const char* nm)->CUdeviceptr{
+            CUdeviceptr o=0;
+            try{
+                if(d.cuMemAlloc(&o,words*8)!=CUDA_SUCCESS){o=0;why(nm);return 0;}
+                CUdeviceptr x=src,y=p,z=o;void* p3[]={&x,&y,&z};void* p2[]={&x,&z};
+                if(d.cuLaunchKernel(f,gx,gy,1,bx,1,1,0,nullptr,two?p2:p3,nullptr)!=CUDA_SUCCESS||d.cuCtxSynchronize()!=CUDA_SUCCESS){d.cuMemFree(o);why(nm);return 0;}
+                d.buffers.push_back(o);return o;
+            }catch(...){if(o)d.cuMemFree(o);why(nm);return 0;}};
+        if(d.bpo_first_xt){if(!d.bpo_t1_init||!tw||root_stride_host!=641||k%4||!k||(fail&1))why("p1tw:pre");else p1tw_t1=make(d.bpo_t1_init,k/4,1,512,size_t(k/4)*2*256*4,tw,true,"p1tw:cuda");}
+        if(d.bpo_middle_r16m){if(!d.bpo_r16x_init||!r16tab||n!=65536||(fail&2))why("p2mt:pre");else p2mt_r16x=make(d.bpo_r16x_init,k,1,1024,size_t(k)*1024,r16tab,true,"p2mt:cuda");}
+        if(d.bpo_last_cm3f){if(!d.bpo_ftab_init||!itw||!p||n!=65536||(fail&4))why("p3f:pre");else p3f_ftab=make(d.bpo_ftab_init,256,k,256,size_t(k)*65536,itw,false,"p3f:cuda");}
+        tabs_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();}
     void build_graph(){
+        build_tabs();
         auto& d=*cuda;
         // L2 schedule unit (default on for the pass-order point; FHERMA_L2G=0 off, =g forces g, =k hints only):
         // one P2+P3 unit = (product, g primes) whose C workspace is g*8*N words per chain; g is the largest

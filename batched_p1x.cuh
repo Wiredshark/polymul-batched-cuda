@@ -39,9 +39,6 @@
 #else
 #define BPO_X_HAS_TMA 0
 #endif
-#if defined(BPO_P1TW)&&!BPO_X_HAS_TMA
-#undef BPO_P1TW   // p1tw rewrites the S6 (TMA-path) twist only; the host passes T1 only when bpo_p1tw_on exists
-#endif
 #ifndef BPO_XF
 #ifndef BPO_X_NC
 #define BPO_X_NC 2
@@ -581,14 +578,14 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
-#ifdef BPO_P1TW   // p1tw: twist argument = P1 twist table T1[((u*2 + c/128)*256 + 64 rr + rl)*4 + tig] (lane-contiguous, 256 B)
-                static_assert(S6,"BPO_P1TW: S6 path only");
-                const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;
+#ifdef BPO_P1TW   // p1tw (flag 0x400000, kernel bpo_first_xt): twist argument = T1[((u*2 + c/128)*256 + 64 rr + rl)*4 + tig]
+                constexpr bool TW=(F&0x400000u)!=0;
+                const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;(void)t1;
 #endif
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
 #ifdef BPO_P1TW
-                    const u64 t2=t1[256u*rr];
+                    const u64 t2=TW?t1[256u*rr]:tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #else
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #endif
@@ -662,8 +659,20 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xb<BPO_XF>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
-#ifdef BPO_P1TW
-extern "C" __global__ void bpo_p1tw_on(){}   // marker: bpo_first_x / bpo_first_xv take the T1 twist table
+#if defined(BPO_P1TW)&&BPO_X_HAS_TMA&&((BPO_XF)&64)
+// p1tw entry: bpo_first_x with the S6 twist from T1 (host launches it only when T1 was built; else bpo_first_x)
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xt(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    bpo_first_xb<BPO_XF|0x400000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+// T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)
+extern "C" __global__ void __launch_bounds__(512) bpo_t1_init(const u64* twist,u64* out){
+    const u32 u=blockIdx.x,hh=threadIdx.x>>8,x=threadIdx.x&255u;
+    #pragma unroll
+    for(u32 tg=0;tg<4;++tg)out[((u*2u+hh)*256u+x)*4u+tg]=twist[(4u*u+tg)*641u+129u+2u*x+hh];
+}
 #endif
 #endif // bpo_first_x
 #ifndef BPO_LEAN
