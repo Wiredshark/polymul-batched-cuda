@@ -28,6 +28,9 @@
 //    stored with one 3-D tensor copy (box 8 words x 32 slot octets x 1 plane) by lane 0; before the next quad
 //    overwrites X, lane 0 waits for the bulk reads (wait_group.read 0).
 #if defined(BPT_ENABLE)&&defined(BPR_DT)
+#ifndef BPO_MA   // memd diag: memory twin ablation bits (patch_memd_kern.py)
+#define BPO_MA 0
+#endif
 #ifndef BPO_XA
 #define BPO_XA 0
 #endif
@@ -304,7 +307,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
             else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13)||stm==3u)){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -333,6 +336,7 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
     constexpr u32 XD=320u;
     constexpr u32 Q=2u,NI=4u/Q;   // column pairs
     const u32 l7=lane&7u;
+    if(BPO_XA!=5)   // ablation 5 (memory twin): no phase B either (TMA stores of the region as is)
     {u64 w64[4],w32[2];
         #pragma unroll
         for(u32 m=0;m<4;++m)w64[m]=st[192u+l7+8u*m];
@@ -410,9 +414,10 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
 #if BPO_X_HAS_TMA
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13)||stm==3u)&&!(BPO_XA==5&&(BPO_MA&2))){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
+        if(BPO_XA==5&&(BPO_MA&4))c&=15u;   // memd: stores into columns c mod 16 (L2-resident window)
         #pragma unroll
         for(u32 n=0;n<4;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
             if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
@@ -429,13 +434,9 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr bool S6=(F&64)!=0;
     constexpr u32 XD=(F&96)?320u:288u,XS=(F&96)?8*320:8*288+32;   // 128 B aligned (prime,digit) regions
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
-#ifdef BPO_P1WP
-    const u32 id=(F&0x1000000u)?bpo_wp_sid:blockIdx.x,c=id&255u,op=id>>8;   // sched diag: work-pulled tile
-#else
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
-#endif
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
-    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
+    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(c&15u):c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores); 12: columns c mod 16 (L2-resident window)
     u32* dst=op?B:A;
     if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
@@ -448,7 +449,14 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
-    const u32 xoff=((BPO_XA==11?0u:c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
+    const u32 xoff=((BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(c&15u):c)*L)&3u;
+    if(BPO_XA==5&&(BPO_MA&32)){   // memd: the block's input bytes (256 x L words) as one contiguous whole-line LDG.128 stream, then exit
+        const uint4* q4=reinterpret_cast<const uint4*>((op?b:a)+u64(c)*256u*L);u32 acc=0;
+        #pragma unroll 4
+        for(u32 x=h;x<64u*L;x+=256u){const uint4 v=__ldcs(q4+x);acc^=v.x^v.y^v.z^v.w;}
+        if(acc==0x9e3779b9u&&stm==3u)dst[h]=acc;   // never taken (stm 3 is never set): keeps the loads live
+        return;
+    }   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
     const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
         u32 mk[8][2];   // flag 4096: per-thread masks of the partial fragment words (clamped funnel shift: 2^wd-1, 0 or ~0)
@@ -461,6 +469,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         for(u32 mt=0;mt<MT;++mt){
             if(mt)__syncthreads();
             const u32* hs=src+u64(mt*128u*256u)*L;
+            if(BPO_XA==13){}else   // ablation 13: no input loads (smem left as is)
             if(ca){   // flag 512: all 16 B chunks of the half in flight at once (cp.async, one DRAM/L2 round trip)
                 const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
                 u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
@@ -525,7 +534,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             }
     }
     if(pfstep&&h<256u&&id+pfstep<512u){
-        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*L+u64(h*256u)*L;
+        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64((BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(pf&15u):(pf&255u))*L+u64(h*256u)*L;
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+L-1));
@@ -586,11 +595,6 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
-#if (defined(BPO_P1WP)||defined(BPO_P2WP)||defined(BPO_P3WP)||defined(BPO_CRTWP))&&!defined(BPO_WP_CTR_DECL)
-#define BPO_WP_CTR_DECL 1
-__device__ unsigned bpo_wp_ctr[4096];   // sched diag: per-launch work counters (zeroed by the host once per graph run)
-__shared__ unsigned bpo_wp_sid;          // the block's current tile
-#endif
 #ifdef BPO_P1TW   // p1tw (flag 0x400000, kernel bpo_first_xt): twist argument = T1[((u*2 + c/128)*256 + 64 rr + rl)*4 + tig]
                 constexpr bool TW=(F&0x400000u)!=0;
                 const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;(void)t1;
@@ -636,12 +640,7 @@ __shared__ unsigned bpo_wp_sid;          // the block's current tile
             constexpr u32 NC=BPO_X_NC;
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
-            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),
-#ifdef BPO_P1EL   // sched diag: quads 2-3 (P2 group 1, read second under p1rev) stored evict_last
-                (u>=2u)?2u:stm);
-#else
-                stm);
-#endif   // flag 131072: one pass
+            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
             else{
             #pragma unroll
             for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;
@@ -693,22 +692,6 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xb<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
-}
-#endif
-#if defined(BPO_P1WP)&&defined(BPO_P1RV)
-// sched diag: work-pulling persistent bpo_first_xr (grid = resident slots; tiles 0..511 from bpo_wp_ctr[logR >> 8])
-extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xw(const u32* a,const u32* b,u32* A,u32* B,
-    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
-    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
-    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
-    unsigned* const ctr=bpo_wp_ctr+(logR>>8);
-    for(;;){
-        __syncthreads();
-        if(threadIdx.x==0)bpo_wp_sid=atomicAdd(ctr,1u);
-        __syncthreads();
-        if(bpo_wp_sid>=512u)break;
-        bpo_first_xb<BPO_XF|0x400000u|0x800000u|0x1000000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
-    }
 }
 #endif
 // T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)

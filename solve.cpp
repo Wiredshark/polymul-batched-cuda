@@ -999,7 +999,7 @@ struct State {
         std::vector<double> a,b,q;timed(prod);timed(ge);
         for(int i=0;i<R;++i){double x,y;if(i&1){y=timed(ge);x=timed(prod);}else{x=timed(prod);y=timed(ge);}a.push_back(x);b.push_back(y);q.push_back(y/x);}
         auto med=[](std::vector<double> z){std::sort(z.begin(),z.end());return z[z.size()/2];};
-        std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"med_us\":%.1f,\"min_us\":%.1f,\"prod_us\":%.1f,\"vs_prod\":%.4f,\"d_us\":%.1f,\"ex\":%d,\"n\":%d,\"cap_ms\":%.0f,\"s\":%.2f}\n",
+        if(!o.quiet)std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"med_us\":%.1f,\"min_us\":%.1f,\"prod_us\":%.1f,\"vs_prod\":%.4f,\"d_us\":%.1f,\"ex\":%d,\"n\":%d,\"cap_ms\":%.0f,\"s\":%.2f}\n",
             name,med(b),*std::min_element(b.begin(),b.end()),med(a),med(q),med(b)-med(a),ex,R,cap_ms,std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());std::fflush(stdout);
         d.cuCtxSynchronize();gxdestroy(ge);for(auto e:evs)edestroy(e);edestroy(ea);edestroy(eb);
         BatchRes res;res.ok=true;res.ex=ex;res.vs=med(q);res.med=med(b);res.prod=med(a);return res;
