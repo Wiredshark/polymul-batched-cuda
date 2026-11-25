@@ -304,7 +304,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
             else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&(BPO_XA!=12||stm==3u)){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -410,7 +410,7 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
 #if BPO_X_HAS_TMA
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&(BPO_XA!=12||stm==3u)){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11){
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -431,7 +431,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
-    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:BPO_XA==12?(c&15u):c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores); 12: columns c mod 16 (L2-resident window)
+    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
     if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
@@ -444,7 +444,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
-    const u32 xoff=((BPO_XA==11?0u:BPO_XA==12?(c&15u):c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
+    const u32 xoff=((BPO_XA==11?0u:c)*L)&3u;   // flag 512: word offset of every row start in its 16 B chunk (256 L words per row step)
     const bool ca=(F&512)&&((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);   // flag 512 needs a 16 B aligned operand base
     if((F&256)&&S6&&MT==2){   // flag 256: coalesced row loads of 128-row halves into X, fragments built from smem
         u32 mk[8][2];   // flag 4096: per-thread masks of the partial fragment words (clamped funnel shift: 2^wd-1, 0 or ~0)
@@ -521,7 +521,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             }
     }
     if(pfstep&&h<256u&&id+pfstep<512u){
-        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(BPO_XA==12?(pf&15u):(pf&255u))*L+u64(h*256u)*L;
+        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*L+u64(h*256u)*L;
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+L-1));
