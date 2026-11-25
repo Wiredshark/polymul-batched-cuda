@@ -1,16 +1,23 @@
 // Exact RNS/NTT multiplication. Setup sees parameters only; all input-dependent
 // Batched answer: fherma_h2d/fherma_d2h move bytes only; fherma_run is device compute for all B products.
 //
-// Device keep-alive (candidate 11). fherma_init starts one host thread that, until the process exits, launches a
-// small spin kernel (ka_spin: a clock64-bounded integer loop in registers, about 20 ms per launch, no memory access)
-// back to back on its own non-blocking stream. It does none of the computation: it reads and writes no input,
-// output or work buffer. Nothing in fherma_h2d, fherma_run or fherma_d2h starts, stops, signals or waits for it;
-// fherma_run waits only for its own graph stream. Why: between cases the device is otherwise idle for seconds and
-// its SM clock falls to the idle state; a 14.6 ms case ends before the clock governor has ramped back up, so every
-// case would run at the idle clock. Keeping the device lightly busy keeps the clock at its boosted state.
-// Level (KA_DEFAULT below, FHERMA_KA=<0..3> overrides): 0 off, 1 one 32-thread block, 2 one 32-thread block per SM,
-// 3 four 256-thread blocks per SM. Any failure creating it (kernel JIT, stream, events, thread) leaves it off and is
-// named in the tabs line ("ka" = level in use, "fallback" = the failure).
+// Device keep-warm (candidate 12a). It does none of the computation. fherma_init creates one host thread and, as
+// its last step, starts the warm load: the thread launches a small spin kernel (ka_spin: a clock64-bounded integer
+// loop in registers, about 5 ms per launch, no memory access at all) back to back on its own stream. It reads and
+// writes no operand, result or pipeline scratch buffer of any call. Lifecycle, between calls only:
+//   - first statement of fherma_h2d: ask the thread to stop and wait (at most 100 ms) until it reports that no spin
+//     kernel is queued or running; on timeout the keep-warm is switched off for the rest of the process ("ka:stop");
+//   - fherma_h2d (after that wait), fherma_run and fherma_d2h then run with nothing of it on the device;
+//   - last statement of fherma_d2h, after its copy has completed: restart the warm load.
+// fherma_run does not touch it, except on a path the ranked harness does not take: if fherma_run is entered while the
+// warm load runs (a caller that skips the hooks), it is stopped and waited for first and restarted on exit.
+// Why: between cases the device is otherwise idle for seconds and its SM clock drops to the idle state; a 14.6 ms
+// case ends before the clock governor ramps back up. This follows the pattern cleared in the challenge discussion
+// (a setup thread keeping the device warm on private work while the harness is between calls, stopped and waited
+// for at the start of fherma_h2d). Level (KA_DEFAULT below, FHERMA_KA=<0..3> overrides; same lifecycle at every
+// level): 0 off, 1 one 32-thread block, 2 one 32-thread block per SM, 3 four 256-thread blocks per SM. Any failure
+// (kernel JIT, stream, events, thread, launch, stop timeout) leaves it off and is named in the tabs line ("ka" =
+// level in use, "kaw" = longest stop wait in fherma_h2d in microseconds, "fallback" = the failure).
 #include "fherma.h"
 #include "host_registration.h"
 #include "owned_pinned_vector_pool.h"
@@ -38,7 +45,7 @@
 #include <functional>
 #include <atomic>
 #ifndef KA_DEFAULT
-#define KA_DEFAULT 1
+#define KA_DEFAULT 3
 #endif
 #ifndef PIN_DEFAULT
 #define PIN_DEFAULT 4   // candidate 10c: default chain-phase pin pattern (pairbar_crt)
@@ -346,7 +353,7 @@ struct State {
         if(ht_run.on&&ht_run.c)std::fprintf(stderr,"{\"hostt\":true,\"n\":%d,\"stage\":%d,\"crew\":%u,\"chunk_mb\":%zu,\"run_pre_us\":%.1f,\"launch_us\":%.1f,\"out_us\":%.1f,\"sync_us\":%.1f,\"run_us\":%.1f,\"h2d_us\":%.0f,\"d2h_us\":%.0f,\"h2d_cp\":%.0f,\"h2d_wait\":%.0f,\"d2h_cp\":%.0f,\"d2h_wait\":%.0f}\n",
             ht_run.c,int(stg.ok),stg.crew?stg.crew->size():0u,stg.chunk>>20,ht_run.med(0),ht_run.med(1),ht_run.med(2),ht_run.med(3),ht_run.med(4),ht_hook.med(0),ht_hook.med(1),ht_hook.med(2),ht_hook.med(3),ht_hook.med(4),ht_hook.med(5));
         free_stage();
-        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"pin\":%d,\"ka\":%d,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,pin_ok?pin_pat:0,ka_used,tabs_ms,tabs_why.c_str());
+        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"pin\":%d,\"ka\":%d,\"kaw\":%.0f,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,pin_ok?pin_pat:0,ka_used,ka_wmax,tabs_ms,tabs_why.c_str());
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -703,6 +710,7 @@ struct State {
     }
     // Byte copies only: caller vectors -> buffers allocated in init.
     void h2d(const fherma::Inputs& in){
+        ka_pause(true);   // keep-warm: stop and wait (comment block at the top)
         const auto t0=std::chrono::steady_clock::now();ht_cp=ht_wait=0;
         check_shape(in.a,"a");check_shape(in.b,"b");
         auto& d=*cuda;const size_t bytes=size_t(bcount)*n*l*4;
@@ -717,6 +725,7 @@ struct State {
         if(stg.ok)stage_down(reinterpret_cast<char*>(answer.c.data.data()),out_all,bytes);
         else d.check(d.cuMemcpyDtoH(answer.c.data.data(),out_all,bytes));
         {const double x[6]={ht_h2d_last,us_since(t0),ht_h2d_cp,ht_h2d_wait,ht_cp,ht_wait};ht_hook.add(x,6);}
+        ka_resume();   // keep-warm: restart after the copy completed (comment block at the top)
         return answer;
     }
     // One product: device a,b (row-major N x L) -> device out (row-major N x L).
@@ -976,7 +985,7 @@ struct State {
     void pin_post(){if(pin_cur<0)return;++pin_m;pin_rec(pin_cur,pin_m);}
     void pin_why(const char* x){if(!tabs_why.empty())tabs_why+=' ';tabs_why+=x;}
     // ---- device keep-alive (see the comment block at the top of this file)
-    int ka_level=0;std::thread ka_th;std::atomic<bool> ka_quit{false},ka_err{false};CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_fn=nullptr;int ka_sms=1;
+    int ka_level=0;std::thread ka_th;std::mutex ka_mx;std::condition_variable ka_cv;std::atomic<bool> ka_quit{false},ka_err{false},ka_want{false},ka_idle{true},ka_off{false};double ka_wmax=0;CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_fn=nullptr;int ka_sms=1;
     bool ka_prepare(){
         auto& d=*cuda;auto& D=d.driver;
         const char* src="extern \"C\" __global__ void ka_spin(long long cyc){const long long t0=clock64();unsigned x=threadIdx.x+blockIdx.x;\n"
@@ -996,22 +1005,45 @@ struct State {
         auto ec=D.get<decltype(&::cuEventCreate)>("cuEventCreate");
         for(auto& e:ka_ev)if(!ec||ec(&e,CU_EVENT_BLOCKING_SYNC|CU_EVENT_DISABLE_TIMING)!=CUDA_SUCCESS){e=nullptr;pin_why("ka:event");return false;}
         return true;}
-    // the thread: launch k, record ev[k%2], then wait (blocking, the thread sleeps) for launch k-1: one launch always queued
+    // the thread: while asked to run, launch k, record ev[k%2], then wait (blocking, the thread sleeps) for launch k-1;
+    // when asked to stop, wait for the last two launches, then report idle (nothing queued or running) and sleep.
     void ka_loop(int lv){
         auto& d=*cuda;auto& D=d.driver;auto setc=D.get<decltype(&::cuCtxSetCurrent)>("cuCtxSetCurrent");auto er=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
         auto es=D.get<decltype(&::cuEventSynchronize)>("cuEventSynchronize");
-        if(!setc||!er||!es||setc(d.context)!=CUDA_SUCCESS){ka_err=true;return;}
-        const unsigned gx=lv==1?1u:lv==2?unsigned(ka_sms):unsigned(ka_sms)*4u,bx=lv==3?256u:32u;long long cyc=40000000ll;void* a[]={&cyc};const unsigned gl=(ka_fail&1024ul)?0u:gx;   // bit 1024: forced launch failure
-
-        unsigned k=0;
-        for(;!ka_quit.load(std::memory_order_relaxed);++k){
-            if(d.cuLaunchKernel(ka_fn,gl,1,1,bx,1,1,0,ka_s,a,nullptr)!=CUDA_SUCCESS||er(ka_ev[k&1u],ka_s)!=CUDA_SUCCESS){ka_err=true;break;}
-            if(k>0&&es(ka_ev[(k-1)&1u])!=CUDA_SUCCESS){ka_err=true;break;}}
-        if(k>0)es(ka_ev[(k-1)&1u]);
-        if(k>1)es(ka_ev[(k-2)&1u]);}
-    void ka_start(int lv){if(lv<=0||!ka_fn||ka_th.joinable())return;ka_quit=false;ka_err=false;
+        auto idle=[&]{std::lock_guard<std::mutex> g(ka_mx);ka_idle=true;ka_cv.notify_all();};
+        if(!setc||!er||!es||setc(d.context)!=CUDA_SUCCESS){ka_err=true;idle();return;}
+        const unsigned gx=lv==1?1u:lv==2?unsigned(ka_sms):unsigned(ka_sms)*4u,bx=lv==3?256u:32u;long long cyc=10000000ll;void* a[]={&cyc};
+        const unsigned gl=(ka_fail&1024ul)?0u:gx;   // FHERMA_TABS_FAIL bit 1024: forced launch failure
+        const bool deaf=(ka_fail&2048ul)!=0;        // bit 2048: ignores stop requests (forced stop timeout)
+        for(;;){
+            {std::unique_lock<std::mutex> lk(ka_mx);ka_cv.wait(lk,[&]{return ka_quit.load()||ka_want.load();});if(ka_quit.load())break;}
+            unsigned k=0;bool bad=false;
+            for(;!ka_quit.load()&&(deaf||ka_want.load());++k){
+                if(d.cuLaunchKernel(ka_fn,gl,1,1,bx,1,1,0,ka_s,a,nullptr)!=CUDA_SUCCESS||er(ka_ev[k&1u],ka_s)!=CUDA_SUCCESS){bad=true;break;}
+                if(k>0&&es(ka_ev[(k-1)&1u])!=CUDA_SUCCESS){bad=true;break;}}
+            if(k>0)es(ka_ev[(k-1)&1u]);
+            if(k>1)es(ka_ev[(k-2)&1u]);
+            if(bad){ka_err=true;break;}
+            idle();}
+        idle();}
+    void ka_start(int lv){if(lv<=0||!ka_fn||ka_th.joinable())return;ka_quit=false;ka_err=false;ka_idle=true;ka_want=false;
         try{ka_th=std::thread([this,lv]{ka_loop(lv);});ka_level=lv;}catch(...){ka_level=0;pin_why("ka:thread");}}
-    void ka_stop(){ka_quit=true;if(ka_th.joinable())ka_th.join();if(ka_err&&ka_level){pin_why("ka:run");ka_used=0;}ka_level=0;}
+    // stop and wait (bounded): first statement of fherma_h2d (rec = true: counts toward "kaw"); fherma_run entry path
+    void ka_pause(bool rec){if(!ka_th.joinable()||ka_off.load())return;
+        try{const auto t0=std::chrono::steady_clock::now();bool ok=false;
+            {std::unique_lock<std::mutex> lk(ka_mx);ka_want=false;ka_cv.notify_all();ok=ka_cv.wait_for(lk,std::chrono::milliseconds(100),[&]{return ka_idle.load();});
+             if(!ok){ka_off=true;ka_quit=true;ka_cv.notify_all();}}
+            if(rec)ka_wmax=std::max(ka_wmax,std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t0).count());
+            if(!ok)pin_why("ka:stop");
+        }catch(...){ka_off=true;ka_quit=true;pin_why("ka:stop");}}
+    // restart: last statement of fherma_d2h (after its copy completed); end of fherma_init; fherma_run exit path
+    void ka_resume(){if(!ka_th.joinable()||ka_off.load()||ka_err.load())return;
+        try{std::lock_guard<std::mutex> g(ka_mx);ka_idle=false;ka_want=true;ka_cv.notify_all();}catch(...){ka_off=true;pin_why("ka:start");}}
+    void ka_stop(){try{std::lock_guard<std::mutex> g(ka_mx);ka_quit=true;ka_want=false;ka_cv.notify_all();}catch(...){ka_quit=true;}
+        if(ka_th.joinable()){ka_th.join();}
+        if(ka_err.load()&&ka_level){pin_why("ka:run");}
+        if(ka_err.load()||ka_off.load()){ka_used=0;}
+        ka_level=0;}
     int ka_used=0;unsigned long ka_fail=0;
     void ka_init(){
         int lv=KA_DEFAULT;
@@ -1019,7 +1051,7 @@ struct State {
             if(const char* e=std::getenv("FHERMA_KA")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>3)pin_why("ka:env");else lv=int(v);}
             {const char* fe=std::getenv("FHERMA_TABS_FAIL");ka_fail=fe?std::strtoul(fe,nullptr,0):0ul;if(lv>0&&(ka_fail&256ul)){lv=0;pin_why("ka:force");}}
             if(lv>0&&!ka_prepare())lv=0;
-            ka_start(lv);ka_used=ka_level;
+            ka_start(lv);ka_used=ka_level;ka_resume();   // the warm load starts as the last step of fherma_init
         }catch(...){ka_used=0;pin_why("ka:init");}}
     void ka_close(){ka_stop();auto& D=cuda->driver;
         auto sd=D.get<decltype(&::cuStreamDestroy)>("cuStreamDestroy_v2");auto ed=D.get<decltype(&::cuEventDestroy)>("cuEventDestroy_v2");
@@ -1147,6 +1179,7 @@ struct State {
         return std::getenv("FHERMA_V14")?0:4;}   // default: pass-order, column-major, chains, P2->P3 untwiddle, P1 L2 prefetch
     fherma::Outputs run(const fherma::Inputs& in){
         (void)in;  // inputs already on the device (h2d)
+        const bool ka_r=ka_th.joinable()&&!ka_off.load()&&ka_want.load();if(ka_r)ka_pause(false);   // not on the ranked path (h2d stopped it)
         const auto r0=std::chrono::steady_clock::now();auto r1=r0,r2=r0;
         auto& d=*cuda;const size_t stride=size_t(n)*l*4,count=size_t(bcount)*n*l;
         d.kp.collect();  // previous call not yet read (no d2h in between)
@@ -1171,6 +1204,7 @@ struct State {
         d.kp.run_end();
         {auto us=[](std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();};
          const double x[5]={us(r0,r1),us(r1,r2),us(r2,r3),us(r3,r4),us(r0,r4)};ht_run.add(x,5);}
+        if(ka_r)ka_resume();
         return result;
     }
     // Bench-only helpers (not part of the official entry points).
