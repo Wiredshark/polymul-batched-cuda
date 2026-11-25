@@ -195,6 +195,7 @@ inline void* ordinary_allocate(std::size_t bytes){
         auto handler=std::get_new_handler();if(!handler)throw std::bad_alloc();handler();}
 }
 }
+#if defined(FHERMA_POOL_NEW)   // candidate 8: replacement only in an explicit build (default: none)
 void* operator new(std::size_t bytes){
     auto* pool=owning_pinned_vector::selected_pool;
     if(pool&&pool->matches(bytes))return pool->acquire();
@@ -206,3 +207,4 @@ void operator delete(void* address,std::size_t) noexcept {owning_pinned_vector::
 void* operator new[](std::size_t bytes){return ::operator new(bytes);}
 void operator delete[](void* address) noexcept {owning_pinned_vector::release(address);}
 void operator delete[](void* address,std::size_t) noexcept {owning_pinned_vector::release(address);}
+#endif

@@ -28,12 +28,13 @@ foreach(WEIGHTED_HEADER weighted_prepare.cuh weighted_ntt.cuh weighted_crt.cuh c
 endforeach()
 configure_file(kernel_source.h.in kernel_source.h @ONLY)
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${CUDA_HEADER_DIR})
-target_link_libraries(solution PRIVATE ${CMAKE_DL_LIBS})
+find_package(Threads REQUIRED)
+target_link_libraries(solution PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(solution PRIVATE -Wall -Wextra)
 
 # Local-only throughput bench (not part of the official build target).
 if(FHERMA_LOCAL_BENCH)
   add_executable(bench_batched ${FHERMA_LOCAL_BENCH} solve.cpp)
   target_include_directories(bench_batched PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${CUDA_HEADER_DIR})
-  target_link_libraries(bench_batched PRIVATE ${CMAKE_DL_LIBS})
+  target_link_libraries(bench_batched PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
