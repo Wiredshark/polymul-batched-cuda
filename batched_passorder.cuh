@@ -976,6 +976,40 @@ template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],
     #pragma unroll
     for(u32 j=0;j<8;++j){if(j)phdit(v[j],v[j+8],t[16*j],p,p2);else phdit1(v[0],v[8],p2);}
 }
+// p2lz (kernel bpo_middle_r16z; host switch FHERMA_P2LZ=1, default off): the FIRST DIF16 of each operand starts from the
+// canonical A/B words ([0,p): P1's cross-twiddle output, also with p1lz), so the Harvey invariant [0,2p) is needed later
+// than r16_dif16h assumes. Bounds (units of p; H path only, p < 2^30 so every value < 4p < 2^32):
+//  S1 (j, j+8), a,b < 1: X = a+b < 2; Y = Shoup(a+p-b) < 2 (j > 0), Y = a+p-b in (0,2) (j = 0)            [no correction]
+//  S2 (h+j, h+j+4), a,b < 2: X = a+b < 4; Y = Shoup(a+2p-b) < 2 (j > 0), Y = a+2p-b in (0,4) (j = 0)       [no correction]
+//  S3 entering bounds per 4-group: h = 0, 8: [4,4,4,4]; h = 4, 12: [4,2,2,2]. Each input with bound 4 is reduced once
+//     (min(x, x-2p) -> < 2) before its butterfly; X = a+b < 4, Y = a+2p-b in (0,4) (trivial) or Shoup < 2 (twiddled)
+//  S4 entering bounds per 4-group [4,4,4,2]: inputs with bound 4 reduced (-> < 2); X = a+b < 4, Y = a+2p-b in (0,4)
+//  output: every word < 4p (r16_dif16h: < 2p). The middle-twiddle Shoup (lazy: any u32 input) maps words 1-15 to < 2p and
+//  word 0 is reduced once (min(x, x-2p)): every word < 2p before the transpose = the second DIF16's input contract.
+//  Corrections per DIF16: 22 (r16_dif16h: 47); per thread and operand 23 with the word-0 reduction.
+__device__ __forceinline__ void r16_dif16z(u32 (&va)[16],u32 (&vb)[16],const u64* t,u32 p,u32 p2){   // both operands, twiddles loaded once
+    u64 w16[8],w32[4];
+    #pragma unroll
+    for(u32 j=1;j<8;++j)w16[j]=t[16*j];
+    #pragma unroll
+    for(u32 j=1;j<4;++j)w32[j]=t[32*j];
+    const u64 w64=t[64];
+    auto one=[&](u32 (&v)[16]){
+    #pragma unroll
+    for(u32 j=0;j<8;++j){const u32 a=v[j],b=v[j+8];v[j]=a+b;v[j+8]=j?pxmshl(a+p-b,w16[j],p):a+p-b;}   // S1
+    #pragma unroll
+    for(u32 h=0;h<16;h+=8)
+        #pragma unroll
+        for(u32 j=0;j<4;++j){const u32 a=v[h+j],b=v[h+j+4];v[h+j]=a+b;v[h+j+4]=j?pxmshl(a+p2-b,w32[j],p):a+p2-b;}   // S2
+    #pragma unroll
+    for(u32 h=0;h<16;h+=4){const bool all4=(h&4u)==0u;   // S3
+        {u32 a=pxadd(v[h],0u,p2),b=v[h+2];if(all4)b=pxadd(b,0u,p2);v[h]=a+b;v[h+2]=a+p2-b;}
+        {u32 a=v[h+1],b=v[h+3];if(all4){a=pxadd(a,0u,p2);b=pxadd(b,0u,p2);}v[h+1]=a+b;v[h+3]=pxmshl(a+p2-b,w64,p);}}
+    #pragma unroll
+    for(u32 h=0;h<16;h+=2){const u32 a=pxadd(v[h],0u,p2),b=(h&2u)?v[h+1]:pxadd(v[h+1],0u,p2);v[h]=a+b;v[h+1]=a+p2-b;}   // S4
+    };
+    one(va);one(vb);
+}
 #ifndef BPO_P2_OLD
 // p2k (default; pv65 on-target whole batch 0.985, round-20 sweep line p2k): same arithmetic as the old body, addressing only:
 // smem transposes as one base pointer + immediates (old: IADD3 + LEA per element, 16 live address registers), A/B/C rows as
@@ -988,10 +1022,13 @@ __device__ __forceinline__ u64 bpo_tw8(const char* tb,u32 s8,u32 k){return __ldg
 #ifdef BPO_P2CU   // p2cu (kernel bpo_middle_r16c): per prime 256 words, [0,128) = r16[0,128), [128,256) = r16[256,384) (the
 // radix-16 stage twiddles tf / ti actually read: t[16 j], t[32 j], t[64]); 32 KB for K = 16; filled by the host (build_tabs)
 __constant__ unsigned long long bpo_p2cu[BCRT_K*256];
-template<bool H,bool MT=false,bool CU=false>
+#define BPO_R16LZ LZ
+template<bool H,bool MT=false,bool CU=false,bool LZ=false>
 #elif defined(BPO_P2MT)
+#define BPO_R16LZ false
 template<bool H,bool MT=false>
 #else
+#define BPO_R16LZ false
 template<bool H>
 #endif
 __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
@@ -1017,11 +1054,17 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     const u32 off=g*2048u+c2*8u+s;
     u32 a[16],b[16];
     {   const u32* a0=A+base+off;const u32* b0=B+base+off;
+        if(BPO_R16LZ){   // p2lz: streaming loads only (host: r16z only with untw bit 4); the runtime ldcs / plain choice made
+            // ptxas rebuild the 64-bit address of every load in this instantiation (census: +58..+105 slots)
+            #pragma unroll
+            for(u32 c1=0;c1<16;++c1){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}}
+        else{
         #pragma unroll
-        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
+        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}}
     }
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
-    r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);
+    if(BPO_R16LZ&&H){r16_dif16z(a,b,BPO_P2TF,p,p2);}   // p2lz: words < 4p
+    else{r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);}
     u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
     u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
     #pragma unroll
@@ -1030,6 +1073,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
 #else
     for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
 #endif
+    if(BPO_R16LZ&&H){a[0]=pxadd(a[0],0u,p2);b[0]=pxadd(b[0],0u,p2);}   // p2lz: word 0 < 4p -> < 2p (words 1-15: lazy Shoup < 2p)
     #pragma unroll
     for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
     __syncthreads();   // every thread's A/B loads have completed (values consumed above)
@@ -1068,6 +1112,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
 }
 #undef BPO_P2TF
 #undef BPO_P2TI
+#undef BPO_R16LZ
 #ifdef BPO_P2MT
 // p2mt entry: bpo_middle_r16 with the r16x middle twiddles (host launches it only when r16x was built; else bpo_middle_r16)
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16m(const u32* A,const u32* B,u32* C,
@@ -1088,6 +1133,17 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16c(const u32* A,c
 #endif
     bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
 }
+#ifdef BPO_P2LZ
+// p2lz entry: bpo_middle_r16c with the first DIF16 of r16_dif16z for the primes < 2^30 (host: FHERMA_P2LZ=1; else r16c)
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16z(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    __shared__ u32 TA[8*292];
+#if BPO_NH30
+    if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true,true,true,true>(TA,A,B,C,primes,r16,N,untw);else
+#endif
+    bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
+}
+#endif
 #endif
 // r16x init (once): per prime [0,512) = r16, [512+16i+c2] = r16[(c2 brev4(i))&255], [768+16i+c2] = r16[256+((brev4(c2) i)&255)]; grid K, 1024 threads
 extern "C" __global__ void __launch_bounds__(1024) bpo_r16x_init(const u64* r16,u64* out){

@@ -681,6 +681,297 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     bpo_first_xb<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif
+#if defined(BPO_P1LZ)&&defined(BPO_P1RV)
+// ---- p1lz (kernel bpo_first_xz; host switch FHERMA_P1LZ=1, default off): bpo_first_xr with lazy (Harvey) arithmetic on
+// the prime quads whose four primes are all < 2^30 (4u + 3 < BPO_NH30: quads 0-2 of the h30 set); the 31-bit quad runs the
+// canonical code (same template, LZ = false). Bounds for LZ (p < 2^30, so 4p < 2^32; values in units of p):
+//  Z0 base conversion r = lo - q p in [0,2p) (unchanged; header comment of this file).
+//  Z1 lazy Shoup zmsh(x, w) = x w - q p in [0,2p) for ANY 32-bit x (w' = floor(w 2^32 / p) in the high word). No correction:
+//     the twist product drops xmsh's min(r, r-p).
+//  Z2 GS butterfly, a, b in [0,2p): X' = min(s, s-2p), s = a+b < 4p -> [0,2p) (one correction, as xadd's);
+//     Y' = zmsh(a + 2p - b, w), argument in (0,4p) < 2^32 -> [0,2p): xmsh's correction dropped.
+//  Z3 trivial (psi^0) butterfly: X' as Z2; Y' = min(d, d-2p), d = a + 2p - b in (0,4p) -> [0,2p) (as xsub's: no change).
+//  Z4 invariant: every value kept in registers, written to X (smem) or read back is in [0,2p) (Z0-Z3 preserve it).
+//  Z5 last R-DIF stage without the fused cross twiddle (!(F&1)): X' = a+b < 4p unreduced (consumer is a Shoup product).
+//  Z6 cross twiddle (with the fused psi^0 stage, flag 1): xmsh(a+b, w) and xmsh(a+2p-b, w), arguments < 4p < 2^32;
+//     canonical output min(r, r-p), r in [0,2p) -> [0,p): the A/B words are bit-identical to bpo_first_xr's (canonical
+//     residues), so P2's input contract is unchanged.
+// Dropped per (prime, column): the Y-side correction of every twiddled butterfly and the twist correction.
+#ifndef BPO_NH30
+#define BPO_NH30 0
+#endif
+struct ZP2{u32 v[BCRT_K];};
+__host__ __device__ constexpr ZP2 zp2_make(){ZP2 a{};constexpr u32 P[BCRT_K]={BCRT_PRIMES};for(u32 i=0;i<BCRT_K;++i)a.v[i]=2u*P[i];return a;}
+__constant__ ZP2 bpr_p2=zp2_make();   // 2p per prime (wraps for 31-bit primes: used only by LZ quads, p < 2^30)
+__device__ __forceinline__ u32 zr2(u32 s,u32 p2){return min(s,s-p2);}
+__device__ __forceinline__ u32 zmsh(u32 x,u64 c,u32 p){const u32 q=__umulhi(x,u32(c>>32));return x*u32(c)-q*p;}   // Z1
+template<bool LZ>__device__ __forceinline__ void zbf(u32& x,u32& y,u64 w,u32 p,u32 p2){
+    if(LZ){const u32 a=x,b=y;x=zr2(a+b,p2);y=zmsh(a+p2-b,w,p);}else xbf(x,y,w,p);}   // Z2
+template<bool LZ,bool TRIV>__device__ __forceinline__ void zbft(u32& x,u32& y,const u64& w,u32 p,u32 p2){
+    if(!TRIV)zbf<LZ>(x,y,w,p,p2);else if(LZ){const u32 a=x,b=y;x=zr2(a+b,p2);y=zr2(a+p2-b,p2);}else xbf1(x,y,p);}   // Z3
+template<u32 F,bool LZ>__device__ __forceinline__ void zjdif(u32 (&x8)[8],const u64* st,u32 p,u32 p2){
+    constexpr bool T=(F&1)!=0;
+    zbft<LZ,T>(x8[0],x8[4],st[0],p,p2);zbf<LZ>(x8[1],x8[5],st[32],p,p2);zbf<LZ>(x8[2],x8[6],st[64],p,p2);zbf<LZ>(x8[3],x8[7],st[96],p,p2);
+    const u64 w0=st[0],w64=st[64];
+    zbft<LZ,T>(x8[0],x8[2],w0,p,p2);zbf<LZ>(x8[1],x8[3],w64,p,p2);zbft<LZ,T>(x8[4],x8[6],w0,p,p2);zbf<LZ>(x8[5],x8[7],w64,p,p2);
+    zbft<LZ,T>(x8[0],x8[1],w0,p,p2);zbft<LZ,T>(x8[2],x8[3],w0,p,p2);zbft<LZ,T>(x8[4],x8[5],w0,p,p2);zbft<LZ,T>(x8[6],x8[7],w0,p,p2);
+}
+// xrdif6q with LZ (same layout, twiddles and TMA burst; arithmetic per Z1-Z6)
+template<u32 F,bool LZ>
+__device__ __forceinline__ void zrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm,const u32 p2){
+    constexpr bool T=(F&1)!=0;
+    constexpr u32 XD=320u;
+    constexpr u32 Q=2u,NI=4u/Q;
+    (void)p2;
+    const u32 l7=lane&7u;
+    {u64 w64[4],w32[2];
+        #pragma unroll
+        for(u32 m=0;m<4;++m)w64[m]=st[192u+l7+8u*m];
+        #pragma unroll
+        for(u32 qq=0;qq<2;++qq)w32[qq]=st[224u+l7+8u*qq];
+        const u64 w16=st[240u+l7];
+        u32* const pb=base0+so+l7+72u*(lane>>3);
+        auto l1=[&](const u32 pr){u32 v[Q][8];
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;++m)v[n][m]=pb[(Q*pr+n)*XD+8*m+4*(m>>2)];
+            #pragma unroll
+            for(u32 m=0;m<4;++m)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)zbf<LZ>(v[n][m],v[n][m+4],w64[m],p,p2);
+            #pragma unroll
+            for(u32 qq=0;qq<2;++qq)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n)
+                    #pragma unroll
+                    for(u32 hh=0;hh<2;++hh)zbf<LZ>(v[n][qq+4*hh],v[n][qq+4*hh+2],w32[qq],p,p2);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;m+=2)zbf<LZ>(v[n][m],v[n][m+1],w16,p,p2);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n)
+                #pragma unroll
+                for(u32 m=0;m<8;++m)pb[(Q*pr+n)*XD+8*m+4*(m>>2)]=v[n][m];
+        };
+        #pragma unroll
+        for(u32 pr=0;pr<NI;++pr){l1(pr);if(pr+1<NI)__syncwarp();}
+    }
+    __syncwarp();
+    u64 w8[4];
+    #pragma unroll
+    for(u32 lo=0;lo<4;++lo)w8[lo]=st[248u+lo];
+    const u64 w253=st[253u],w252=st[252u],w254=st[254u];
+    const u32* const pr0=base0+so+8*lane+4*(lane>>2);
+    const bool sw=(lane>>2)&1u;uint4* const sd=reinterpret_cast<uint4*>(base0+8*lane)+(sw?1:0);
+    #pragma unroll 1
+    for(u32 pr=0;pr<NI;++pr){u32 v[Q][8];
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){const uint4* p4=reinterpret_cast<const uint4*>(pr0+(Q*pr+n)*XD);const uint4 x0=p4[0],x1=p4[1];
+            v[n][0]=x0.x;v[n][1]=x0.y;v[n][2]=x0.z;v[n][3]=x0.w;v[n][4]=x1.x;v[n][5]=x1.y;v[n][6]=x1.z;v[n][7]=x1.w;}
+        #pragma unroll
+        for(u32 lo=0;lo<4;++lo)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){if(lo==0)zbft<LZ,T>(v[n][0],v[n][4],w8[0],p,p2);else zbf<LZ>(v[n][lo],v[n][lo+4],w8[lo],p,p2);}
+        #pragma unroll
+        for(u32 k=0;k<4;++k)
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 lo=(k&1)+4*(k>>1);if(lo&1)zbf<LZ>(v[n][lo],v[n][lo+2],w253,p,p2);else zbft<LZ,T>(v[n][lo],v[n][lo+2],w252,p,p2);}
+        if(!T){
+            #pragma unroll
+            for(u32 lo=0;lo<8;lo+=2)
+                #pragma unroll
+                for(u32 n=0;n<Q;++n){if(LZ){const u32 a=v[n][lo],b=v[n][lo+1];v[n][lo]=a+b;v[n][lo+1]=zmsh(a+p2-b,w254,p);}   // Z5
+                    else xbf(v[n][lo],v[n][lo+1],w254,p);}}
+        #pragma unroll
+        for(u32 m2=0;m2<4;++m2){const ulonglong2 w=xct_ldv(ct,lane,m2);
+            #pragma unroll
+            for(u32 n=0;n<Q;++n){const u32 a=v[n][2*m2],b=v[n][2*m2+1];
+                if(T){v[n][2*m2]=xmsh(a+b,u64(w.x),p);v[n][2*m2+1]=xmsh(a+(LZ?p2:p)-b,u64(w.y),p);}   // Z6
+                else{v[n][2*m2]=xmsh(a,u64(w.x),p);v[n][2*m2+1]=xmsh(b,u64(w.y),p);}}}
+#if BPO_X_HAS_TMA
+        __syncwarp();
+        #pragma unroll
+        for(u32 n=0;n<Q;++n){
+            const uint4 e0=make_uint4(v[n][0],v[n][1],v[n][2],v[n][3]),e1=make_uint4(v[n][4],v[n][5],v[n][6],v[n][7]);
+            uint4* const d=sd+(Q*pr+n)*(XD/4);
+            d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}
+#endif
+    }
+#if BPO_X_HAS_TMA
+    asm volatile("fence.proxy.async.shared::cta;":::"memory");
+    __syncwarp();
+    if(lane==0){
+        u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
+        if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
+        #pragma unroll
+        for(u32 n=0;n<4;++n){const u32 sa=u32(__cvta_generic_to_shared(base0+n*XD));
+            if(hint)asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint [%0,{%1,%2,%3}],[%4],%5;"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa),"l"(pol):"memory");
+            else asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.bulk_group [%0,{%1,%2,%3}],[%4];"::"l"(reinterpret_cast<u64>(tm)),"r"(c*8u),"r"(0u),"r"(plane0+n),"r"(sa):"memory");}
+        asm volatile("cp.async.bulk.commit_group;":::"memory");}
+#endif
+}
+// one prime quad of bpo_first_xbz (phase A + phase B), LZ per Z1-Z6
+template<u32 F,bool LZ>
+__device__ __forceinline__ void xz_quad(const u32 u,const u32 (&af)[8][2][4],u32* const X,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,
+    const u64* ctab,const XTMap* tmA,const XTMap* tmB,const u32 c,const u32 op,const u32 lane,const u32 warp,const u32 gid,const u32 tig,const u32 stm){
+    constexpr u32 MT=2,XD=320u,XS=8*320;
+        __syncthreads();   // previous quad's R-DIF reads of X done
+        {
+            const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;
+            const u32 np=bpr_np.v[r];const u32 p2=bpr_p2.v[r];(void)p2;   // 2p from a table: IADD3 operands (ptxas refolds 2*p into IMAD)
+            const u64* st=stage_tw+size_t(r)*256;
+            u32 res[2*MT][8];   // Z0: [0,2p)
+            #pragma unroll
+            for(u32 j=0;j<8;++j){
+#ifdef BPO_P1WL
+                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
+#else
+                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
+#endif
+                #pragma unroll
+                for(u32 mt=0;mt<MT;++mt){
+                    u32 c0[4]={0,0,0,0},c1[4]={0,0,0,0};
+                    pimma16832(c0,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.x,bv.y);
+                    pimma16832(c1,af[j][mt][0],af[j][mt][1],af[j][mt][2],af[j][mt][3],bv.z,bv.w);
+                    #pragma unroll
+                    for(u32 hf=0;hf<2;++hf){
+                        const u32 y0=c0[2*hf],y1=c0[2*hf+1],y2=c1[2*hf],y3=c1[2*hf+1];
+                        const u32 w=y0+(y1<<8),z=y2+(y3<<8);
+                        const u32 lo=w+(z<<16),hi=(w>>14)+(z<<2);
+                        const u32 q=__umulhi(hi,m62)>>qsh;
+                        res[2*mt+hf][j]=lo+q*np;
+                    }
+                }
+            }
+            const u32 rl=8*warp+gid;
+            const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;
+            #pragma unroll
+            for(u32 rr=0;rr<4;++rr){
+                const u64 t2=t1[256u*rr];
+                #pragma unroll
+                for(u32 j=0;j<8;++j)res[rr][j]=LZ?zmsh(res[rr][j],t2,p):xmsh(res[rr][j],t2,p);   // Z1 (LZ: [0,2p), no correction)
+                zjdif<F,LZ>(res[rr],st,p,p2);
+            }
+            const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
+            #pragma unroll
+            for(u32 j=0;j<8;++j){zbf<LZ>(res[0][j],res[2][j],wa,p,p2);zbf<LZ>(res[1][j],res[3][j],wb,p,p2);zbf<LZ>(res[0][j],res[1][j],wc,p,p2);zbf<LZ>(res[2][j],res[3][j],wc,p,p2);}
+            u32* const xa=X+tig*XS+8*tig+rl+4*(rl>>5);   // Z4: stored words in [0,2p) (LZ) / [0,p)
+            #pragma unroll
+            for(u32 rr=0;rr<4;++rr)
+                #pragma unroll
+                for(u32 j=0;j<8;++j)xa[j*XD+72*rr]=res[rr][j];
+        }
+        __syncthreads();
+        {const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
+            const u64* const st=stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            zrdif6q<F,LZ>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);}
+#if BPO_X_HAS_TMA
+        if(lane==0)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable
+#endif
+}
+// bpo_first_xb restricted to the production flag set (S6, flags 256/512/4096/8192/131072, p1tw, p1rev), loop body per quad
+// instantiated twice (LZ for quads of primes < 2^30, canonical otherwise).
+template<u32 F>
+__device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const XTMap* tmA,const XTMap* tmB,u32* X){
+    static_assert((F&64)&&(F&256)&&(F&512)&&(F&4096)&&(F&8192)&&(F&131072u)&&(F&0x400000u)&&(F&0x800000u)&&!(F&8)&&!(F&4)&&!(F&32768u),"p1lz: production flag set only");
+    constexpr u32 L=BCRT_L;
+    constexpr u32 POS[9]={BCRT_POS,BCRT_W};
+    constexpr u32 XD=320u,XS=8*320;
+    const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;
+    const u32 id=blockIdx.x,c=id&255u,op=id>>8;
+    const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
+    const u32* src=(op?b:a)+u64(c)*L;
+    constexpr u32 MT=2;
+    u32 af[8][MT][4];
+    constexpr u32 XRS=60;
+    const u32 xoff=(c*L)&3u;
+    const bool ca=((reinterpret_cast<unsigned long long>(op?b:a)&15ull)==0);
+    {
+        u32 mk[8][2];
+        #pragma unroll
+        for(u32 j=0;j<8;++j)
+            #pragma unroll
+            for(u32 xh=0;xh<2;++xh)mk[j][xh]=bpr_fmask.v[j][xh][tig];
+        #pragma unroll
+        for(u32 mt=0;mt<MT;++mt){
+            if(mt)__syncthreads();
+            const u32* hs=src+u64(mt*128u*256u)*L;
+            if(ca){
+                const u32 q=h&15u,nch=(xoff+L+3u)/4u;const u32* g0=hs-xoff+4u*q;
+                u64 pol=0;if(!ldn)asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+                if(q<nch){
+                    const u32 sa0=u32(__cvta_generic_to_shared(X+(h>>4)*XRS+4u*q));const u32* const gq=g0+u64((h>>4)*256u)*L;
+                    #pragma unroll
+                    for(u32 i=0;i<8;++i){
+                        const u32 sa=sa0+i*(16u*XRS*4u);
+                        const u32* g=gq+i*(16u*256u*L);
+                        if(ldn)asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa),"l"(g):"memory");
+                        else asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"::"r"(sa),"l"(g),"l"(pol):"memory");}}
+                asm volatile("cp.async.commit_group;":::"memory");
+                asm volatile("cp.async.wait_group 0;":::"memory");
+            }else
+            #pragma unroll 4
+            for(u32 x=h;x<128u*L;x+=256u){const u32 rr=x/L,w=x-rr*L;X[x]=ldn?__ldg(hs+u64(rr*256u)*L+w):__ldcs(hs+u64(rr*256u)*L+w);}
+            __syncthreads();
+            if(ca){
+                const u32* const rpt=X+(8*warp+gid)*XRS+xoff+tig;
+                #pragma unroll
+                for(u32 j=0;j<8;++j){
+                    const u32 wb=POS[j]/32,sh=POS[j]%32;
+                    const int D=int(POS[j+1])-int(POS[j]);
+                    #pragma unroll
+                    for(u32 x=0;x<4;++x){
+                        const u32* rp=rpt+64*(x&1)*XRS+wb+4*(x>>1);
+                        const u32 v=__funnelshift_r(rp[0],rp[1],sh);
+                        if(D-32*(3+4*int(x>>1))>=32)af[j][mt][x]=v;
+                        else af[j][mt][x]=v&mk[j][x>>1];
+                    }
+                }
+            }else
+            #pragma unroll
+            for(u32 j=0;j<8;++j){
+                const u32 wb=POS[j]/32,sh=POS[j]%32;
+                #pragma unroll
+                for(u32 x=0;x<4;++x){
+                    const u32 lrow=64*(x&1)+8*warp+gid,t=tig+4*(x>>1);
+                    const u32* rp=X+lrow*L;
+                    const u32 w0=wb+t,w1=min(wb+t+1,L-1);
+                    const u32 v=__funnelshift_r(rp[min(w0,L-1)],rp[w1],sh);
+                    const int width=int(POS[j+1])-int(POS[j]+32*t);
+                    af[j][mt][x]=width>=32?v:(width<=0?0u:(v&((1u<<width)-1)));
+                }
+            }
+        }
+    }
+    if(pfstep&&h<256u&&id+pfstep<512u){
+        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64(pf&255u)*L+u64(h*256u)*L;
+        asm volatile("prefetch.global.L2 [%0];"::"l"(ps));
+        asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));
+        asm volatile("prefetch.global.L2 [%0];"::"l"(ps+L-1));
+    }
+    #pragma unroll 1
+    for(u32 uu=r0/4;uu<r1/4;++uu){const u32 u=r1/4-1u-(uu-r0/4);   // p1rev: quads in reverse order
+#ifdef BPO_P1LZ_ALL   // census-only build (JIT_DEFS): every quad on the lazy body, so the function holds one quad body
+        if(true)xz_quad<F,true>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);else
+#endif
+        if(4u*u+3u<u32(BPO_NH30))xz_quad<F,true>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);
+        else xz_quad<F,false>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);}
+#if BPO_X_HAS_TMA
+    if(lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
+#endif
+}
+// p1lz entry (host launches it only when FHERMA_P1LZ=1 and the entry exists; else bpo_first_xr)
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xz(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    bpo_first_xbz<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+#endif
 // T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)
 extern "C" __global__ void __launch_bounds__(512) bpo_t1_init(const u64* twist,u64* out){
     const u32 u=blockIdx.x,hh=threadIdx.x>>8,x=threadIdx.x&255u;
