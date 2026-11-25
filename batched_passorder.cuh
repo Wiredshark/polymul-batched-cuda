@@ -990,8 +990,12 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     constexpr u32 N=65536u;
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
+#ifdef BPO_P2MT   // wl2 p2mt: r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
+    const u64* tf=r16+u64(prime)*1024u;const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);
+#else
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
-    const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
+#endif
+    const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));(void)tfb;(void)tib;
     const u64 base=u64(prime*8+j)*N;
     const u32 off=g*2048u+c2*8u+s;
     u32 a[16],b[16];
@@ -1004,7 +1008,11 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
     u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
     #pragma unroll
+#ifdef BPO_P2MT
+    for(u32 i=1;i<16;++i){const u64 w=__ldg(tmf+16u*i);a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+#else
     for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+#endif
     #pragma unroll
     for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
     __syncthreads();   // every thread's A/B loads have completed (values consumed above)
@@ -1024,7 +1032,11 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     r16_dit16h<H,true>(a,ti,p,p2);
     {const u32 k8=8u*r16_brev4(c2);
         #pragma unroll
+#ifdef BPO_P2MT
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],__ldg(tmi+16u*i),p);(void)k8;
+#else
         for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);   // natural c2' = i
+#endif
         a[0]=H?pxadd(a[0],0u,p2):pzred(a[0],p);}   // all canonical (H: < 2p) for the second DIT16 (CI)
     __syncthreads();   // forward reads of TA done
     #pragma unroll
@@ -1625,12 +1637,17 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
     {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
-    u64 F;{
+    u64 F;
+#ifdef BPO_P3F   // wl2 p3f: untwist argument = precomputed F table [prime][c][t] (the values of the block below; 2 KB lane-contiguous per block)
+    F=__ldg(untwist+(u64(prime)*65536u+(c*256u+t)));(void)itw;
+#else
+    {
         const u32 k1=__brev(t)>>(32-logR);
         const u32 wv=mul_shoup(u32(bm_root(itw,2u*c*k1,N,p)),itw[1+(c&127u)],p);
         const u64 m0=itw[0];u32 q=wv*u32(m0>>32)+__umulhi(wv,u32(m0));
         const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
         F=u64(wv)|(u64(q)<<32);}
+#endif
     #pragma unroll
     for(u32 d=0;d<8;++d)yv[d]=pxmshh<H>(yv[d],F,p);
     if(H){

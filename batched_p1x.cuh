@@ -65,6 +65,15 @@ __device__ __forceinline__ void xbf(u32& x,u32& y,u64 w,u32 p){const u32 a=x,b=y
 __device__ __forceinline__ void xbf1(u32& x,u32& y,u32 p){const u32 a=x,b=y;x=xadd(a,b,p);y=xsub(a,b,p);}   // twiddle psi^0
 template<bool TRIV>__device__ __forceinline__ void xbft(u32& x,u32& y,const u64& w,u32 p){if(TRIV)xbf1(x,y,p);else xbf(x,y,w,p);}
 // 8-point cyclic DIF over the digit axis (= BPO_JDIF): entry e of the stage table = psi^(2eN/256).
+#ifdef BPO_P1ST   // wl2 p1st: quad-interleaved stage table (entry e of prime 4u+tig at 4e+tig): xjdif with stride 4
+template<u32 F>__device__ __forceinline__ void xjdifq(u32 (&x8)[8],const u64* sq,u32 p){
+    constexpr bool T=(F&1)!=0;
+    xbft<T>(x8[0],x8[4],sq[0],p);xbf(x8[1],x8[5],sq[4*32],p);xbf(x8[2],x8[6],sq[4*64],p);xbf(x8[3],x8[7],sq[4*96],p);
+    const u64 w0=sq[0],w64=sq[4*64];
+    xbft<T>(x8[0],x8[2],w0,p);xbf(x8[1],x8[3],w64,p);xbft<T>(x8[4],x8[6],w0,p);xbf(x8[5],x8[7],w64,p);
+    xbft<T>(x8[0],x8[1],w0,p);xbft<T>(x8[2],x8[3],w0,p);xbft<T>(x8[4],x8[5],w0,p);xbft<T>(x8[6],x8[7],w0,p);
+}
+#endif
 template<u32 F>__device__ __forceinline__ void xjdif(u32 (&x8)[8],const u64* st,u32 p){
     constexpr bool T=(F&1)!=0;
     xbft<T>(x8[0],x8[4],st[0],p);xbf(x8[1],x8[5],st[32],p);xbf(x8[2],x8[6],st[64],p);xbf(x8[3],x8[7],st[96],p);
@@ -578,14 +587,32 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
+#ifdef BPO_P1TW   // wl2 p1tw: twist argument = P1 twist table T1[((u*2 + c/128)*256 + 64 rr + rl)*4 + tig] (lane-contiguous, 256 B)
+                const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;
+#endif
+#ifdef BPO_P1ST   // wl2 p1st: stage_tw argument = [K x 256 production table][K/4 quads x 256 x 4 (prime-interleaved)]
+                const u64* const sq=st+(int(BCRT_K*256u)-int(255u*tig));   // = stage_tw + K*256 + 1024 u + tig (st = stage_tw + 256 (4u + tig))
+#endif
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
+#ifdef BPO_P1TW
+                    const u64 t2=t1[256u*rr];
+#else
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+#endif
                     #pragma unroll
                     for(u32 j=0;j<8;++j)res[rr][j]=xmsh(res[rr][j],t2,p);
+#ifdef BPO_P1ST
+                    xjdifq<F>(res[rr],sq,p);
+#else
                     xjdif<F>(res[rr],st,p);
+#endif
                 }
+#ifdef BPO_P1ST
+                const u64 wa=sq[4u*rl],wb=sq[4u*(64u+rl)],wc=sq[4u*(128u+rl)];
+#else
                 const u64 wa=st[rl],wb=st[64u+rl],wc=st[128u+rl];
+#endif
                 #pragma unroll
                 for(u32 j=0;j<8;++j){xbf(res[0][j],res[2][j],wa,p);xbf(res[1][j],res[3][j],wb,p);xbf(res[0][j],res[1][j],wc,p);xbf(res[2][j],res[3][j],wc,p);}
                 if(LB)__syncthreads();   // previous quad's phase-B / TMA reads of X done (flag 32768)
