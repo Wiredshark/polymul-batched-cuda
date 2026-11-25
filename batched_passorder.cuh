@@ -1,9 +1,3 @@
-#ifndef BPO_RM   // abl diag: removal bits (patch_abl_kern.py); 0 = production
-#define BPO_RM 0
-#endif
-#ifndef BPO_RMK   // abl diag: thread-varying register value standing in for a removed table load
-#define BPO_RMK(a,b) (u64(u32(a)*0x9e3779b9u+u32(b))|(u64(u32(a)^u32(b))<<32))
-#endif
 // Pass-order restructure (N=65536, R=S=256, J=8), NVRTC-specialized.
 // Same exact modular values as prepare2 -> forward -> middle -> inverse; only the
 // placement of the (commuting) J-axis transforms and the intermediate layouts differ:
@@ -994,98 +988,52 @@ __device__ __forceinline__ u64 bpo_tw8(const char* tb,u32 s8,u32 k){return __ldg
 #ifdef BPO_P2CU   // p2cu (kernel bpo_middle_r16c): per prime 256 words, [0,128) = r16[0,128), [128,256) = r16[256,384) (the
 // radix-16 stage twiddles tf / ti actually read: t[16 j], t[32 j], t[64]); 32 KB for K = 16; filled by the host (build_tabs)
 __constant__ unsigned long long bpo_p2cu[BCRT_K*256];
-#ifdef BPO_P2SM
-template<bool H,bool MT=false,bool CU=false,bool SM=false>
-#else
 template<bool H,bool MT=false,bool CU=false>
-#endif
 #elif defined(BPO_P2MT)
 template<bool H,bool MT=false>
 #else
 template<bool H>
 #endif
 __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
-#ifdef BPO_P2SM
-    const u32* primes,const u64* r16,u32,u32 untw,u64* TM=nullptr){
-#else
     const u32* primes,const u64* r16,u32,u32 untw){
-#endif
     constexpr u32 N=65536u;
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
 #ifdef BPO_P2MT   // p2mt (MT, kernel bpo_middle_r16m): r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
     const u64* tf=r16+u64(prime)*(MT?1024u:512u);const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);(void)tmf;(void)tmi;
-#endif
-#ifdef BPO_P2SM   // p2sm (SM, kernel bpo_middle_r16s): the prime's middle twiddles r16x[512,1024) staged in smem once per block
-    if(SM){const uint4* const s4=reinterpret_cast<const uint4*>(tf+512u);uint4* const d4=reinterpret_cast<uint4*>(TM);
-        d4[threadIdx.x]=__ldg(s4+threadIdx.x);d4[threadIdx.x+128u]=__ldg(s4+threadIdx.x+128u);}
-#define BPO_P2MF(i) (SM?TM[c2+16u*(i)]:__ldg(tmf+16u*(i)))
-#define BPO_P2MI(i) (SM?TM[256u+c2+16u*(i)]:__ldg(tmi+16u*(i)))
-#else
-#define BPO_P2MF(i) __ldg(tmf+16u*(i))
-#define BPO_P2MI(i) __ldg(tmi+16u*(i))
-#endif
-#ifdef BPO_P2MT
 #else
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
 #endif
     const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
 #ifdef BPO_P2CU   // CU: stage twiddles from the constant table (untw bits 24-31 = global index of the group's first prime)
     const u64* const cuf=CU?bpo_p2cu+((untw>>24)+prime)*256u:tf;const u64* const cui=CU?cuf+128u:ti;
-#if (BPO_RM)&8   // abl: stage twiddles removed (register values; constant indices only)
-    u64 rmt_[113];
-    #pragma unroll
-    for(u32 e=1;e<8;++e)rmt_[16u*e]=BPO_RMK(c2,e);
-#define BPO_P2TF rmt_
-#define BPO_P2TI rmt_
-#else
 #define BPO_P2TF cuf
 #define BPO_P2TI cui
-#endif
 #else
 #define BPO_P2TF tf
 #define BPO_P2TI ti
 #endif
-#ifdef BPO_TWC   // ovl compute twin: tiles (prime, g mod 16) only (4 MB, L2-resident); stores predicated off (untw bit 30)
-#define P2A_G (g&15u)
-#define P2ST if(untw&0x40000000u)
-#define P2DM 0x40000000u
-#define P2S_G (g&15u)
-    const u64 base=u64(prime*8)*N,lbase=base;
-#else
-#define P2DM ((BPO_RM&1024)?0x40000000u:8u)
-#define P2A_G ((BPO_RM&1024)?(g&15u):g)
-#define P2S_G g
-#define P2ST if(!(BPO_RM&2048)||(untw&0x40000000u))
-    const u64 base=u64(prime*8+j)*N,lbase=(BPO_RM&1024)?u64(prime*8)*N:base;   // abl: A,B loads from a window, C stores real
-#endif
-    const u32 off=P2A_G*2048u+c2*8u+s;
+    const u64 base=u64(prime*8+j)*N;
+    const u32 off=g*2048u+c2*8u+s;
     u32 a[16],b[16];
-    {   const u32* a0=A+lbase+off;const u32* b0=B+lbase+off;
+    {   const u32* a0=A+base+off;const u32* b0=B+base+off;
         #pragma unroll
-#if defined(BPO_TWC)&&BPO_TWC==2   // compute twin without data loads
-        for(u32 c1=0;c1<16;++c1){a[c1]=(off+c1*977u)&0x3fffffffu;b[c1]=(off^(c1*7919u))&0x3fffffffu;(void)a0;(void)b0;}
-#else
         for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
-#endif
     }
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
     r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);
-#ifdef BPO_P2SM
-    if(SM)__syncthreads();   // p2sm: staged middle twiddles visible
-#endif
     u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
     u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
     #pragma unroll
 #ifdef BPO_P2MT
-    for(u32 i=1;i<16;++i){const u64 w=MT?((BPO_RM&4)?BPO_RMK(c2,i):BPO_P2MF(i)):bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+    for(u32 i=1;i<16;++i){const u64 w=MT?__ldg(tmf+16u*i):bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
 #else
     for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
 #endif
     #pragma unroll
     for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
     __syncthreads();   // every thread's A/B loads have completed (values consumed above)
-    if(untw&P2DM)bpo_discard((threadIdx.x<64u?A:B)+lbase+P2A_G*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
+    if(untw&8)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=tr_[i];   // thread row t = c2: k1 = brev4(c2)
     __syncthreads();
@@ -1102,7 +1050,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     {const u32 k8=8u*r16_brev4(c2);
         #pragma unroll
 #ifdef BPO_P2MT
-        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],MT?((BPO_RM&4)?BPO_RMK(i,c2):BPO_P2MI(i)):bpo_tw8(tib,k8,i),p);
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],MT?__ldg(tmi+16u*i):bpo_tw8(tib,k8,i),p);
 #else
         for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);   // natural c2' = i
 #endif
@@ -1114,26 +1062,15 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=tw_[17*i];   // register i = row i -> k1 = brev4(i): bit-reversed input
     r16_dit16h<H,true>(a,BPO_P2TI,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
-    u32* o=C+base+(c2*256u+P2S_G*8u+s);
-#undef P2A_G
-#undef P2S_G
-#undef P2DM
+    u32* o=C+base+(c2*256u+g*8u+s);
     #pragma unroll
-    for(u32 c1=0;c1<16;++c1)P2ST o[4096u*c1]=a[c1];
-#undef P2ST
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
 #undef BPO_P2TF
 #undef BPO_P2TI
-#undef BPO_P2MF
-#undef BPO_P2MI
 #ifdef BPO_P2MT
 // p2mt entry: bpo_middle_r16 with the r16x middle twiddles (host launches it only when r16x was built; else bpo_middle_r16)
-#if defined(BPO_TWC)||(BPO_RM)   // abl: RM variants keep R's 9 blocks/SM
-#define P2TWC_LB __launch_bounds__(128,9)   // ovl compute twin: R's register count (56, 9 blocks/SM)
-#else
-#define P2TWC_LB __launch_bounds__(128)
-#endif
-extern "C" __global__ void P2TWC_LB bpo_middle_r16m(const u32* A,const u32* B,u32* C,
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16m(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     __shared__ u32 TA[8*292];
 #if BPO_NH30
@@ -1143,7 +1080,7 @@ extern "C" __global__ void P2TWC_LB bpo_middle_r16m(const u32* A,const u32* B,u3
 }
 #ifdef BPO_P2CU
 // p2cu entry: bpo_middle_r16m with the stage twiddles from bpo_p2cu (host launches it only when the table was filled; else r16m)
-extern "C" __global__ void P2TWC_LB bpo_middle_r16c(const u32* A,const u32* B,u32* C,
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16c(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     __shared__ u32 TA[8*292];
 #if BPO_NH30
@@ -1151,17 +1088,6 @@ extern "C" __global__ void P2TWC_LB bpo_middle_r16c(const u32* A,const u32* B,u3
 #endif
     bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
 }
-#ifdef BPO_P2SM
-// p2sm entry: bpo_middle_r16c with the middle twiddles from shared memory (host launches it only when it exists; else r16c)
-extern "C" __global__ void __launch_bounds__(128,9) bpo_middle_r16s(const u32* A,const u32* B,u32* C,
-    const u32* primes,const u64* r16,u32 N,u32 untw){
-    __shared__ u32 TA[8*292];__shared__ __align__(16) u64 TM[512];
-#if BPO_NH30
-    if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true,true,true,true>(TA,A,B,C,primes,r16,N,untw,TM);else
-#endif
-    bpo_r16_body<false,true,true,true>(TA,A,B,C,primes,r16,N,untw,TM);
-}
-#endif
 #endif
 // r16x init (once): per prime [0,512) = r16, [512+16i+c2] = r16[(c2 brev4(i))&255], [768+16i+c2] = r16[256+((brev4(c2) i)&255)]; grid K, 1024 threads
 extern "C" __global__ void __launch_bounds__(1024) bpo_r16x_init(const u64* r16,u64* out){
@@ -1757,35 +1683,16 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
     constexpr u32 N=65536u,logR=8u;
     const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
     const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
-#ifdef BPO_TWC   // ovl compute twin: tiles (prime, c mod 16) only (2.5 MB, L2-resident); stores predicated off (dfl bit 30)
-#define P3A_C (c&15u)
-#define P3A_P prime
-#define P3ST if(dfl&0x40000000u)
-#define P3DM 0x40000000u
-#define P3T_C (c&15u)
-#define P3S_C (c&15u)
-#else
-#define P3DM ((BPO_RM&2048)?0x40000000u:1u)
-#define P3ST if(!(BPO_RM&4096)||(dfl&0x40000000u))
-#define P3A_C ((BPO_RM&2048)?(c&15u):c)
-#define P3T_C c
-#define P3S_C c
-#define P3A_P prime
-#endif
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
-    const u64* sit=stage_itw+((BPO_RM&64)?0u:prime*256u);
+    const u64* sit=stage_itw+prime*256u;
     u32 yv[8];
-    {const u32* src=C+u64(P3A_P*8u)*N+(P3A_C*256u+t);
+    {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
         #pragma unroll
-#if defined(BPO_TWC)&&BPO_TWC==2   // compute twin without data loads
-        for(u32 d=0;d<8;++d){yv[d]=((P3A_C*256u+t)*7u+d*40503u)&0x3fffffffu;(void)src;}}
-#else
         for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
-#endif
     u64 F;
 #ifdef BPO_P3F   // p3f (PF, kernel bpo_last_cm3f): untwist argument = F table [prime][c][t] (bpo_ftab_init: the values of the block below)
-    if(PF)F=(BPO_RM&16)?BPO_RMK(t,c):__ldg(untwist+(u64(P3A_P)*65536u+(P3T_C*256u+t)));else
+    if(PF)F=__ldg(untwist+(u64(prime)*65536u+(c*256u+t)));else
 #endif
     {
         const u32 k1=__brev(t)>>(32-logR);
@@ -1818,27 +1725,23 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
         #pragma unroll
         for(u32 d=0;d<8;++d)xw[d*288u]=yv[d];}
     __syncthreads();
-    const u64* const tn=t2n+(u64(P3A_P*8u+warp)*512u+((P3T_C>>7)*256u+lane));
+    const u64* const tn=t2n+(u64(prime*8u+warp)*512u+((c>>7)*256u+lane));
     u64 tv[8];
     #pragma unroll
-    for(u32 m=0;m<8;++m)tv[m]=(BPO_RM&32)?BPO_RMK(lane,m):__ldg(tn+32u*m);
-    if((dfl&P3DM)&&lane<8u)bpo_discard(C+u64(P3A_P*8u+lane)*N+(P3A_C*256u+32u*warp));   // C lines read by this warp (all used)
+    for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+32u*m);
+    if((dfl&1)&&lane<8u)bpo_discard(C+u64(prime*8u+lane)*N+(c*256u+32u*warp));   // C lines read by this warp (all used)
     u32 v[8];
     u32* const base=X+warp*288u;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
     if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
-    u32* const out=D+(u64(P3A_P*8u+warp)*N+(P3S_C*256u+lane));
-#undef P3A_C
-#undef P3A_P
-#undef P3T_C
-#undef P3S_C
+    u32* const out=D+(u64(prime*8u+warp)*N+(c*256u+lane));
 #ifdef BPO_P3EL
     const u32 pm=12u;   // dfl 8: group-0 residues L2 evict_last; dfl 4: evict_first (bpo_p3_body order)
 #else
     const u32 pm=4u;
 #endif
-    P3ST if(dfl&pm){
+    if(dfl&pm){
         u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
         for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
@@ -1846,8 +1749,6 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
         #pragma unroll
         for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
     }
-#undef P3ST
-#undef P3DM
 }
 #ifdef BPO_P3F
 // p3f entry: the p3b body with F from the table (host launches it only when the table was built and the p3b conditions hold:
@@ -1861,11 +1762,11 @@ extern "C" __global__ void __maxnreg__(32) bpo_last_cm3f(const u32* C,u32* D,con
     bpo_p3b_body<false,true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
 }
 #ifdef BPO_P3T2
-// p3t2 (kernel bpo_last_cm3t, opt-in FHERMA_P3T2=1): the cm3f body over BPO_P3CB adjacent columns per block (same c>>7, so
+// p3t2 (candidate 6, kernel bpo_last_cm3t, FHERMA_P3T2=0 off; pv105 on-target 0.9793): the cm3f body over BPO_P3CB adjacent columns per block (same c>>7, so
 // the same t2n entries): phase 1 (C loads, F, J-DIT 8, X stores) for every column into its own X region, one barrier, the
 // t2n values loaded ONCE per block (cm3f: once per column = 128 re-reads of the 0.5 MB table), then phase 2 (R-DIT from X,
 // t2n product, residue stores) per column. Same values as cm3f (exact). Grid (cols / BPO_P3CB, primes); static smem
-// BPO_P3CB x 9 KB; registers as cm3f (tv is live only in phase 2, as in cm3f).
+// BPO_P3CB x 9 KB; 48 registers (BPO_P3TR).
 #ifndef BPO_P3CB
 #define BPO_P3CB 2
 #endif
@@ -1942,7 +1843,7 @@ __device__ __forceinline__ void bpo_p3t_body(u32* X0,const u32* C,u32* D,const u
     }
 }
 #ifndef BPO_P3TR
-#define BPO_P3TR 40   // p3t2 register cap (32 spills: tv live across the phase-2 column loop)
+#define BPO_P3TR 48   // register cap (pv105: 40 spills and loses 14%; 32 spills more)
 #endif
 extern "C" __global__ void __maxnreg__(BPO_P3TR) bpo_last_cm3t(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){

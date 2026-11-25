@@ -11,12 +11,6 @@
 //    selected by (borrow, bit W, t >= q) instead of fold 2, -q, -bias, +q.
 #ifdef BTC_F
 typedef long long i64;
-#ifndef BPO_RM   // abl diag: removal bits (patch_abl_kern.py); 0 = production
-#define BPO_RM 0
-#endif
-#ifndef BPO_RMK   // abl diag: thread-varying register value standing in for a removed table load
-#define BPO_RMK(a,b) (u64(u32(a)*0x9e3779b9u+u32(b))|(u64(u32(a)^u32(b))<<32))
-#endif
 __device__ __forceinline__ void swc_cpa16(u32 dst,const void* src){asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(dst),"l"(src):"memory");}
 __device__ __forceinline__ void swc_commit(){asm volatile("cp.async.commit_group;":::"memory");}
 __device__ __forceinline__ void swc_wait0(){asm volatile("cp.async.wait_group 0;":::"memory");}
@@ -104,11 +98,7 @@ template<u32 T> __device__ __forceinline__ void swc_tile(const u32 (&a)[2][2][4]
 }
 extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
-#ifdef BPO_TWC   // ovl compute twin: no next-product L2 prefetch, block 0's coefficients
-    if(false){
-#else
-    if(pfitems&&!(BPO_RM&256)){
-#endif
+    if(pfitems){
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
             const u32 it=t>>8,hh=t&255u;const u32* ps=(it>=256u?pfb:pfa)+u64(it&255u)*BCRT_L+u64(hh*256u)*BCRT_L;
@@ -125,31 +115,15 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     __shared__ __align__(16) u32 stage_all[4][STW];
     const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
     u32* st=stage_all[warp];
-#ifdef BPO_TWC   // ovl compute twin: 32 coefficient blocks only (2 MB, L2-resident); stores predicated off (dfl bit 30)
-    const u32 i0=(blockIdx.x&31u)*128+warp*32,il0=i0;
-#define CRTST if(dfl&0x40000000u)
-#define CRTDM 0x40000000u
-#else
-#define CRTDM ((BPO_RM&4096)?0x40000000u:1u)
-#define CRTST if(!(BPO_RM&512)||(dfl&0x40000000u))
-#ifdef BPO_CRTW   // crtw: warp w = column cc0 + w, rows h0 .. h0+31 (one 880 B output chunk per row and block)
-    const u32 i0=((blockIdx.x>>3)*4u+warp)*256u+(blockIdx.x&7u)*32u,il0=(BPO_RM&4096)?(blockIdx.x&31u)*128+warp*32:i0;   // abl: residue loads from a window
-#else
-    const u32 i0=blockIdx.x*128+warp*32,il0=(BPO_RM&4096)?(blockIdx.x&31u)*128+warp*32:i0;   // abl: residue loads from a window
-#endif
-#endif
+    const u32 i0=blockIdx.x*128+warp*32;
     u32* const pbuf=st+32*SST;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
     auto prefetch=[&](u32 j){
         #pragma unroll
         for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
-#if defined(BPO_TWC)&&BPO_TWC==2   // compute twin without data loads (pbuf left as is)
-            (void)r;(void)ch;}
-#else
-            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+il0+4*ch);}
-#endif
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
         swc_commit();};
     prefetch(0);
-    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=(BPO_RM&128)?x*2654435761u:bfrag[x];
+    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
     __syncthreads();
     u32 acc[NW+2];   // [64..65]: scratch of the digit chains
     #pragma unroll
@@ -191,157 +165,12 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
         acc[WO]&=(1u<<WS)-1;
     }
-    if(dfl&CRTDM)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+il0);
+    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
     const u32 cc_=i0>>8,h0=i0&255u;
     {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
         __syncwarp();
         #pragma unroll
         for(u32 w=0;w<L;++w)st[lane*L+w]=acc[w];
-        __syncwarp();
-#ifdef BPO_CRTW
-        (void)h0;(void)cc_;
-        __syncthreads();   // all four warps' stages written
-        const u32 cc0=(blockIdx.x>>3)*4u,hb=(blockIdx.x&7u)*32u;
-        CRTST for(u32 x=threadIdx.x;x<32u*L;x+=128u){const u32 rr=x/L,q=x-rr*L;   // row hb+rr, 16 B word q of its chunk
-            u32 wv[4];
-            #pragma unroll
-            for(u32 e=0;e<4;++e){const u32 wi=4u*q+e,wq=wi/L,ww=wi-wq*L;wv[e]=stage_all[wq][rr*L+ww];}
-            uint4* const dst=reinterpret_cast<uint4*>(output+u64((hb+rr)*256u+cc0)*L)+q;const uint4 val=make_uint4(wv[0],wv[1],wv[2],wv[3]);
-            if(dfl&2)__stcs(dst,val);else *dst=val;}
-#else
-        u32* const ob=output+u64(h0*256u+cc_)*L+lane;
-        CRTST if(dfl&2){
-            #pragma unroll
-            for(u32 rr=0;rr<32;++rr){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}
-        }else{
-            #pragma unroll
-            for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
-        }
-#endif
-    }
-#undef CRTST
-#undef CRTDM
-}
-#ifdef BPO_TWM
-#ifndef BPO_MA
-#define BPO_MA 0
-#endif
-// memd sink: keeps loads live when the stores are off (flag bit 30 is never set)
-#define MA_SINK(x,ptr,flags) if(((x)==0x9e3779b9u)&&((flags)&0x40000000u))(ptr)[0]=(x)
-// ---- ovl memory-only twins (production signatures, grids, blocks): the production global loads and stores (addresses, widths,
-// cache operators, order, tables) with the arithmetic removed; loaded words XOR-folded into the stored words.
-extern "C" __global__ void __launch_bounds__(128) wl4_p2m(const u32* A,const u32* B,u32* C,const u32* primes,const u64* r16,u32 N,u32 untw){
-    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z;(void)primes;(void)N;
-    const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
-    const u64* tf=r16+u64(prime)*1024u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);
-#ifdef BPO_P2CU   // production p2cu: stage twiddles from the constant table
-    const u64* const tsf=bpo_p2cu+((untw>>24)+prime)*256u;const u64* const tsi=tsf+128u;
-#else
-    const u64* const tsf=tf;const u64* const tsi=tf+256u;
-#endif
-    const u32 gl=(BPO_MA&1)?(g&15u):g,gs=(BPO_MA&4)?(g&15u):g;   // memd: load / store tile windows
-    const u64 base=u64(prime*8+((BPO_MA&1)?0u:j))*65536u,sbase=u64(prime*8+((BPO_MA&4)?0u:j))*65536u;const u32 off=gl*2048u+c2*8u+s;
-    u32 x=0;
-    {const u32* a0=A+base+off;const u32* b0=B+base+off;
-        #pragma unroll
-        for(u32 c1=0;c1<16;++c1){if(untw&4){x^=__ldcs(a0+128u*c1)+c1;x^=__ldcs(b0+128u*c1);}else{x^=a0[128u*c1]+c1;x^=b0[128u*c1];}}}
-    u64 w=0;
-    if(!(BPO_MA&8)){
-    #pragma unroll
-    for(u32 e=1;e<8;++e)w^=tsf[16u*e];   // forward stage twiddles (uniform)
-    #pragma unroll
-    for(u32 i=1;i<16;++i)w^=__ldg(tmf+16u*i);}   // middle twiddles
-    x+=__syncthreads_or(x==0x9e3779b9u);   // the barrier consumes the loads (as R: discard after use)
-    if(untw&8)bpo_discard((threadIdx.x<64u?A:B)+base+gl*2048u+(threadIdx.x&63u)*32u);
-    if(!(BPO_MA&8)){
-    #pragma unroll
-    for(u32 e=1;e<8;++e)w^=tsi[16u*e];   // inverse stage twiddles
-    #pragma unroll
-    for(u32 i=1;i<16;++i)w^=__ldg(tmi+16u*i);}
-    x^=u32(w)^u32(w>>32);
-    u32* o=C+sbase+(c2*256u+gs*8u+s);
-    if(BPO_MA&2){MA_SINK(x,o,untw);return;}
-    #pragma unroll
-    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=x+c1;
-}
-extern "C" __global__ void __launch_bounds__(256) wl4_p3m(const u32* C,u32* D,const u32* primes,
-    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
-    constexpr u32 NN=65536u;(void)primes;(void)N;(void)logR;
-    const u32 c=blockIdx.x,prime=blockIdx.y,t=threadIdx.x,lane=t&31u,warp=t>>5,l3=lane&3u;
-    u32 x=0;const u32 cl=(BPO_MA&1)?(c&15u):c,cs=(BPO_MA&4)?(c&15u):c;   // memd: C load / residue store windows
-    {const u32* src=C+u64(prime*8u)*NN+(cl*256u+t);
-        #pragma unroll
-        for(u32 d=0;d<8;++d)x^=src[d*NN]+d;}
-    u64 w=(BPO_MA&8)?u64(t):__ldg(untwist+(u64(prime)*65536u+(c*256u+t)));
-    const u64* sit=stage_itw+prime*256u;
-    if(!(BPO_MA&8))w^=sit[32]^sit[64]^sit[96]^sit[253];   // J-DIT / first R-DIT twiddles (uniform)
-    x+=__syncthreads_or(x==0x9e3779b9u);   // the barrier consumes x: the C loads land before the discard below (as in R)
-    const u64* const tn=t2n+(u64(prime*8u+warp)*512u+((c>>7)*256u+lane));
-    u64 tv=0;
-    #pragma unroll
-    for(u32 m=0;m<8;++m)tv^=(BPO_MA&8)?m:__ldg(tn+32u*m)+m;
-    if((dfl&1)&&lane<8u)bpo_discard(C+u64(prime*8u+lane)*NN+(cl*256u+32u*warp));
-    if(!(BPO_MA&8)){w^=sit[248u+l3]^sit[240u+l3]^sit[244u+l3]^sit[224u+l3]^sit[228u+l3]^sit[232u+l3]^sit[236u+l3];   // R-DIT lane twiddles
-    w^=sit[192u+lane]^sit[128u+lane]^sit[160u+lane]^sit[lane]^sit[32u+lane]^sit[64u+lane]^sit[96u+lane];}
-    x^=u32(w)^u32(w>>32)^u32(tv)^u32(tv>>32);
-    u32* const out=D+(u64(prime*8u+warp)*NN+(cs*256u+lane));
-    if(BPO_MA&2){MA_SINK(x,out,dfl);return;}
-#ifdef BPO_P3EL
-    const u32 pm=12u;
-#else
-    const u32 pm=4u;
-#endif
-    if(dfl&pm){
-        u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
-        #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=x+m;asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
-    }else{
-        #pragma unroll
-        for(u32 m=0;m<8;++m)out[32u*m]=x+m;
-    }
-}
-#ifdef BTC_F
-extern "C" __global__ void __launch_bounds__(128,3) wl4_crtm(const u32* __restrict__ residues,u32* __restrict__ output,
- const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
-    (void)d;
-    if(pfitems&&!(BPO_MA&16)){
-        const u32 total=gridDim.x*blockDim.x;
-        for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
-            const u32 it=t>>8,hh=t&255u;const u32* ps=(it>=256u?pfb:pfa)+u64(it&255u)*BCRT_L+u64(hh*256u)*BCRT_L;
-            asm volatile("prefetch.global.L2 [%0];"::"l"(ps));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+BCRT_L-1));
-        }
-    }
-    constexpr u32 K=BCRT_K,L=BCRT_L,NT=9,SST=36,STW=32*L;
-    __shared__ __align__(16) u32 bsh[NT*2*32*2];
-    __shared__ __align__(16) u32 stage_all[4][STW];
-    const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31;
-    u32* st=stage_all[warp];
-    const u32 i0=((BPO_MA&1)?(blockIdx.x&31u):blockIdx.x)*128+warp*32,is0=((BPO_MA&4)?(blockIdx.x&31u):blockIdx.x)*128+warp*32;   // memd: load / store windows
-    u32* const pbuf=st+32*SST;
-    auto prefetch=[&](u32 j){
-        #pragma unroll
-        for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
-            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
-        swc_commit();};
-    prefetch(0);
-    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=(BPO_MA&8)?x:bfrag[x];
-    __syncthreads();
-    u32 acc=bsh[lane];
-    #pragma unroll
-    for(u32 j=0;j<8;++j){
-        swc_wait0();__syncwarp();
-        #pragma unroll
-        for(u32 k=0;k<16;++k)acc^=pbuf[k*32+lane];   // this digit's 16 residue rows (prefetch buffer)
-        __syncwarp();
-        if(j<7)prefetch(j+1);
-        __syncwarp();
-    }
-    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
-    const u32 cc_=is0>>8,h0=is0&255u;
-    if(BPO_MA&2){MA_SINK(acc,output+is0,dfl);return;}
-    {   __syncwarp();
-        #pragma unroll
-        for(u32 w=0;w<L;++w)st[lane*L+w]=acc+w;
         __syncwarp();
         u32* const ob=output+u64(h0*256u+cc_)*L+lane;
         if(dfl&2){
@@ -353,6 +182,4 @@ extern "C" __global__ void __launch_bounds__(128,3) wl4_crtm(const u32* __restri
         }
     }
 }
-#endif
-#endif
 #endif
