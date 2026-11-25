@@ -96,6 +96,11 @@ template<u32 T> __device__ __forceinline__ void swc_tile(const u32 (&a)[2][2][4]
     imma16832(e,a[1][0][0],a[1][0][1],a[1][0][2],a[1][0][3],b0.x,b0.y);imma16832(e,a[1][1][0],a[1][1][1],a[1][1][2],a[1][1][3],b1.x,b1.y);
     swc_sts<(16*36+4*T)*4>(sb,e[0]+(e[1]<<8));swc_sts<(24*36+4*T)*4>(sb,e[2]+(e[3]<<8));
 }
+#ifdef BPO_CRTN   // wl3 crtn: residue addressing with N = 65536 compile-time (host runs bpo_crt_lean only for n = 65536)
+#define SWC_N 65536u
+#else
+#define SWC_N N
+#endif
 extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
     if(pfitems){
@@ -120,7 +125,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     auto prefetch=[&](u32 j){
         #pragma unroll
         for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
-            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*SWC_N+i0+4*ch);}
         swc_commit();};
     prefetch(0);
     for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
@@ -165,7 +170,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
         acc[WO]&=(1u<<WS)-1;
     }
-    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
+    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*SWC_N+i0);
     const u32 cc_=i0>>8,h0=i0&255u;
     {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
         __syncwarp();

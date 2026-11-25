@@ -976,6 +976,12 @@ template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],
     #pragma unroll
     for(u32 j=0;j<8;++j){if(j)phdit(v[j],v[j+8],t[16*j],p,p2);else phdit1(v[0],v[8],p2);}
 }
+#if defined(BPO_P2CU)&&defined(BPO_CU_DUMMY)   // wl3 SASS census only: table contents irrelevant (the diag prepends the real tables)
+__constant__ unsigned long long bpo_p2cu[BCRT_K*256];
+#endif
+#if defined(BPO_P3CU)&&defined(BPO_CU_DUMMY)
+__constant__ unsigned long long bpo_p3cu[BCRT_K*8];
+#endif
 #ifndef BPO_P2_OLD
 // p2k (default; pv65 on-target whole batch 0.985, round-20 sweep line p2k): same arithmetic as the old body, addressing only:
 // smem transposes as one base pointer + immediates (old: IADD3 + LEA per element, 16 live address registers), A/B/C rows as
@@ -1001,6 +1007,14 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
 #endif
     const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
+#ifdef BPO_P2CU
+    const u64* const tsf=bpo_p2cu+((untw>>24)+prime)*256u;const u64* const tsi=tsf+128u;
+#define BPO_P2TF tsf
+#define BPO_P2TI tsi
+#else
+#define BPO_P2TF tf
+#define BPO_P2TI ti
+#endif
     const u64 base=u64(prime*8+j)*N;
     const u32 off=g*2048u+c2*8u+s;
     u32 a[16],b[16];
@@ -1009,7 +1023,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
         for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
     }
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
-    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
+    r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);
     u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
     u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
     #pragma unroll
@@ -1030,11 +1044,11 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     __syncthreads();
     #pragma unroll
     for(u32 i=0;i<16;++i)b[i]=tr_[i];
-    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
+    r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);
     {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
         #pragma unroll
         for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
-    r16_dit16h<H,true>(a,ti,p,p2);
+    r16_dit16h<H,true>(a,BPO_P2TI,p,p2);
     {const u32 k8=8u*r16_brev4(c2);
         #pragma unroll
 #ifdef BPO_P2MT
@@ -1049,10 +1063,12 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     __syncthreads();
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=tw_[17*i];   // register i = row i -> k1 = brev4(i): bit-reversed input
-    r16_dit16h<H,true>(a,ti,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
+    r16_dit16h<H,true>(a,BPO_P2TI,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
     u32* o=C+base+(c2*256u+g*8u+s);
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+#undef BPO_P2TF
+#undef BPO_P2TI
 }
 #ifdef BPO_P2MT
 // p2mt entry: bpo_middle_r16 with the r16x middle twiddles (host launches it only when r16x was built; else bpo_middle_r16)
@@ -1648,6 +1664,95 @@ template<u32 T0,bool H=false>__device__ __forceinline__ void bpo_p3_body(u32* X,
 // bpo_p2_of lookup), one t2n layout; kernel __maxnreg__(32) (40 -> 32 regs, 0 spill; P3 blocks pack better next to P1 / P2
 // blocks). sm_90 SASS 1423 -> 1198 instr. The kernel falls back to bpo_p3_body when N != 65536, logR != 8 or dfl 2 (old t2n
 // layout). FHERMA_P3_OLD=1 compiles the old kernel (BPO_P3_OLD).
+#ifdef BPO_P3CU
+__device__ __forceinline__ constexpr u32 bpo_p3u_slot(u32 i){return i==0u?0u:i==32u?1u:i==64u?2u:i==96u?3u:i==252u?4u:i==253u?5u:6u;}
+#define BPO_P3U(i) scu[bpo_p3u_slot(i)]
+#else
+#define BPO_P3U(i) sit[i]
+#endif
+#if defined(BPO_P3CU)||defined(BPO_P3LT)
+// wl3: bpo_p3b R-DIT (phdit_smr<false> / pzdit_smr<false> values) with uniform twiddles from BPO_P3U and, under BPO_P3LT, the
+// 14 lane twiddles as 7 uint4 loads (pairs: (248+l3, 240+l3) (244+l3, 224+l3) (228+l3, 232+l3) (236+l3, 192+l) (128+l, 160+l)
+// (l, 32+l) (64+l, 96+l), l3 = lane&3)
+template<bool H>__device__ __forceinline__ void bpo_p3x_smr(u32* base,u32 (&v)[8],const u64* sit,const u64* scu,u32 p,u32 p2,u32 lane){
+    (void)scu;(void)p2;
+#ifdef BPO_P3LT
+    const uint4* const lt=reinterpret_cast<const uint4*>(sit+256u)+lane;
+#define LTQ(qi) const uint4 q_=__ldg(lt+32u*(qi))
+#define LTL (u64(q_.x)|(u64(q_.y)<<32))
+#define LTH (u64(q_.z)|(u64(q_.w)<<32))
+#endif
+    auto bf=[&](u32& x,u32& y,u64 w){if(H)phdit(x,y,w,p,p2);else pzdit(x,y,w,p);};
+    if(H){
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2)phdit1(v[lo],v[lo+1],p2);
+        const u64 w1=BPO_P3U(253u);phdit1(v[0],v[2],p2);phdit(v[1],v[3],w1,p,p2);phdit1(v[4],v[6],p2);phdit(v[5],v[7],w1,p,p2);
+    }else{
+        {const u64 w=sit[254u];   // 31-bit path: sit (p3cu measured +6.9 slots there)
+            #pragma unroll
+            for(u32 lo=0;lo<8;lo+=2)pzdit1(v[lo],v[lo+1],w,p);}
+        const u64 w0=sit[252u],w1=sit[253u];pzdit1(v[0],v[2],w0,p);pzdit(v[1],v[3],w1,p);pzdit1(v[4],v[6],w0,p);pzdit(v[5],v[7],w1,p);
+    }
+    __syncwarp();
+    {uint4* p4=reinterpret_cast<uint4*>(base+8*lane+4*(lane>>2));
+     p4[0]=make_uint4(v[0],v[1],v[2],v[3]);p4[1]=make_uint4(v[4],v[5],v[6],v[7]);}
+    __syncwarp();
+    const u32 b2=(lane&3u)+36u*(lane>>2);
+    #pragma unroll
+    for(u32 m=0;m<8;++m)v[m]=base[b2+4*m];
+#ifdef BPO_P3LT
+    {LTQ(0);const u64 w=LTL,wb0=LTH;
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2)bf(v[lo],v[lo+1],w);
+     u64 wb1,wc0;{LTQ(1);wb1=LTL;wc0=LTH;}
+        #pragma unroll
+        for(u32 k=0;k<4;++k){const u32 lo=(k&1)+4*(k>>1);bf(v[lo],v[lo+2],(lo&1)?wb1:wb0);}
+     bf(v[0],v[4],wc0);
+     {LTQ(2);bf(v[1],v[5],LTL);bf(v[2],v[6],LTH);}}
+    u64 wd;{LTQ(3);bf(v[3],v[7],LTL);wd=LTH;}
+#else
+    {const u64 w=sit[248u+(lane&3u)];
+        #pragma unroll
+        for(u32 lo=0;lo<8;lo+=2)bf(v[lo],v[lo+1],w);}
+    #pragma unroll
+    for(u32 k=0;k<4;++k){const u32 lo=(k&1)+4*(k>>1);bf(v[lo],v[lo+2],sit[240u+(lane&3u)+4*(lo&1)]);}
+    #pragma unroll
+    for(u32 lo=0;lo<4;++lo)bf(v[lo],v[lo+4],sit[224u+(lane&3u)+4*lo]);
+#endif
+    __syncwarp();
+    #pragma unroll
+    for(u32 m=0;m<8;++m)base[b2+4*m]=v[m];
+    __syncwarp();
+    #pragma unroll
+    for(u32 m=0;m<8;++m)v[m]=base[lane+36*m];
+#ifdef BPO_P3LT
+    {
+        #pragma unroll
+        for(u32 m=0;m<8;m+=2)bf(v[m],v[m+1],wd);}
+    {LTQ(4);
+        #pragma unroll
+        for(u32 hh=0;hh<2;++hh){bf(v[4*hh],v[4*hh+2],LTL);}
+        #pragma unroll
+        for(u32 hh=0;hh<2;++hh){bf(v[1+4*hh],v[1+4*hh+2],LTH);}}
+    {LTQ(5);bf(v[0],v[4],LTL);bf(v[1],v[5],LTH);}
+    {LTQ(6);bf(v[2],v[6],LTL);bf(v[3],v[7],LTH);}
+#undef LTQ
+#undef LTL
+#undef LTH
+#else
+    {const u64 w=sit[192u+lane];
+        #pragma unroll
+        for(u32 m=0;m<8;m+=2)bf(v[m],v[m+1],w);}
+    #pragma unroll
+    for(u32 qq=0;qq<2;++qq){const u64 w=sit[128u+lane+32u*qq];
+        #pragma unroll
+        for(u32 hh=0;hh<2;++hh){const u32 m=qq+4*hh;bf(v[m],v[m+2],w);}}
+    #pragma unroll
+    for(u32 m=0;m<4;++m)bf(v[m],v[m+4],sit[lane+32u*m]);
+#endif
+}
+#endif
+#undef BPO_P3U
 #ifdef BPO_P3F
 template<bool H,bool PF=false>
 #else
@@ -1660,7 +1765,18 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
     const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
+#ifdef BPO_P3LT
+    const u64* sit=stage_itw+prime*704u;
+#else
     const u64* sit=stage_itw+prime*256u;
+#endif
+#ifdef BPO_P3CU
+    const u64* const scu=bpo_p3cu+((dfl>>24)+prime)*8u;
+#define BPO_P3S(i) scu[bpo_p3u_slot(i)]
+#else
+    const u64* const scu=nullptr;
+#define BPO_P3S(i) sit[i]
+#endif
     u32 yv[8];
     {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
         #pragma unroll
@@ -1685,7 +1801,7 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
             #pragma unroll
             for(u32 d0=0;d0<8;d0+=len){
                 #pragma unroll
-                for(u32 jj=0;jj<half;++jj){if(jj==0)phdit1(yv[d0],yv[d0+half],p2);else phdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p,p2);}}}
+                for(u32 jj=0;jj<half;++jj){if(jj==0)phdit1(yv[d0],yv[d0+half],p2);else phdit(yv[d0+jj],yv[d0+jj+half],BPO_P3S(jj*(256u/len)),p,p2);}}}
     }else{
         #pragma unroll
         for(u32 d0=0;d0<8;d0+=2)pzdit1c(yv[d0],yv[d0+1],p);
@@ -1709,7 +1825,12 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
     u32* const base=X+warp*288u;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
+#if defined(BPO_P3CU)||defined(BPO_P3LT)
+    bpo_p3x_smr<H>(base,v,sit,scu,p,p2,lane);
+#else
     if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
+#endif
+#undef BPO_P3S
     u32* const out=D+(u64(prime*8u+warp)*N+(c*256u+lane));
 #ifdef BPO_P3EL
     const u32 pm=12u;   // dfl 8: group-0 residues L2 evict_last; dfl 4: evict_first (bpo_p3_body order)

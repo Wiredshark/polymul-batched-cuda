@@ -543,8 +543,17 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
-            const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;   // floor(2^(64-msh)/p) < 2^32 (BPO_MIXED: h30 prime set)
+#ifdef BPO_P1PC   // wl3 p1pc: {p, m62, qsh, np} of prime r as one uint4 appended to T1 (twist + K/4*2048 words)
+            const uint4 pc_=__ldg(reinterpret_cast<const uint4*>(twist+(BCRT_K/4u)*2048u)+(4*u+tig));
+            const u32 r=4*u+tig,p=pc_.x;const u32 m62=pc_.y,qsh=pc_.z;
+#else
+            const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;
+#endif   // floor(2^(64-msh)/p) < 2^32 (BPO_MIXED: h30 prime set)
+#ifdef BPO_P1PC
+            const u32 np=(F&4096)?pc_.w:0u-p;
+#else
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
+#endif
             const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
             #pragma unroll
