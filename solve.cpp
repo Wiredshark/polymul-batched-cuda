@@ -26,7 +26,7 @@
 #include <condition_variable>
 #include <functional>
 #ifndef PIN_DEFAULT
-#define PIN_DEFAULT 2   // candidate 10: default chain-phase pin pattern (lock)
+#define PIN_DEFAULT 3   // candidate 10: default chain-phase pin pattern (k0_d3)
 #endif
 #if defined(FHERMA_POOL_NEW)
 static constexpr bool pool_new_built=true;
