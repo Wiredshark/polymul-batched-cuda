@@ -115,7 +115,16 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     __shared__ __align__(16) u32 stage_all[4][STW];
     const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
     u32* st=stage_all[warp];
+#ifdef BPO_CRTWP   // sched diag: work-pulling persistent grid, N / 128 tiles from bpo_wp_ctr[dfl >> 8] (prefetch above: once per block)
+    for(;;){
+    __syncthreads();
+    if(threadIdx.x==0)bpo_wp_sid=atomicAdd(bpo_wp_ctr+(dfl>>8),1u);
+    __syncthreads();
+    if(bpo_wp_sid>=N/128u)break;
+    const u32 i0=bpo_wp_sid*128+warp*32;
+#else
     const u32 i0=blockIdx.x*128+warp*32;
+#endif
     u32* const pbuf=st+32*SST;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
     auto prefetch=[&](u32 j){
         #pragma unroll
@@ -181,5 +190,8 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
             for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
         }
     }
+#ifdef BPO_CRTWP
+    }
+#endif
 }
 #endif

@@ -666,7 +666,7 @@ struct State {
     u32 p1s_cols=64,p1s_quads=4,p1s_skip=std::getenv("FHERMA_P1S_SKIP")?u32(std::atoi(std::getenv("FHERMA_P1S_SKIP"))):0u;   // skip: ablation only (1 a, 2 b)
    CUdeviceptr wsT[4]{};
     bool p1split()const{return pox&&!off(2048)&&cuda->bpo_p1a&&cuda->bpo_p1b&&ctab&&tc_bpt&&wsT[cur_ws]&&std::getenv("FHERMA_P1SPLIT");}
-    CUfunction ovr_fn[4]{};u32 ovr_smem[4]{},ovr_sm=0,ovr_p1grid=0,ovr_p2grid=0,ovr_slot=0;bool ovr_grev=false,ovr_ev_done=true;CUevent ovr_ev=nullptr;   // sched diag (batch_line only; never set for the timed graph)
+    CUfunction ovr_fn[4]{};u32 ovr_smem[4]{},ovr_sm=0,ovr_p1grid=0,ovr_p2grid=0,ovr_p3grid=0,ovr_crtgrid=0,ovr_slot=0;bool ovr_grev=false,ovr_ev_done=true;CUevent ovr_ev=nullptr;   // sched diag (batch_line only; never set for the timed graph)
     bool pox=false;u32 p1x=0,p1_grid=96;   // p1x: P1 kernel 1 bpo_first_x, 2 bpo_first_xv (graph variant 7, A/B FHERMA_P1X), 3 bpo_first_w
       // variant 4: persistent out-of-phase P1
     bool p3r16()const{return cuda->bpo_last_r16&&r16tab&&std::getenv("FHERMA_P3R16")&&std::atoi(std::getenv("FHERMA_P3R16"))!=0;}   // opt-in: neutral-to-slower locally (P3 is latency-bound, not issue-bound)
@@ -738,7 +738,7 @@ struct State {
             if(!(which&2)||!(sm&16)||fxon){}else if(po==2&&p3v2()&&p3r16()&&!t2n_old())d.launch3(d.bpo_last_r16,cols,gg,1u,128u,Cg,Ag,pgs_,itwg,r16tab+size_t(s0)*512*8,(mont?t2nM:t2n)+size_t(s0)*J*512*8,n,logrows);
             else if(po==2&&p3v2()){const CUfunction p3k=p1x==2&&d.bpo_last_cm3v?d.bpo_last_cm3v:!off(256)&&d.bpo_last_cm3?d.bpo_last_cm3:d.bpo_last_cm2;
                 const bool f3=p3f_ftab&&p3k==d.bpo_last_cm3&&n==65536&&logrows==8&&!(t2n_old()&&t2nO);
-                d.launch3s(f3&&ovr_fn[2]?ovr_fn[2]:f3?d.bpo_last_cm3f:p3k,cols,gg,1u,256u,f3?ovr_smem[2]:0u,Cg,Ag,pgs_,f3?p3f_ftab+size_t(s0)*65536*8:itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));}
+                d.launch3s(f3&&ovr_fn[2]?ovr_fn[2]:f3?d.bpo_last_cm3f:p3k,f3&&ovr_p3grid?ovr_p3grid:cols,f3&&ovr_p3grid?1u:gg,1u,256u,f3?ovr_smem[2]:0u,Cg,Ag,pgs_,f3?p3f_ftab+size_t(s0)*65536*8:itwg,stage_itw+size_t(s0)*256*8,(t2n_old()&&t2nO?(mont?t2nMO:t2nO):(mont?t2nM:t2n))+size_t(s0)*J*512*8,f3&&ovr_p3grid?((ovr_slot++)<<8)|gg:n,logrows,u32(l2on&&(l2f&4)?1u:0u)|(t2n_old()&&t2nO?2u:0u)|((gfl&8)&&r0+pg<k?4u:0u)|((gfl&128)&&r0==0&&pg<k?8u:0u));}
             else if(po==2)d.launch3(d.bpo_last_cm,cols,gg,1u,256u,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);
             else d.launch3(d.bpo_last,64u/p3h,gg,1u,256u*p3h,Cg,Ag,pgs_,itwg,stage_itw+size_t(s0)*256*8,invg,n);mark(4);};
             if(g2<pg&&p23db_now&&wsG2[cur_ws]&&side_streams[cur_ws]){   // P3(g) on a side stream overlaps P2(g+1); C double-buffered
@@ -756,7 +756,7 @@ struct State {
             if(!ovr_ev_done&&ovr_ev){static auto er_=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");d.check(er_(ovr_ev,d.stream));ovr_ev_done=true;}   // sched diag: half-phase start
         }
         if(!(sm&32)){}else if(fxon)d.launch3(d.bpo_p3crt_x,8u,256u,1u,64u,C,out,tc_bfrag,r16tab,t2nM,n,delta);
-        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&!std::getenv("FHERMA_NO_CRTPF");d.launch3s(ovr_fn[3]?ovr_fn[3]:d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?d.bpo_crt_lean:d.bpo_crt_tc_cm,n/128,1,1u,128u,ovr_smem[3],A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(std::getenv("FHERMA_CRTPF_ITEMS")?u32(std::atoi(std::getenv("FHERMA_CRTPF_ITEMS"))):3u*p1_grid/4,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}   // default (pv44 sweep x:crt=pf 0.983; items = 3*p1_grid/4 capped at 2 cols (pv61 whole-batch pf3q 0.994 vs p1_grid/2; FHERMA_CRTPF_ITEMS=n overrides): L2 prefetch of the next same-chain product's P1 input; none for the last product of each chain (next_a=0); FHERMA_NO_CRTPF=1 off
+        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&!std::getenv("FHERMA_NO_CRTPF");d.launch3s(ovr_fn[3]?ovr_fn[3]:d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?d.bpo_crt_lean:d.bpo_crt_tc_cm,ovr_crtgrid?ovr_crtgrid:n/128,1u,1u,128u,ovr_smem[3],A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(std::getenv("FHERMA_CRTPF_ITEMS")?u32(std::atoi(std::getenv("FHERMA_CRTPF_ITEMS"))):3u*p1_grid/4,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u)|(ovr_crtgrid?((ovr_slot++)<<8):0u));}   // default (pv44 sweep x:crt=pf 0.983; items = 3*p1_grid/4 capped at 2 cols (pv61 whole-batch pf3q 0.994 vs p1_grid/2; FHERMA_CRTPF_ITEMS=n overrides): L2 prefetch of the next same-chain product's P1 input; none for the last product of each chain (next_a=0); FHERMA_NO_CRTPF=1 off
         else if(po==2)d.launch(d.bpo_crt_cm,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));
         else if(d.batched_crt_tc&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT"))d.launch(d.batched_crt_tc,n/128,1,A,out,tc_bfrag,n,delta);
         else d.launch(d.batched_crt,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));mark(5);
@@ -966,7 +966,7 @@ struct State {
             const u32 S=std::min(std::max(1u,std::min(default_chains(),4u)),bcount);
             {static auto screate=d.driver.get<decltype(&::cuStreamCreate)>("cuStreamCreate");   // chains 3 / 4: streams and workspaces on demand
              for(u32 c=1;c<S;++c){if(!chain_streams[c])d.check(screate(&chain_streams[c],CU_STREAM_NON_BLOCKING));if(!wsA[c]){wsA[c]=d.alloc(size_t(k)*8*n*4);wsB[c]=d.alloc(size_t(k)*8*n*4);wsC[c]=d.alloc(size_t(k)*8*n*4);}}}
-            ovr_p1grid=o.p1grid;ovr_p2grid=o.p2grid;ovr_grev=o.grev;ovr_slot=0;
+            ovr_p1grid=o.p1grid;ovr_p2grid=o.p2grid;ovr_p3grid=o.p3grid;ovr_crtgrid=o.crtgrid;ovr_grev=o.grev;ovr_slot=0;
             if(o.half&&!ovr_ev){static auto ec=d.driver.get<decltype(&::cuEventCreate)>("cuEventCreate");d.check(ec(&ovr_ev,CU_EVENT_DISABLE_TIMING));}
             ovr_ev_done=!o.half;
             p23db_now=p23db_env(false);l2on=true;p1x=p1x_default();po=2;pox=true;xoff=0;for(int q=0;q<4;++q){ovr_fn[q]=o.fn[q];ovr_smem[q]=o.smem[q];}ovr_sm=o.sm;
@@ -981,7 +981,7 @@ struct State {
                 for(u32 c=1;c<S;++c){CUevent j=mk();d.check(erecord(j,cs[c]));d.check(swait(graph_stream,j,0));}
                 CUgraph g=nullptr;cap=false;d.check(endc(graph_stream,&g));const CUresult r=inst(&ge,g,0);gdestroy(g);d.check(r);
             }catch(...){if(cap){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}ge=nullptr;}
-            envrestore();ovr_p1grid=ovr_p2grid=0;ovr_grev=false;ovr_ev_done=true;
+            envrestore();ovr_p1grid=ovr_p2grid=ovr_p3grid=ovr_crtgrid=0;ovr_grev=false;ovr_ev_done=true;
             for(int q=0;q<4;++q){ovr_fn[q]=nullptr;ovr_smem[q]=0;}ovr_sm=0;d.stream=graph_stream;cur_ws=0;next_a=next_b=0;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;l2on=false;
         }
         if(!ge){std::printf("{\"diag\":\"sw\",\"k\":\"batch\",\"v\":\"%s\",\"error\":\"capture failed\"}\n",name);std::fflush(stdout);for(auto e:evs)edestroy(e);return {};}

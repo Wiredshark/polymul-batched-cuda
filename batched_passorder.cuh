@@ -985,7 +985,7 @@ template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],
 // FHERMA_P2_OLD=1 compiles the old body (BPO_P2_OLD).
 template<class T>__device__ __forceinline__ T* bpo_opq(T* p){asm("mov.b64 %0, %0;":"+l"(p));return p;}
 __device__ __forceinline__ u64 bpo_tw8(const char* tb,u32 s8,u32 k){return __ldg(reinterpret_cast<const u64*>(tb+u64(s8)*k));}
-#if (defined(BPO_P1WP)||defined(BPO_P2WP))&&!defined(BPO_WP_CTR_DECL)
+#if (defined(BPO_P1WP)||defined(BPO_P2WP)||defined(BPO_P3WP)||defined(BPO_CRTWP))&&!defined(BPO_WP_CTR_DECL)
 #define BPO_WP_CTR_DECL 1
 __device__ unsigned bpo_wp_ctr[4096];   // sched diag: per-launch work counters (zeroed by the host once per graph run)
 __shared__ unsigned bpo_wp_sid;          // the block's current tile
@@ -1708,7 +1708,11 @@ template<bool H>
 __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 dfl){
     constexpr u32 N=65536u,logR=8u;
+#ifdef BPO_P3WP   // sched diag: work-pulled tile (c, prime) = (t&255, t>>8)
+    const u32 c=bpo_wp_sid&255u,prime=bpo_wp_sid>>8,p=primes[prime];
+#else
     const u32 c=blockIdx.x,prime=blockIdx.y,p=primes[prime];
+#endif
     const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
@@ -1783,10 +1787,23 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
 extern "C" __global__ void __maxnreg__(32) bpo_last_cm3f(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];(void)N;(void)logR;
+#ifdef BPO_P3WP   // sched diag: work-pulling persistent grid, 256 * (N & 255) tiles from bpo_wp_ctr[N >> 8]
+    for(;;){
+        __syncthreads();
+        if(threadIdx.x==0)bpo_wp_sid=atomicAdd(bpo_wp_ctr+(N>>8),1u);
+        __syncthreads();
+        const u32 t_=bpo_wp_sid;if(t_>=256u*(N&255u))break;
+#if BPO_NH30
+        if(primes[t_>>8]<(1u<<30))bpo_p3b_body<true,true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
+#endif
+        bpo_p3b_body<false,true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
+    }
+#else
 #if BPO_NH30
     if(primes[blockIdx.y]<(1u<<30))bpo_p3b_body<true,true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
 #endif
     bpo_p3b_body<false,true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
+#endif
 }
 // F table init (once): F[prime][c][t] = the bpo_p3b_body F factor (same formula), grid (256, K), 256 threads
 extern "C" __global__ void __launch_bounds__(256) bpo_ftab_init(const u64* untwist,const u32* primes,u64* out){

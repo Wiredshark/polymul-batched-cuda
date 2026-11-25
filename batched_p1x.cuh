@@ -586,7 +586,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
-#if (defined(BPO_P1WP)||defined(BPO_P2WP))&&!defined(BPO_WP_CTR_DECL)
+#if (defined(BPO_P1WP)||defined(BPO_P2WP)||defined(BPO_P3WP)||defined(BPO_CRTWP))&&!defined(BPO_WP_CTR_DECL)
 #define BPO_WP_CTR_DECL 1
 __device__ unsigned bpo_wp_ctr[4096];   // sched diag: per-launch work counters (zeroed by the host once per graph run)
 __shared__ unsigned bpo_wp_sid;          // the block's current tile
