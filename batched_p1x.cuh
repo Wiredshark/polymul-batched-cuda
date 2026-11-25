@@ -28,6 +28,12 @@
 //    stored with one 3-D tensor copy (box 8 words x 32 slot octets x 1 plane) by lane 0; before the next quad
 //    overwrites X, lane 0 waits for the bulk reads (wait_group.read 0).
 #if defined(BPT_ENABLE)&&defined(BPR_DT)
+#ifndef BPO_RM   // abl diag: removal bits (patch_abl_kern.py); 0 = production
+#define BPO_RM 0
+#endif
+#ifndef BPO_RMK   // abl diag: thread-varying register value standing in for a removed table load
+#define BPO_RMK(a,b) (u64(u32(a)*0x9e3779b9u+u32(b))|(u64(u32(a)^u32(b))<<32))
+#endif
 #ifndef BPO_MA   // memd diag: memory twin ablation bits (patch_memd_kern.py)
 #define BPO_MA 0
 #endif
@@ -307,7 +313,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
             else{d[0]=sw?e1:e0;d[sw?-1:1]=sw?e0:e1;}}}
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13)||stm==3u)){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13&&!(BPO_RM&1024))||stm==3u)){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -319,6 +325,7 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
 }
 __device__ __forceinline__ ulonglong2 xct_ldv(const u64* ctg,u32 lane,u32 m2){   // cross twiddles 2 m2, 2 m2+1 of a lane, never CSE'd across pairs (registers)
     ulonglong2 w;
+    if(BPO_RM&1){w.x=BPO_RMK(lane,m2);w.y=BPO_RMK(m2+7u,lane);(void)ctg;return w;}   // abl: ctab removed
 #ifdef BPO_P1WL   // wline p1wl (FHERMA_P1WL=1): host table ctab_wl[r][c][64 m2 + 2 lane + e] = ctab[r][c][8 lane + 2 m2 + e]: one request = 512 contiguous bytes (4 whole lines)
     asm volatile("ld.global.nc.v2.u64 {%0,%1},[%2];":"=l"(w.x),"=l"(w.y):"l"(ctg+2*lane+64*m2));
 #else
@@ -414,7 +421,7 @@ __device__ __forceinline__ void xrdif6q(u32* const base0,const u32 so,const u64*
 #if BPO_X_HAS_TMA
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
-    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13)||stm==3u)&&!(BPO_XA==5&&(BPO_MA&2))){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
+    if(lane==0&&BPO_XA!=8&&BPO_XA!=11&&((BPO_XA!=12&&BPO_XA!=13&&!(BPO_RM&1024))||stm==3u)&&!(BPO_XA==5&&(BPO_MA&2))){   // ablation 12 (ovl compute twin): stores kept, predicated off (stm 3 never set)
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         if(BPO_XA==5&&(BPO_MA&4))c&=15u;   // memd: stores into columns c mod 16 (L2-resident window)
@@ -436,7 +443,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
-    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(c&15u):c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores); 12: columns c mod 16 (L2-resident window)
+    const u32* src=(op?b:a)+u64(BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1))||(BPO_RM&256))?(c&15u):c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores); 12: columns c mod 16 (L2-resident window)
     u32* dst=op?B:A;
     if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
@@ -449,7 +456,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr u32 MT=(F&8)?1:2,WR=16*MT,NW=256/WR;   // m-tiles per warp, rows per warp, warps
     u32 af[8][MT][4];
     constexpr u32 XRS=60;   // flag 512 smem row stride (words): 15 aligned 16 B chunks, conflict-free fragment reads
-    const u32 xoff=((BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(c&15u):c)*L)&3u;
+    const u32 xoff=((BPO_XA==11?0u:(BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1))||(BPO_RM&256))?(c&15u):c)*L)&3u;
     if(BPO_XA==5&&(BPO_MA&32)){   // memd: the block's input bytes (256 x L words) as one contiguous whole-line LDG.128 stream, then exit
         const uint4* q4=reinterpret_cast<const uint4*>((op?b:a)+u64(c)*256u*L);u32 acc=0;
         #pragma unroll 4
@@ -534,7 +541,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             }
     }
     if(pfstep&&h<256u&&id+pfstep<512u){
-        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64((BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1)))?(pf&15u):(pf&255u))*L+u64(h*256u)*L;
+        const u32 pf=id+pfstep;const u32* ps=(pf>=256u?b:a)+u64((BPO_XA==12||BPO_XA==13||(BPO_XA==5&&(BPO_MA&1))||(BPO_RM&256))?(pf&15u):(pf&255u))*L+u64(h*256u)*L;
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));
         asm volatile("prefetch.global.L2 [%0];"::"l"(ps+L-1));
@@ -553,23 +560,23 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
         if(F&4){
             #pragma unroll
-            for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t(4*u+q)*256+h];
+            for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t((BPO_RM&2)?q:4*u+q)*256+h];
         }
-        if((F&16384)&&(F&8192)&&S6&&NW==8){   // flag 16384: phase-B cross twiddles of this warp's prime pulled into L1 now (L2 latency off phase B)
+        if((F&16384)&&(F&8192)&&S6&&NW==8&&!(BPO_RM&1)){   // flag 16384: phase-B cross twiddles of this warp's prime pulled into L1 now (L2 latency off phase B)
             const u64* const ctp=ctab+(size_t(4*u+(warp>>1))*256u+c)*256u+8u*lane;
             asm volatile("prefetch.global.L1 [%0];"::"l"(ctp));
         }
         if(BPO_XA!=4&&BPO_XA!=5){   // ablation 4/5: no phase A
             const u32 r=4*u+tig,p=bpr_pr[r];const u32 msh=(BPO_MIXED&&p<(1u<<30))?3u:2u;const u32 m62=u32(bpr_mu[r]>>msh),qsh=18u-msh;   // floor(2^(64-msh)/p) < 2^32 (BPO_MIXED: h30 prime set)
             const u32 np=(F&4096)?bpr_np.v[r]:0u-p;
-            const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t(r)*256;
+            const u64* tw=twist+size_t(r)*stride;const u64* st=stage_tw+size_t((BPO_RM&2)?tig:r)*256;
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
             #pragma unroll
             for(u32 j=0;j<8;++j){
 #ifdef BPO_P1WL   // wline p1wl: host table bpt_wl[(4 j + u) 32 + lane] (uint4) = bpt[(32 j + lane) 16 + 4 u ..]: 512 contiguous bytes per request
-                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
+                const uint4 bv=(BPO_RM&2)?make_uint4(lane*977u+j,u+lane,lane^j,j*u+1u):__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
 #else
-                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
+                const uint4 bv=(BPO_RM&2)?make_uint4(lane*977u+j,u+lane,lane^j,j*u+1u):__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
 #endif
                 #pragma unroll
                 for(u32 mt=0;mt<MT;++mt){
@@ -602,7 +609,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
 #ifdef BPO_P1TW
-                    const u64 t2=TW?t1[256u*rr]:tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+                    const u64 t2=(BPO_RM&2)?BPO_RMK(rl+rr,tig):TW?t1[256u*rr]:tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #else
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #endif
@@ -639,7 +646,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
         if((F&8192)&&S6&&NW==8&&BPO_XA!=3){   // warp w: prime q = w>>1, digits 4(w&1)..+3 as NC-column groups sharing twiddles
             constexpr u32 NC=BPO_X_NC;
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
-            const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
+            const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t((BPO_RM&2)?q:r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
             if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
             else{
             #pragma unroll

@@ -1,5 +1,5 @@
 #pragma once
-// pipe diag (round 34: what binds inside the production pipeline: compute / memory twins in the production schedule,
+// abl diag (round 35, on 0640c2f = pipe diag on 5ca0049): real-kernel class removal (BPO_RM). Former: pipe diag (round 34: what binds inside the production pipeline: compute / memory twins in the production schedule,
 // L2 capacity probes). Former header: sched3 diag (round 33, on 5ca0049 = candidate 5; all four stages as work-pulling resident-slot grids, depth-first groups; production PTX unchanged by this file): whole-batch schedule variants aimed at
 // "GPU full AND working set in L2". Every line = the production graph (variant 6) recaptured with one change, timed in paired
 // alternating reps against the production graph exec; ex = 1 when all B outputs are bit-identical (trivial-kernel lines: not
@@ -135,6 +135,9 @@ template<class C> inline void pipe_probes(C& d,int which,const char* tag){
 
 template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
     const std::function<BatchRes(const BatchOvr&,const char*)>& line,CUfunction& cmp){
+    // abl diag (round 35): the cost of each memory class inside the REAL pipeline. Every line = the production graph
+    // (variant 6, 2 chains, same launches) recaptured with all four stages from a diag module compiled with
+    // BPO_RM = mask (patch_abl_kern.py): the real kernels with one class removed (arithmetic kept). Timing-only (ex=0).
     if(const char* e=std::getenv("FHERMA_COMBO"))if(*e=='0')return;
     const auto t0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();};
     const double budget=std::getenv("FHERMA_COMBO_S")?std::atof(std::getenv("FHERMA_COMBO_S")):300.0;
@@ -142,19 +145,18 @@ template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
     std::string s=src;{const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
     ComboMods<C> M(d);
     const int m_rc=M.add("rc",s+"\nextern \"C\" __global__ void cb_cmp(const uint4* a,const uint4* b,unsigned long long n,unsigned* bad){unsigned c=0;for(unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n",{"cb_cmp"});
-    const char* P1N="bpo_first_xr<0>";
-    // compute twins: C (L2-window data, stores and discards predicated off), C2 (C without data loads)
-    const int m_c1=M.add("xa12","#define BPO_XA 12\n"+s,{P1N}),m_c2p1=M.add("xa13","#define BPO_XA 13\n"+s,{P1N});
+    const std::vector<std::string> KN={"bpo_first_xr<0>","bpo_middle_r16c<0>","bpo_last_cm3f<0>","bpo_crt_lean<0>"};
+    // compute twins of the pipe diag (allC reference line)
+    const int m_c1=M.add("xa12","#define BPO_XA 12\n"+s,{"bpo_first_xr<0>"});
     const int m_tc=M.add("twc","#define BPO_TWC 1\n"+s,{"bpo_middle_r16c<0>","bpo_last_cm3f<0>","bpo_crt_lean<0>"});
-    const int m_tc2=M.add("twc2","#define BPO_TWC 2\n"+s,{"bpo_middle_r16c<0>","bpo_last_cm3f<0>","bpo_crt_lean<0>"});
-    // memory twins (no math) with ablation bits MA: P1 = BPO_XA 5, P2 / P3 / CRT = BPO_TWM wl4_p2m / wl4_p3m / wl4_crtm
-    const unsigned MAV[5]={0,1,4,8,16};int m_p1m[5],m_twm[5];
-    for(int i=0;i<5;++i){const std::string ma="#define BPO_MA "+std::to_string(MAV[i])+"\n";char b[24];
-        std::snprintf(b,sizeof b,"p1m%u",MAV[i]);m_p1m[i]=(MAV[i]==0||MAV[i]==1||MAV[i]==4)?M.add(b,"#define BPO_XA 5\n"+ma+s,{P1N}):-1;
-        std::snprintf(b,sizeof b,"twm%u",MAV[i]);m_twm[i]=M.add(b,"#define BPO_TWM 1\n"+ma+s,{"wl4_p2m<0>","wl4_p3m<0>","wl4_crtm<0>"});}
+    struct V { const char* nm; unsigned rm; int m=-1; };
+    std::vector<V> v={{"rm0",0},
+        {"t_p1ct",1},{"t_p1tw",2},{"t_p2mt",4},{"t_p2st",8},{"t_p3f",16},{"t_p3t2n",32},{"t_p3sit",64},{"t_crt",128},{"t_all",255},
+        {"d_in",256},{"d_out",512},{"d_ab",1024},{"d_c",2048},{"d_res",4096},{"d_all",7936},{"all",8191}};
+    for(auto& x:v){char b[24];std::snprintf(b,sizeof b,"rm%u",x.rm);x.m=M.add(b,"#define BPO_RM "+std::to_string(x.rm)+"u\n"+s,KN);}
     M.build();
-    std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"round\":\"pipe\",\"cc\":\"%d.%d\",\"sms\":%d,\"B\":%u,\"mods\":%zu,\"compile_s\":%.1f}\n",cc1,cc2,sms,T.b,M.progs.size(),el());
-    for(const auto& P:M.progs)if(!P.mod)std::printf("{\"diag\":\"pipe\",\"k\":\"mod\",\"m\":\"%s\",\"err\":\"%.120s\"}\n",P.name.c_str(),P.err.c_str());
+    std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"round\":\"abl\",\"cc\":\"%d.%d\",\"sms\":%d,\"B\":%u,\"mods\":%zu,\"compile_s\":%.1f}\n",cc1,cc2,sms,T.b,M.progs.size(),el());
+    for(const auto& P:M.progs)if(!P.mod)std::printf("{\"diag\":\"abl\",\"k\":\"mod\",\"m\":\"%s\",\"err\":\"%.120s\"}\n",P.name.c_str(),P.err.c_str());
     std::fflush(stdout);
     cmp=M.fn(m_rc,0);
     {   // every diag module's own __constant__ p2cu table = copy of the production module's (filled by build_tabs)
@@ -163,50 +165,21 @@ template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
         if(gglob(&pc,&ps,d.module,"bpo_p2cu")==CUDA_SUCCESS)for(const auto& P:M.progs){CUdeviceptr wc=0;size_t ws=0;if(P.mod&&gglob(&wc,&ws,P.mod,"bpo_p2cu")==CUDA_SUCCESS&&ws==ps)cpy(wc,pc,ps);}
         d.cuCtxSynchronize();}
     const double B=T.b?double(T.b):1.0;
-    // per-stage function tables: [0] P1, [1] P2, [2] P3, [3] CRT
-    CUfunction CF[4]={M.fn(m_c1),M.fn(m_tc,0),M.fn(m_tc,1),M.fn(m_tc,2)},C2F[4]={M.fn(m_c2p1),M.fn(m_tc2,0),M.fn(m_tc2,1),M.fn(m_tc2,2)};
-    auto MF=[&](int q,unsigned ma)->CUfunction{int i=0;while(i<5&&MAV[i]!=ma)++i;if(i==5)return nullptr;return q==0?M.fn(m_p1m[i]):M.fn(m_twm[i],size_t(q-1));};
-    const unsigned MASK[4]={2u,8u,16u,32u};const char* SN[4]={"p1","p2","p3","crt"};
-    auto run=[&](const char* v,BatchOvr o)->BatchRes{BatchRes r;if(el()>budget){std::printf("{\"diag\":\"pipe\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",v);std::fflush(stdout);return r;}
-        o.quiet=true;r=line(o,v);return r;};
-    auto pl=[&](const char* v,const BatchOvr& o){   // one pipeline line: us per product, vs production, ex (twin lines are timing-only: ex=0 by design)
-        bool okf=true;for(int q=0;q<4;++q)if(o.fn[q]==nullptr&&o.need[q])okf=false;
-        if(!okf){std::printf("{\"diag\":\"pipe\",\"v\":\"%s\",\"skipped\":\"module\"}\n",v);std::fflush(stdout);return;}
-        const BatchRes r=run(v,o);if(!r.ok)return;
-        std::printf("{\"diag\":\"pipe\",\"v\":\"%s\",\"us\":%.2f,\"prod_us\":%.2f,\"vs_prod\":%.4f,\"ex\":%d%s}\n",v,r.med/B,r.prod/B,r.vs,r.ex,o.check?"":",\"timing_only\":1");std::fflush(stdout);};
-    auto tw=[&](CUfunction a,CUfunction b,CUfunction c,CUfunction e){BatchOvr o;CUfunction f[4]={a,b,c,e};for(int q=0;q<4;++q){o.fn[q]=f[q];o.need[q]=true;}o.check=false;return o;};
-    auto allM=[&](unsigned m0,unsigned m1,unsigned m2,unsigned m3){return tw(MF(0,m0),MF(1,m1),MF(2,m2),MF(3,m3));};
-    auto hyb=[&](int real){BatchOvr o;for(int q=0;q<4;++q)if(q!=real){o.fn[q]=CF[q];o.need[q]=true;}o.check=false;return o;};
-    auto pipeline=[&](const char* sfx){
-        char v[40];auto nm=[&](const char* a){std::snprintf(v,sizeof v,"%s%s",a,sfx);return v;};
-        pl(nm("allC"),tw(CF[0],CF[1],CF[2],CF[3]));
-        if(!*sfx)pl(nm("allC2"),tw(C2F[0],C2F[1],C2F[2],C2F[3]));
-        pl(nm("allM"),allM(0,0,0,0));
-        pl(nm("M_in_l2"),allM(1,0,0,0));       // P1 input reads from a 16-column L2-resident window
-        pl(nm("M_out_l2"),allM(0,0,0,4));      // CRT output stores into an L2-resident window
-        pl(nm("M_ab_l2"),allM(4,1,0,0));       // P1 A,B stores and P2 A,B loads in L2-resident windows
-        pl(nm("M_c_l2"),allM(0,4,1,0));        // P2 C stores and P3 C loads in L2-resident windows
-        pl(nm("M_res_l2"),allM(0,0,4,1));      // P3 residue stores and CRT residue loads in L2-resident windows
-        pl(nm("M_notab"),allM(0,8,8,8));       // P2 twiddles, P3 untwist / stage / t2n tables, CRT bfrag: no loads
-        pl(nm("M_nopf"),allM(0,0,0,16));       // CRT next-input L2 prefetch off
-        pl(nm("H_realP1"),hyb(0));pl(nm("H_realP2"),hyb(1));pl(nm("H_realP3"),hyb(2));pl(nm("H_realCRT"),hyb(3));
-    };
-    auto ctrl=[&](const char* v){BatchOvr o;const BatchRes r=run(v,o);if(r.ok){std::printf("{\"diag\":\"pipe\",\"v\":\"%s\",\"us\":%.2f,\"prod_us\":%.2f,\"vs_prod\":%.4f,\"ex\":%d}\n",v,r.med/B,r.prod/B,r.vs,r.ex);std::fflush(stdout);}};
-    ctrl("ctrl");
-    // 1. stage-isolated compute utilization: only stage q in the graph (stage mask), R = production kernel, C / C2 = twins
-    for(int q=0;q<4;++q){double r[3]={-1,-1,-1};char v[32];
-        {BatchOvr o;o.sm=MASK[q];o.check=false;std::snprintf(v,sizeof v,"%s_R",SN[q]);const BatchRes x=run(v,o);if(x.ok)r[0]=x.med/B;}
-        if(CF[q]){BatchOvr o;o.sm=MASK[q];o.check=false;o.fn[q]=CF[q];std::snprintf(v,sizeof v,"%s_C",SN[q]);const BatchRes x=run(v,o);if(x.ok)r[1]=x.med/B;}
-        if(C2F[q]){BatchOvr o;o.sm=MASK[q];o.check=false;o.fn[q]=C2F[q];std::snprintf(v,sizeof v,"%s_C2",SN[q]);const BatchRes x=run(v,o);if(x.ok)r[2]=x.med/B;}
-        std::printf("{\"diag\":\"pipe\",\"k\":\"cutil\",\"st\":\"%s\",\"R\":%.2f,\"C\":%.2f,\"C2\":%.2f,\"timing_only\":1}\n",SN[q],r[0],r[1],r[2]);std::fflush(stdout);}
-    // 2. pipeline-level twins in the production schedule
-    pipeline("");
-    // 3. L2 capacity curve + persistence
-    pipe_probes(d,3,"");
-    // repeat of the key lines
-    pipeline("_r");
-    pipe_probes(d,1,"_r");
-    ctrl("ctrl_end");
-    std::printf("{\"diag\":\"pipe\",\"k\":\"done\",\"s\":%.2f}\n",el());std::fflush(stdout);
+    auto run=[&](const char* nm,BatchOvr o)->BatchRes{BatchRes r;if(el()>budget){std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",nm);std::fflush(stdout);return r;}
+        o.quiet=true;r=line(o,nm);return r;};
+    auto out=[&](const char* nm,const BatchRes& r,bool to){if(!r.ok)return;
+        std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"us\":%.2f,\"prod_us\":%.2f,\"vs_prod\":%.4f,\"ex\":%d%s}\n",nm,r.med/B,r.prod/B,r.vs,r.ex,to?",\"timing_only\":1":"");std::fflush(stdout);};
+    auto one=[&](const V& x,const char* sfx){char nm[40];std::snprintf(nm,sizeof nm,"%s%s",x.nm,sfx);
+        BatchOvr o;bool ok=true;for(int q=0;q<4;++q){o.fn[q]=M.fn(x.m,size_t(q));if(!o.fn[q])ok=false;}
+        if(!ok){std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"skipped\":\"module\"}\n",nm);std::fflush(stdout);return;}
+        o.check=x.rm==0;out(nm,run(nm,o),x.rm!=0);};   // rm0 (module identity) is checked: ex must be 1
+    auto allc=[&](const char* nm){BatchOvr o;CUfunction f[4]={M.fn(m_c1),M.fn(m_tc,0),M.fn(m_tc,1),M.fn(m_tc,2)};bool ok=true;for(int q=0;q<4;++q){o.fn[q]=f[q];if(!f[q])ok=false;}
+        if(!ok)return;o.check=false;out(nm,run(nm,o),true);};
+    {BatchOvr o;out("ctrl",run("ctrl",o),false);}
+    for(int pass=0;pass<2;++pass){const char* sfx=pass?"_r":"";
+        for(const auto& x:v)one(x,sfx);
+        char nm[16];std::snprintf(nm,sizeof nm,"allC%s",sfx);allc(nm);}
+    {BatchOvr o;out("ctrl_end",run("ctrl_end",o),false);}
+    std::printf("{\"diag\":\"abl\",\"k\":\"done\",\"s\":%.2f}\n",el());std::fflush(stdout);
     d.cuCtxSynchronize();cmp=nullptr;
 }

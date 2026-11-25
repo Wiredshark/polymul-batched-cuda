@@ -1,3 +1,9 @@
+#ifndef BPO_RM   // abl diag: removal bits (patch_abl_kern.py); 0 = production
+#define BPO_RM 0
+#endif
+#ifndef BPO_RMK   // abl diag: thread-varying register value standing in for a removed table load
+#define BPO_RMK(a,b) (u64(u32(a)*0x9e3779b9u+u32(b))|(u64(u32(a)^u32(b))<<32))
+#endif
 // Pass-order restructure (N=65536, R=S=256, J=8), NVRTC-specialized.
 // Same exact modular values as prepare2 -> forward -> middle -> inverse; only the
 // placement of the (commuting) J-axis transforms and the intermediate layouts differ:
@@ -1007,8 +1013,16 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
 #ifdef BPO_P2CU   // CU: stage twiddles from the constant table (untw bits 24-31 = global index of the group's first prime)
     const u64* const cuf=CU?bpo_p2cu+((untw>>24)+prime)*256u:tf;const u64* const cui=CU?cuf+128u:ti;
+#if (BPO_RM)&8   // abl: stage twiddles removed (register values; constant indices only)
+    u64 rmt_[113];
+    #pragma unroll
+    for(u32 e=1;e<8;++e)rmt_[16u*e]=BPO_RMK(c2,e);
+#define BPO_P2TF rmt_
+#define BPO_P2TI rmt_
+#else
 #define BPO_P2TF cuf
 #define BPO_P2TI cui
+#endif
 #else
 #define BPO_P2TF tf
 #define BPO_P2TI ti
@@ -1017,16 +1031,18 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
 #define P2A_G (g&15u)
 #define P2ST if(untw&0x40000000u)
 #define P2DM 0x40000000u
-    const u64 base=u64(prime*8)*N;
+#define P2S_G (g&15u)
+    const u64 base=u64(prime*8)*N,lbase=base;
 #else
-#define P2DM 8u
-#define P2A_G g
-#define P2ST
-    const u64 base=u64(prime*8+j)*N;
+#define P2DM ((BPO_RM&1024)?0x40000000u:8u)
+#define P2A_G ((BPO_RM&1024)?(g&15u):g)
+#define P2S_G g
+#define P2ST if(!(BPO_RM&2048)||(untw&0x40000000u))
+    const u64 base=u64(prime*8+j)*N,lbase=(BPO_RM&1024)?u64(prime*8)*N:base;   // abl: A,B loads from a window, C stores real
 #endif
     const u32 off=P2A_G*2048u+c2*8u+s;
     u32 a[16],b[16];
-    {   const u32* a0=A+base+off;const u32* b0=B+base+off;
+    {   const u32* a0=A+lbase+off;const u32* b0=B+lbase+off;
         #pragma unroll
 #if defined(BPO_TWC)&&BPO_TWC==2   // compute twin without data loads
         for(u32 c1=0;c1<16;++c1){a[c1]=(off+c1*977u)&0x3fffffffu;b[c1]=(off^(c1*7919u))&0x3fffffffu;(void)a0;(void)b0;}
@@ -1040,14 +1056,14 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
     #pragma unroll
 #ifdef BPO_P2MT
-    for(u32 i=1;i<16;++i){const u64 w=MT?__ldg(tmf+16u*i):bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+    for(u32 i=1;i<16;++i){const u64 w=MT?((BPO_RM&4)?BPO_RMK(c2,i):__ldg(tmf+16u*i)):bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
 #else
     for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
 #endif
     #pragma unroll
     for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
     __syncthreads();   // every thread's A/B loads have completed (values consumed above)
-    if(untw&P2DM)bpo_discard((threadIdx.x<64u?A:B)+base+P2A_G*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
+    if(untw&P2DM)bpo_discard((threadIdx.x<64u?A:B)+lbase+P2A_G*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=tr_[i];   // thread row t = c2: k1 = brev4(c2)
     __syncthreads();
@@ -1064,7 +1080,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     {const u32 k8=8u*r16_brev4(c2);
         #pragma unroll
 #ifdef BPO_P2MT
-        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],MT?__ldg(tmi+16u*i):bpo_tw8(tib,k8,i),p);
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],MT?((BPO_RM&4)?BPO_RMK(i,c2):__ldg(tmi+16u*i)):bpo_tw8(tib,k8,i),p);
 #else
         for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);   // natural c2' = i
 #endif
@@ -1076,8 +1092,9 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     #pragma unroll
     for(u32 i=0;i<16;++i)a[i]=tw_[17*i];   // register i = row i -> k1 = brev4(i): bit-reversed input
     r16_dit16h<H,true>(a,BPO_P2TI,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
-    u32* o=C+base+(c2*256u+P2A_G*8u+s);
+    u32* o=C+base+(c2*256u+P2S_G*8u+s);
 #undef P2A_G
+#undef P2S_G
 #undef P2DM
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)P2ST o[4096u*c1]=a[c1];
@@ -1087,7 +1104,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
 #undef BPO_P2TI
 #ifdef BPO_P2MT
 // p2mt entry: bpo_middle_r16 with the r16x middle twiddles (host launches it only when r16x was built; else bpo_middle_r16)
-#ifdef BPO_TWC
+#if defined(BPO_TWC)||(BPO_RM)   // abl: RM variants keep R's 9 blocks/SM
 #define P2TWC_LB __launch_bounds__(128,9)   // ovl compute twin: R's register count (56, 9 blocks/SM)
 #else
 #define P2TWC_LB __launch_bounds__(128)
@@ -1710,15 +1727,19 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
 #define P3A_P prime
 #define P3ST if(dfl&0x40000000u)
 #define P3DM 0x40000000u
+#define P3T_C (c&15u)
+#define P3S_C (c&15u)
 #else
-#define P3DM 1u
-#define P3ST
-#define P3A_C c
+#define P3DM ((BPO_RM&2048)?0x40000000u:1u)
+#define P3ST if(!(BPO_RM&4096)||(dfl&0x40000000u))
+#define P3A_C ((BPO_RM&2048)?(c&15u):c)
+#define P3T_C c
+#define P3S_C c
 #define P3A_P prime
 #endif
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
     const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
-    const u64* sit=stage_itw+prime*256u;
+    const u64* sit=stage_itw+((BPO_RM&64)?0u:prime*256u);
     u32 yv[8];
     {const u32* src=C+u64(P3A_P*8u)*N+(P3A_C*256u+t);
         #pragma unroll
@@ -1729,7 +1750,7 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
 #endif
     u64 F;
 #ifdef BPO_P3F   // p3f (PF, kernel bpo_last_cm3f): untwist argument = F table [prime][c][t] (bpo_ftab_init: the values of the block below)
-    if(PF)F=__ldg(untwist+(u64(P3A_P)*65536u+(P3A_C*256u+t)));else
+    if(PF)F=(BPO_RM&16)?BPO_RMK(t,c):__ldg(untwist+(u64(P3A_P)*65536u+(P3T_C*256u+t)));else
 #endif
     {
         const u32 k1=__brev(t)>>(32-logR);
@@ -1762,19 +1783,21 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
         #pragma unroll
         for(u32 d=0;d<8;++d)xw[d*288u]=yv[d];}
     __syncthreads();
-    const u64* const tn=t2n+(u64(P3A_P*8u+warp)*512u+((P3A_C>>7)*256u+lane));
+    const u64* const tn=t2n+(u64(P3A_P*8u+warp)*512u+((P3T_C>>7)*256u+lane));
     u64 tv[8];
     #pragma unroll
-    for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+32u*m);
+    for(u32 m=0;m<8;++m)tv[m]=(BPO_RM&32)?BPO_RMK(lane,m):__ldg(tn+32u*m);
     if((dfl&P3DM)&&lane<8u)bpo_discard(C+u64(P3A_P*8u+lane)*N+(P3A_C*256u+32u*warp));   // C lines read by this warp (all used)
     u32 v[8];
     u32* const base=X+warp*288u;
     {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
      v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
     if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
-    u32* const out=D+(u64(P3A_P*8u+warp)*N+(P3A_C*256u+lane));
+    u32* const out=D+(u64(P3A_P*8u+warp)*N+(P3S_C*256u+lane));
 #undef P3A_C
 #undef P3A_P
+#undef P3T_C
+#undef P3S_C
 #ifdef BPO_P3EL
     const u32 pm=12u;   // dfl 8: group-0 residues L2 evict_last; dfl 4: evict_first (bpo_p3_body order)
 #else

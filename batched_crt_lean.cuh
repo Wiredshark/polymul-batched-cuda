@@ -11,6 +11,12 @@
 //    selected by (borrow, bit W, t >= q) instead of fold 2, -q, -bias, +q.
 #ifdef BTC_F
 typedef long long i64;
+#ifndef BPO_RM   // abl diag: removal bits (patch_abl_kern.py); 0 = production
+#define BPO_RM 0
+#endif
+#ifndef BPO_RMK   // abl diag: thread-varying register value standing in for a removed table load
+#define BPO_RMK(a,b) (u64(u32(a)*0x9e3779b9u+u32(b))|(u64(u32(a)^u32(b))<<32))
+#endif
 __device__ __forceinline__ void swc_cpa16(u32 dst,const void* src){asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(dst),"l"(src):"memory");}
 __device__ __forceinline__ void swc_commit(){asm volatile("cp.async.commit_group;":::"memory");}
 __device__ __forceinline__ void swc_wait0(){asm volatile("cp.async.wait_group 0;":::"memory");}
@@ -101,7 +107,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
 #ifdef BPO_TWC   // ovl compute twin: no next-product L2 prefetch, block 0's coefficients
     if(false){
 #else
-    if(pfitems){
+    if(pfitems&&!(BPO_RM&256)){
 #endif
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
@@ -120,13 +126,13 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
     u32* st=stage_all[warp];
 #ifdef BPO_TWC   // ovl compute twin: 32 coefficient blocks only (2 MB, L2-resident); stores predicated off (dfl bit 30)
-    const u32 i0=(blockIdx.x&31u)*128+warp*32;
+    const u32 i0=(blockIdx.x&31u)*128+warp*32,il0=i0;
 #define CRTST if(dfl&0x40000000u)
 #define CRTDM 0x40000000u
 #else
-#define CRTDM 1u
-#define CRTST
-    const u32 i0=blockIdx.x*128+warp*32;
+#define CRTDM ((BPO_RM&4096)?0x40000000u:1u)
+#define CRTST if(!(BPO_RM&512)||(dfl&0x40000000u))
+    const u32 i0=blockIdx.x*128+warp*32,il0=(BPO_RM&4096)?(blockIdx.x&31u)*128+warp*32:i0;   // abl: residue loads from a window
 #endif
     u32* const pbuf=st+32*SST;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
     auto prefetch=[&](u32 j){
@@ -135,11 +141,11 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
 #if defined(BPO_TWC)&&BPO_TWC==2   // compute twin without data loads (pbuf left as is)
             (void)r;(void)ch;}
 #else
-            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+il0+4*ch);}
 #endif
         swc_commit();};
     prefetch(0);
-    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
+    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=(BPO_RM&128)?x*2654435761u:bfrag[x];
     __syncthreads();
     u32 acc[NW+2];   // [64..65]: scratch of the digit chains
     #pragma unroll
@@ -181,7 +187,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
         acc[WO]&=(1u<<WS)-1;
     }
-    if(dfl&CRTDM)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
+    if(dfl&CRTDM)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+il0);
     const u32 cc_=i0>>8,h0=i0&255u;
     {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
         __syncwarp();
