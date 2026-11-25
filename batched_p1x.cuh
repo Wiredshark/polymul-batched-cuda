@@ -316,7 +316,11 @@ __device__ __forceinline__ void xrdif6s(u32* const base0,const u32 so,const u64*
 }
 __device__ __forceinline__ ulonglong2 xct_ldv(const u64* ctg,u32 lane,u32 m2){   // cross twiddles 2 m2, 2 m2+1 of a lane, never CSE'd across pairs (registers)
     ulonglong2 w;
+#ifdef BPO_P1WL   // wline p1wl (FHERMA_P1WL=1): host table ctab_wl[r][c][64 m2 + 2 lane + e] = ctab[r][c][8 lane + 2 m2 + e]: one request = 512 contiguous bytes (4 whole lines)
+    asm volatile("ld.global.nc.v2.u64 {%0,%1},[%2];":"=l"(w.x),"=l"(w.y):"l"(ctg+2*lane+64*m2));
+#else
     asm volatile("ld.global.nc.v2.u64 {%0,%1},[%2];":"=l"(w.x),"=l"(w.y):"l"(ctg+8*lane+2*m2));
+#endif
     return w;
 }
 // Flag 131072 (with 8192) phase B, xrdif6q (sweep a26c406 "pbq"; on target 0.938x P1 time, exact): the warp's 4 columns
@@ -545,7 +549,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             u32 res[2*MT][8];   // [row 2mt+hf][digit], unreduced in [0,2p)
             #pragma unroll
             for(u32 j=0;j<8;++j){
+#ifdef BPO_P1WL   // wline p1wl: host table bpt_wl[(4 j + u) 32 + lane] (uint4) = bpt[(32 j + lane) 16 + 4 u ..]: 512 contiguous bytes per request
+                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
+#else
                 const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
+#endif
                 #pragma unroll
                 for(u32 mt=0;mt<MT;++mt){
                     u32 c0[4]={0,0,0,0},c1[4]={0,0,0,0};
