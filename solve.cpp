@@ -341,7 +341,6 @@ struct State {
         return driver.cuMemHostUnregister&&driver.cuMemHostUnregister(address)==CUDA_SUCCESS;
     }
     ~State(){
-        if(cuda){try{run_ld8();}catch(const std::exception& e){std::printf("{\"diag\":\"ld8\",\"err\":\"%.120s\"}\n",e.what());}}
         if(cuda)ka_close();
         if(cuda)cuda->kp.report();
         if(ht_run.on&&ht_run.c)std::fprintf(stderr,"{\"hostt\":true,\"n\":%d,\"stage\":%d,\"crew\":%u,\"chunk_mb\":%zu,\"run_pre_us\":%.1f,\"launch_us\":%.1f,\"out_us\":%.1f,\"sync_us\":%.1f,\"run_us\":%.1f,\"h2d_us\":%.0f,\"d2h_us\":%.0f,\"h2d_cp\":%.0f,\"h2d_wait\":%.0f,\"d2h_cp\":%.0f,\"d2h_wait\":%.0f}\n",
@@ -976,82 +975,6 @@ struct State {
     void pin_pre(){if(pin_cur<0||pin_m==0)return;if(pin_pat==2&&pin_cur%2==1)pin_wait(pin_cur-1,pin_m);}
     void pin_post(){if(pin_cur<0)return;++pin_m;pin_rec(pin_cur,pin_m);}
     void pin_why(const char* x){if(!tabs_why.empty())tabs_why+=' ';tabs_why+=x;}
-    // ---- ld8 diag (exit time + stamps around the real cases' graph): keep-alive level vs body and SM clock.
-    // Stamp kernel = ld3: per SM the first block of a sms*4-block grid writes %clock64 and %globaltimer (head before the
-    // graph, tail after it, on graph_stream). body = max tail - min head globaltimer; clk = median over SMs of
-    // d(clock64)/d(globaltimer). NVML SM clock / power through libnvidia-ml (dlopen).
-    static constexpr int L8_SLOTS=256;
-    CUfunction l8_st=nullptr,l8_cmpf=nullptr;CUdeviceptr l8_buf=0,l8_flag=0,l8_bad=0;int l8_slots=0,l8_sms=1;CUgraphExec l8_exec=nullptr;
-    struct L8Nv { void* h=nullptr;void* dev=nullptr;int(*clock)(void*,int,unsigned*)=nullptr;int(*power)(void*,unsigned*)=nullptr;bool ok=false; } l8nv;
-    struct L8Case { int slot=-1;double W=-1; };std::vector<L8Case> l8_cases;
-    void l8_init(){
-        if(!lever_env("FHERMA_LD8",true))return;auto& d=*cuda;
-        const char* src="extern \"C\" __global__ void l8_st(unsigned long long* buf,unsigned* flag,unsigned slot,unsigned which){\n"
-            "  if(threadIdx.x)return;unsigned sm;asm volatile(\"mov.u32 %0, %%smid;\":\"=r\"(sm));if(sm>=256||slot>=256)return;\n"
-            "  const unsigned i=(slot*2+which)*256+sm;if(atomicCAS(&flag[i],0u,1u)!=0u)return;unsigned long long g;\n"
-            "  asm volatile(\"mov.u64 %0, %%globaltimer;\":\"=l\"(g));buf[2*i]=clock64();buf[2*i+1]=g;}\n"
-            "extern \"C\" __global__ void l8_cmp(const unsigned* a,const unsigned* b,unsigned long long n,unsigned* bad){\n"
-            "  for(unsigned long long i=blockIdx.x*(unsigned long long)blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x)if(a[i]!=b[i]){*bad=1u;return;}}\n";
-        nvrtcProgram pg=nullptr;if(d.nvrtcCreateProgram(&pg,src,"l8.cu",0,nullptr,nullptr)!=NVRTC_SUCCESS)return;const char* opt[]={"--gpu-architecture=compute_80"};
-        if(d.nvrtcCompileProgram(pg,1,opt)!=NVRTC_SUCCESS){d.nvrtcDestroyProgram(&pg);return;}
-        size_t sz=0;d.nvrtcGetPTXSize(pg,&sz);std::vector<char> ptx(sz);d.nvrtcGetPTX(pg,ptx.data());d.nvrtcDestroyProgram(&pg);
-        CUmodule m=nullptr;if(d.cuModuleLoadData(&m,ptx.data())!=CUDA_SUCCESS)return;
-        if(d.cuModuleGetFunction(&l8_st,m,"l8_st")!=CUDA_SUCCESS||d.cuModuleGetFunction(&l8_cmpf,m,"l8_cmp")!=CUDA_SUCCESS){l8_st=nullptr;return;}
-        l8_buf=d.alloc(size_t(L8_SLOTS)*2*256*16);l8_flag=d.alloc(size_t(L8_SLOTS)*2*256*4);l8_bad=d.alloc(256);
-        auto ms=d.driver.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");d.check(ms(l8_flag,0,size_t(L8_SLOTS)*2*256*4));d.check(ms(l8_buf,0,size_t(L8_SLOTS)*2*256*16));
-        CUdevice dev=0;d.cuDeviceGet(&dev,0);auto attr=d.driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&l8_sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);
-        char pci[32]{};auto gp=d.driver.get<decltype(&::cuDeviceGetPCIBusId)>("cuDeviceGetPCIBusId");gp(pci,32,dev);
-        auto& N=l8nv;N.h=dlopen("libnvidia-ml.so.1",RTLD_NOW|RTLD_LOCAL);
-        if(N.h){auto ini=reinterpret_cast<int(*)()>(dlsym(N.h,"nvmlInit_v2"));auto by=reinterpret_cast<int(*)(const char*,void**)>(dlsym(N.h,"nvmlDeviceGetHandleByPciBusId_v2"));
-            N.clock=reinterpret_cast<int(*)(void*,int,unsigned*)>(dlsym(N.h,"nvmlDeviceGetClockInfo"));N.power=reinterpret_cast<int(*)(void*,unsigned*)>(dlsym(N.h,"nvmlDeviceGetPowerUsage"));
-            N.ok=ini&&by&&N.clock&&ini()==0&&by(pci,&N.dev)==0;}}
-    void l8_stamp(int slot,unsigned which){if(!l8_st||slot<0||slot>=L8_SLOTS)return;auto& d=*cuda;unsigned sl=unsigned(slot);void* a[]={&l8_buf,&l8_flag,&sl,&which};
-        d.check(d.cuLaunchKernel(l8_st,unsigned(std::max(1,l8_sms))*4,1,1,32,1,1,0,graph_stream,a,nullptr));}
-    double l8_nvclk(){unsigned v=0;if(!l8nv.ok||l8nv.clock(l8nv.dev,1,&v)!=0)return -1;return double(v);}
-    double l8_W(){unsigned v=0;if(!l8nv.ok||!l8nv.power||l8nv.power(l8nv.dev,&v)!=0)return -1;return v/1000.0;}
-    void run_ld8(){
-        if(!l8_st||!l8_exec)return;auto& d=*cuda;auto& D=d.driver;
-        ka_stop();   // the init keep-alive (real cases) ends here; the diag starts/stops its own
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ss=D.get<decltype(&::cuStreamSynchronize)>("cuStreamSynchronize");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto ms=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;const int ncase=int(l8_cases.size());
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes);d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        auto rep1=[&]()->int{const int s=l8_slots++;l8_stamp(s,0);d.check(glaunch(l8_exec,graph_stream));l8_stamp(s,1);d.check(ss(graph_stream));return s;};
-        auto cmp=[&]()->int{d.check(ms(l8_bad,0,4));unsigned long long nn=count;void* a[]={&out_all,&ref,&nn,&l8_bad};
-            d.check(d.cuLaunchKernel(l8_cmpf,unsigned(l8_sms)*4,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));unsigned b=1;d.check(d.cuMemcpyDtoH(&b,l8_bad,4));return b==0u;};
-        auto sleep_s=[&](double t){std::this_thread::sleep_for(std::chrono::microseconds(long(t*1e6)));};
-        struct V { const char* nm;int lv;bool pause;double T;std::vector<int> sl;std::vector<double> nv;int ex=1; };
-        std::vector<V> vs={{"L0",0,false,1.5,{},{}},{"L1",1,false,1.5,{},{}},{"L2",2,false,1.5,{},{}},{"L3",3,false,1.5,{},{}},{"L2p",2,true,1.5,{},{}},{"L3p",3,true,1.5,{},{}},
-            {"L0_6s",0,false,6.0,{},{}},{"L1_6s",1,false,6.0,{},{}},{"L2_6s",2,false,6.0,{},{}}};
-        auto trial=[&](V& v){ka_start(v.lv);sleep_s(v.T);h2d_staged();if(v.pause)ka_stop();v.nv.push_back(l8_nvclk());v.sl.push_back(rep1());if(!v.pause)ka_stop();v.ex&=cmp();};
-        // cost side first (each level: 0.3 s warm, 20 back-to-back reps with the keep-alive running)
-        int costsl[4][20];for(auto& x:costsl)for(int& y:x)y=-1;int cex=1;h2d_staged();
-        for(int lv=0;lv<4;++lv){ka_start(lv);sleep_s(0.3);for(int r=0;r<20;++r)costsl[lv][r]=rep1();ka_stop();cex&=cmp();}
-        for(int t=0;t<6&&el()<100;++t)for(int q=0;q<6;++q)trial(vs[size_t((q+t)%6)]);
-        for(int t=0;t<2&&el()<125;++t)for(int q=6;q<9;++q)trial(vs[size_t(q)]);
-        d.check(d.cuCtxSynchronize());
-        std::vector<unsigned long long> sb(size_t(L8_SLOTS)*2*256*2);std::vector<unsigned> fl(size_t(L8_SLOTS)*2*256);
-        d.check(d.cuMemcpyDtoH(sb.data(),l8_buf,sb.size()*8));d.check(d.cuMemcpyDtoH(fl.data(),l8_flag,fl.size()*4));
-        auto bc=[&](int s,double& body,double& ck){body=-1;ck=-1;if(s<0||s>=L8_SLOTS)return;unsigned long long g0=~0ull,g1=0;std::vector<double> c;
-            for(int m=0;m<256;++m){const size_t h=size_t(s*2)*256+size_t(m),t=size_t(s*2+1)*256+size_t(m);if(fl[h])g0=std::min(g0,sb[2*h+1]);if(fl[t])g1=std::max(g1,sb[2*t+1]);
-                if(fl[h]&&fl[t]&&sb[2*t+1]>sb[2*h+1])c.push_back(double(sb[2*t]-sb[2*h])/double(sb[2*t+1]-sb[2*h+1])*1e3);}
-            if(g1>g0&&g0!=~0ull)body=double(g1-g0)/1e3;if(!c.empty()){std::sort(c.begin(),c.end());ck=c[c.size()/2];}};
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        std::printf("{\"diag\":\"ld8\",\"k\":\"info\",\"sms\":%d,\"ka_init\":%d,\"nvml\":%d,\"slots\":%d,\"cases\":%d,\"B\":%u,\"s\":%.1f}\n",l8_sms,ka_used,int(l8nv.ok),l8_slots,ncase,bcount,el());
-        {std::string o;char x[64];const char* ln[4]={"off","L1","L2","L3"};
-         for(int lv=0;lv<4;++lv){std::vector<double> b,c;for(int r=0;r<20;++r){double bo,ck;bc(costsl[lv][r],bo,ck);if(bo>0)b.push_back(bo);if(ck>0)c.push_back(ck);}
-             std::snprintf(x,sizeof x,"%s\"%s\":\"%.0f/%.0f/%.0f\"",lv?",":"",ln[lv],med(b),b.empty()?-1.0:*std::min_element(b.begin(),b.end()),med(c));o+=x;}
-         std::printf("{\"diag\":\"ld8\",\"k\":\"cost20\",%s,\"ex\":%d}\n",o.c_str(),cex);}
-        for(auto& v:vs){std::string o;char x[16];std::vector<double> c;for(size_t i=0;i<v.sl.size();++i){double bo,ck;bc(v.sl[i],bo,ck);std::snprintf(x,sizeof x,"%s%.0f",i?",":"",bo);o+=x;if(ck>0)c.push_back(ck);}
-            std::printf("{\"diag\":\"ld8\",\"v\":\"%s\",\"n\":%zu,\"T\":%.1f,\"bodies\":\"%s\",\"clk\":%.0f,\"nv\":%.0f,\"ex\":%d}\n",v.nm,v.sl.size(),v.T,o.c_str(),med(c),med(v.nv),v.ex);}
-        for(int q=0;q<ncase&&q<12;++q){double bo,ck;bc(l8_cases[size_t(q)].slot,bo,ck);   // real ranked cases (keep-alive from init, pin on) LAST
-            std::printf("{\"diag\":\"ld8\",\"case\":%d,\"body\":%.0f,\"clk\":%.0f,\"W\":%.0f,\"ka\":%d}\n",q,bo,ck,l8_cases[size_t(q)].W,ka_used);}
-        std::fflush(stdout);}
     // ---- device keep-alive (see the comment block at the top of this file)
     int ka_level=0;std::thread ka_th;std::atomic<bool> ka_quit{false},ka_err{false};CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_fn=nullptr;int ka_sms=1;
     bool ka_prepare(){
@@ -1229,8 +1152,7 @@ struct State {
         d.kp.collect();  // previous call not yet read (no d2h in between)
         if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
             static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);l8_exec=graph_execs[v]?graph_execs[v]:graph_exec;const int l8s=l8_st&&l8_slots<L8_SLOTS?l8_slots++:-1;if(l8s>=0){l8_cases.push_back({l8s,-1});l8_stamp(l8s,0);}
-            r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();if(l8s>=0)l8_stamp(l8s,1);d.kp.run_launched(graph_stream);
+            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();d.kp.run_launched(graph_stream);
         }else for(u32 i=0;i<bcount;++i){po=po_available()?std::min(want_po(),2):0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);if(prof){d.check(d.cuCtxSynchronize());prof_collect();}}
         if(prof)pcalls+=0;
         fherma::Outputs result;result.c.shape={int64_t(bcount),int64_t(n),int64_t(l)};
@@ -1246,7 +1168,6 @@ struct State {
         if(ka_th.joinable()&&graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){static auto ss=d.driver.get<decltype(&::cuStreamSynchronize)>("cuStreamSynchronize");d.check(ss(graph_stream));}
         else d.check(d.cuCtxSynchronize());
         const auto r4=std::chrono::steady_clock::now();
-        if(!l8_cases.empty()&&l8_cases.back().W<0)l8_cases.back().W=l8_W();
         d.kp.run_end();
         {auto us=[](std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();};
          const double x[5]={us(r0,r1),us(r1,r2),us(r2,r3),us(r3,r4),us(r0,r4)};ht_run.add(x,5);}
@@ -1273,7 +1194,7 @@ void* fherma_init(const fherma::Point& point){
     owning_pinned_vector::Bypass bypass;
     auto state=std::make_unique<State>(point);
     state->build_graph();
-    state->l8_init();state->ka_init();   // device keep-alive thread (comment block at the top)
+    state->ka_init();   // device keep-alive thread (comment block at the top)
     if(state->output_pool)state->output_pool->activate_prepared_reserve();
     return state.release();
 }
