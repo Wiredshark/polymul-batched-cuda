@@ -322,6 +322,7 @@ struct State {
         if(cuda)cuda->kp.report();
         if(ht_run.on&&ht_run.c)std::fprintf(stderr,"{\"hostt\":true,\"n\":%d,\"stage\":%d,\"crew\":%u,\"chunk_mb\":%zu,\"run_pre_us\":%.1f,\"launch_us\":%.1f,\"out_us\":%.1f,\"sync_us\":%.1f,\"run_us\":%.1f,\"h2d_us\":%.0f,\"d2h_us\":%.0f,\"h2d_cp\":%.0f,\"h2d_wait\":%.0f,\"d2h_cp\":%.0f,\"d2h_wait\":%.0f}\n",
             ht_run.c,int(stg.ok),stg.crew?stg.crew->size():0u,stg.chunk>>20,ht_run.med(0),ht_run.med(1),ht_run.med(2),ht_run.med(3),ht_run.med(4),ht_hook.med(0),ht_hook.med(1),ht_hook.med(2),ht_hook.med(3),ht_hook.med(4),ht_hook.med(5));
+        try{run_launch_diag();}catch(const std::exception& e){std::printf("{\"diag\":\"ld\",\"err\":\"%.120s\"}\n",e.what());}
         free_stage();
         if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,tabs_ms,tabs_why.c_str());
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
@@ -1029,6 +1030,136 @@ struct State {
     int want_po()const{const char* e=std::getenv("FHERMA_POY");if(e&&*e=='1')return 5;e=std::getenv("FHERMA_POX");if(e&&*e=='1')return 4;e=std::getenv("FHERMA_POCH");if(e&&*e=='1')return 3;e=std::getenv("FHERMA_POCM");if(e&&*e=='1')return 2;e=std::getenv("FHERMA_PO");if(e&&*e=='1')return 1;
         e=std::getenv("FHERMA_PO_DEFAULT");if(e)return std::atoi(e);
         return std::getenv("FHERMA_V14")?0:4;}   // default: pass-order, column-major, chains, P2->P3 untwiddle, P1 L2 prefetch
+    // ---- launch diag ld1 (on 6a3f4ed = candidate 8; diag build only): how the production work is SUBMITTED, at exit
+    // on the real batch. Same kernels, same per-chain order, same chains/workspaces as graph variant 6; only the
+    // number of graphs, which streams/threads launch them, the context sync mode and the wait call change.
+    std::vector<CUevent> ld_events;
+    CUevent ld_ev(bool timing){auto& D=cuda->driver;static auto ecreate=D.get<decltype(&::cuEventCreate)>("cuEventCreate");
+        CUevent e=nullptr;cuda->check(ecreate(&e,timing?0u:unsigned(CU_EVENT_DISABLE_TIMING)));ld_events.push_back(e);return e;}
+    u32 ld_chains(){return std::min(std::max(1u,std::min(default_chains(),4u)),bcount);}
+    void ld_state(bool on){
+        if(on){l2on=true;pox=true;po=2;p1x=p1x_default();xoff=0;p23db_now=p23db_env(false);}
+        else{l2on=false;pox=false;po=0;p1x=0;xoff=0;p23db_now=false;cur_ws=0;next_a=next_b=0;cuda->stream=graph_stream;}
+    }
+    void ld_one(u32 i,u32 S,const CUstream* cs){const size_t stride=size_t(n)*l*4;auto& d=*cuda;
+        d.stream=cs[i%S];cur_ws=i%S;next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;
+        compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);}
+    // products [i0,i1) of the variant-6 schedule; only>=0: just chain `only`'s products, captured on that chain's stream
+    CUgraphExec ld_cap(u32 i0,u32 i1,int only,CUevent head=nullptr,CUevent tail=nullptr){
+        auto& d=*cuda;auto& D=d.driver;
+        static auto begin=D.get<decltype(&::cuStreamBeginCapture)>("cuStreamBeginCapture_v2");
+        static auto endc=D.get<decltype(&::cuStreamEndCapture)>("cuStreamEndCapture");
+        static auto inst=D.get<decltype(&::cuGraphInstantiateWithFlags)>("cuGraphInstantiateWithFlags");
+        static auto gdestroy=D.get<decltype(&::cuGraphDestroy)>("cuGraphDestroy");
+        static auto erecord=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
+        static auto swait=D.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
+        static auto erecf=D.get<decltype(&::cuEventRecordWithFlags)>("cuEventRecordWithFlags");   // external record nodes (timing)
+        const u32 S=ld_chains();CUstream cs[4]{graph_stream};for(u32 c=1;c<S;++c)cs[c]=chain_streams[c];
+        const CUstream cap=only>=0?cs[only]:graph_stream;CUgraphExec ge=nullptr;bool capt=false;
+        ld_state(true);
+        try{
+            d.stream=cap;d.check(begin(cap,CU_STREAM_CAPTURE_MODE_RELAXED));capt=true;
+            if(head)d.check(erecf(head,cap,CU_EVENT_RECORD_EXTERNAL));
+            if(only<0&&S>1){CUevent f=ld_ev(false);d.check(erecord(f,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],f,0));}
+            for(u32 i=i0;i<i1;++i){if(only>=0&&int(i%S)!=only)continue;ld_one(i,S,cs);}
+            d.stream=cap;
+            if(only<0)for(u32 c=1;c<S;++c){CUevent j=ld_ev(false);d.check(erecord(j,cs[c]));d.check(swait(graph_stream,j,0));}
+            if(tail)d.check(erecf(tail,cap,CU_EVENT_RECORD_EXTERNAL));
+            CUgraph g=nullptr;capt=false;d.check(endc(cap,&g));const CUresult r=inst(&ge,g,0);gdestroy(g);d.check(r);
+        }catch(...){if(capt){CUgraph g=nullptr;endc(cap,&g);if(g)gdestroy(g);}ge=nullptr;}
+        ld_state(false);return ge;
+    }
+    // two parked launcher threads (created once for the diag), each launches its own (graph, stream) job
+    struct LdCrew {
+        std::vector<std::thread> th;std::mutex m;std::condition_variable go,fin;uint64_t gen=0;unsigned left=0;bool quit=false;
+        std::vector<std::pair<CUgraphExec,CUstream>> jobs;CUresult err=CUDA_SUCCESS;
+        decltype(&::cuGraphLaunch) gl=nullptr;
+        void start(unsigned nt,CUcontext ctx,decltype(&::cuCtxSetCurrent) setcur,decltype(&::cuGraphLaunch) g){gl=g;
+            for(unsigned t=0;t<nt;++t)th.emplace_back([=,this]{setcur(ctx);uint64_t seen=0;for(;;){{std::unique_lock<std::mutex> lk(m);go.wait(lk,[&]{return quit||gen!=seen;});if(quit)return;seen=gen;}
+                CUresult r=t<jobs.size()?gl(jobs[t].first,jobs[t].second):CUDA_SUCCESS;{std::lock_guard<std::mutex> lk(m);if(r!=CUDA_SUCCESS)err=r;if(--left==0)fin.notify_one();}}});}
+        void launch(){{std::lock_guard<std::mutex> lk(m);left=unsigned(th.size());++gen;}go.notify_all();std::unique_lock<std::mutex> lk(m);fin.wait(lk,[&]{return left==0;});}
+        ~LdCrew(){{std::lock_guard<std::mutex> lk(m);quit=true;}go.notify_all();for(auto& t:th)t.join();}
+    };
+    struct LdSub { std::vector<std::pair<CUgraphExec,CUstream>> g; u32 direct=0; bool thr=false; int wait=0; CUevent pre=nullptr,head=nullptr,tail=nullptr; };
+    double ld_once(const LdSub& s,LdCrew* crew,double* lau){
+        auto& d=*cuda;auto& D=d.driver;
+        static auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");static auto erecord=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
+        static auto esync=D.get<decltype(&::cuEventSynchronize)>("cuEventSynchronize");static auto sq=D.get<decltype(&::cuStreamQuery)>("cuStreamQuery");
+        static auto swait=D.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
+        static CUevent fin_ev=ld_ev(false);
+        const auto t0=std::chrono::steady_clock::now();
+        if(s.pre)d.check(erecord(s.pre,graph_stream));
+        if(s.direct){const u32 S=ld_chains();CUstream cs[4]{graph_stream};for(u32 c=1;c<S;++c)cs[c]=chain_streams[c];
+            ld_state(true);for(u32 i=0;i<s.direct;++i)ld_one(i,S,cs);ld_state(false);
+            for(u32 c=1;c<S;++c){static CUevent dj[4]{};if(!dj[c])dj[c]=ld_ev(false);d.check(erecord(dj[c],cs[c]));d.check(swait(graph_stream,dj[c],0));}}
+        if(s.thr&&crew){crew->jobs=s.g;crew->launch();d.check(crew->err);}
+        else for(const auto& x:s.g)d.check(glaunch(x.first,x.second));
+        const auto t1=std::chrono::steady_clock::now();
+        if(s.wait==0)d.check(d.cuCtxSynchronize());
+        else{for(const auto& x:s.g)if(x.second!=graph_stream){static CUevent cj[4]{};const u32 c=x.second==chain_streams[1]?1:x.second==chain_streams[2]?2:3;if(!cj[c])cj[c]=ld_ev(false);d.check(erecord(cj[c],x.second));d.check(swait(graph_stream,cj[c],0));}
+            d.check(erecord(fin_ev,graph_stream));
+            if(s.wait==1)d.check(esync(fin_ev));else{CUresult r;while((r=sq(graph_stream))==CUDA_ERROR_NOT_READY){}d.check(r);}}
+        const auto t2=std::chrono::steady_clock::now();
+        *lau=std::chrono::duration<double,std::micro>(t1-t0).count();return std::chrono::duration<double,std::micro>(t2-t0).count();
+    }
+    void run_launch_diag(){
+        if(!lever_env("FHERMA_LDIAG",true)||!graph_execs[6]||bcount<2)return;
+        auto& d=*cuda;auto& D=d.driver;
+        auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
+        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
+        typedef CUresult (*FlagsSet)(unsigned);typedef CUresult (*FlagsGet)(unsigned*);
+        auto fset=reinterpret_cast<FlagsSet>(dlsym(D.handle,"cuCtxSetFlags"));auto fget=reinterpret_cast<FlagsGet>(dlsym(D.handle,"cuCtxGetFlags"));
+        auto setcur=D.get<decltype(&::cuCtxSetCurrent)>("cuCtxSetCurrent");auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
+        const auto T0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-T0).count();};
+        const size_t bytes=size_t(bcount)*n*l*4;const u32 S=ld_chains(),B=bcount;
+        const int R=std::getenv("FHERMA_LD_R")?std::max(3,std::atoi(std::getenv("FHERMA_LD_R"))):15;
+        unsigned flags0=0;if(fget)fget(&flags0);
+        std::printf("{\"diag\":\"ld\",\"k\":\"info\",\"B\":%u,\"chains\":%u,\"R\":%d,\"ctx_flags\":%u,\"setflags\":%d,\"hostt_launch_us\":%.1f,\"hostt_run_us\":%.1f}\n",
+            B,S,R,flags0,fset?1:0,ht_run.med(1),ht_run.med(4));std::fflush(stdout);
+        CUdeviceptr ref=0;try{ref=d.alloc(bytes);}catch(...){ref=0;}
+        const CUgraphExec prod=graph_execs[6];LdSub P;P.g={{prod,graph_stream}};double lau=0;
+        ld_once(P,nullptr,&lau);if(ref){d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());}
+        std::vector<char> h1(size_t(32)<<20),h2(size_t(32)<<20);
+        auto exact=[&](const LdSub& s,LdCrew* crew)->int{if(!ref)return -1;double x;d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());ld_once(s,crew,&x);d.check(d.cuCtxSynchronize());
+            for(size_t off=0;off<bytes;off+=h1.size()){const size_t len=std::min(h1.size(),bytes-off);d.check(d.cuMemcpyDtoH(h1.data(),ref+off,len));d.check(d.cuMemcpyDtoH(h2.data(),out_all+off,len));if(std::memcmp(h1.data(),h2.data(),len))return 0;}
+            return 1;};
+        LdCrew crew2;if(setcur)crew2.start(2,d.context,setcur,glaunch);
+        auto med=[](std::vector<double> v){std::sort(v.begin(),v.end());return v.empty()?0.0:v[v.size()/2];};
+        auto line=[&](const char* nm,LdSub s,unsigned flags,bool evs){
+            if(el()>240){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"skipped\":\"time\"}\n",nm);return;}
+            for(const auto& x:s.g)if(!x.first){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"err\":\"capture\"}\n",nm);return;}
+            bool fl=flags!=~0u;if(fl&&(!fset||fset(flags)!=CUDA_SUCCESS)){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"err\":\"setflags\"}\n",nm);return;}
+            std::vector<double> tp,tv,lp,lv,hd,bd,tl;double a=0,b2=0;
+            for(int w=0;w<2;++w){ld_once(P,nullptr,&a);ld_once(s,&crew2,&a);}
+            for(int r=0;r<R;++r){tp.push_back(ld_once(P,nullptr,&a));lp.push_back(a);const double t=ld_once(s,&crew2,&b2);tv.push_back(t);lv.push_back(b2);
+                if(evs){float x=0,y=0;if(eel(&x,s.pre,s.head)==CUDA_SUCCESS&&eel(&y,s.head,s.tail)==CUDA_SUCCESS){hd.push_back(1e3*x);bd.push_back(1e3*y);tl.push_back(t-1e3*(x+y));}}}
+            const int ex=exact(s,&crew2);
+            if(fl)fset(flags0);
+            const double mv=med(tv),mp=med(tp);
+            if(evs)std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"us\":%.1f,\"prod_us\":%.1f,\"vs\":%.4f,\"ex\":%d,\"lau\":%.1f,\"lau_p\":%.1f,\"head_us\":%.1f,\"body_us\":%.1f,\"tail_us\":%.1f}\n",nm,mv,mp,mp>0?mv/mp:0,ex,med(lv),med(lp),med(hd),med(bd),med(tl));
+            else std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"us\":%.1f,\"prod_us\":%.1f,\"vs\":%.4f,\"ex\":%d,\"lau\":%.1f,\"lau_p\":%.1f,\"n\":%zu}\n",nm,mv,mp,mp>0?mv/mp:0,ex,med(lv),med(lp),s.g.size());
+            std::fflush(stdout);
+            for(const auto& x:s.g)if(x.first!=prod)ged(x.first);};
+        auto split=[&](u32 parts){LdSub s;for(u32 j=0;j<parts;++j)s.g.push_back({ld_cap(j*B/parts,(j+1)*B/parts,-1),graph_stream});return s;};
+        auto headg=[&](u32 h){LdSub s;s.g={{ld_cap(0,h,-1),graph_stream},{ld_cap(h,B,-1),graph_stream}};return s;};
+        auto perch=[&](bool thr){LdSub s;s.thr=thr;for(u32 c=0;c<S;++c)s.g.push_back({ld_cap(0,B,int(c)),c?chain_streams[c]:graph_stream});return s;};
+        auto direct=[&](u32 h){LdSub s;s.direct=h;s.g={{ld_cap(h,B,-1),graph_stream}};return s;};
+        auto prodw=[&](int w){LdSub s=P;s.wait=w;return s;};
+        {LdSub s=P;line("ctrl",s,~0u,false);}
+        for(int pass=0;pass<2;++pass){char nm[32];auto N=[&](const char* b){std::snprintf(nm,sizeof nm,"%s%s",b,pass?"_r":"");return nm;};
+            {LdSub s;s.g={{ld_cap(0,B,-1),graph_stream}};line(N("recap"),s,~0u,false);}                       // recaptured production graph: capture itself
+            {LdSub s;s.pre=ld_ev(true);s.head=ld_ev(true);s.tail=ld_ev(true);s.g={{ld_cap(0,B,-1,s.head,s.tail),graph_stream}};line(N("ev"),s,~0u,true);}   // head/body/tail
+            for(u32 p:{2u,4u,8u,16u,32u,64u,128u})if(p<=B){char b[16];std::snprintf(b,sizeof b,"split%u",p);line(N(b),split(p),~0u,false);}
+            for(u32 h:{2u,4u})if(h<B){char b[16];std::snprintf(b,sizeof b,"head%u",h);line(N(b),headg(h),~0u,false);}
+            if(S>1){line(N("perchain"),perch(false),~0u,false);if(setcur)line(N("perch_thr"),perch(true),~0u,false);}
+            for(u32 h:{2u,4u})if(h<B){char b[16];std::snprintf(b,sizeof b,"direct%u",h);line(N(b),direct(h),~0u,false);}
+            line(N("spin"),P,unsigned(CU_CTX_SCHED_SPIN),false);line(N("yield"),P,unsigned(CU_CTX_SCHED_YIELD),false);line(N("block"),P,unsigned(CU_CTX_SCHED_BLOCKING_SYNC),false);
+            line(N("wait_ev"),prodw(1),~0u,false);line(N("wait_poll"),prodw(2),~0u,false);}
+        {LdSub s=P;line("ctrl_end",s,~0u,false);}
+        std::printf("{\"diag\":\"ld\",\"k\":\"done\",\"s\":%.1f}\n",el());std::fflush(stdout);
+        (void)ref;   // freed with the other device buffers
+        auto edes=D.get<decltype(&::cuEventDestroy)>("cuEventDestroy_v2");for(auto e:ld_events)edes(e);ld_events.clear();
+    }
     fherma::Outputs run(const fherma::Inputs& in){
         (void)in;  // inputs already on the device (h2d)
         const auto r0=std::chrono::steady_clock::now();auto r1=r0,r2=r0;
