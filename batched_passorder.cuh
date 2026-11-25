@@ -1087,93 +1087,6 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
 #endif
-#if defined(BPO_P2W)&&!defined(BPO_P2_OLD)
-// wline p2w (FHERMA_P2W=1, opt-in; default build does not define BPO_P2W): same arithmetic and values as the p2k body, but one
-// 512-thread block = 4 slot octets (g = 4 blockIdx.x + group, group = 128-thread quarter with its own TA region and named
-// barrier) so the C stores can cover whole 128 B lines: after the last DIT16 the 4 groups' a[c1] go to a 256 x 32-word tile
-// (columns x 32 slots, XOR swizzle slot ^ 8 (c & 3): conflict-free STS and LDS) overlaying the 4 TA regions, then warp k
-// (0..15) stores columns c = k + 16 i (i = 0..15), lane = slot: each STG covers one full line (production: 4 x 32 B).
-// Registers capped at 64 (__launch_bounds__(512,2): 2 blocks x 16 warps = the production 32 warps/SM); smem 37.4 KB/block.
-template<bool H>__device__ __forceinline__ void bpo_r16w_body(u32* TAall,const u32* A,const u32* B,u32* C,
-    const u32* primes,const u64* r16,u32 untw){
-    constexpr u32 N=65536u;
-    const u32 gq=threadIdx.x>>7,tl=threadIdx.x&127u;
-    const u32 g=4u*blockIdx.x+gq,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
-    const u32 lane=tl&31u,warp=tl>>5,s=lane&7u,c2=4u*warp+(lane>>3);
-    u32* const TA=TAall+gq*(8u*292u);
-    // named barrier per group with IMMEDIATE ids 1..4 (a register id makes ptxas reserve all 16 barriers: 1 block/SM)
-    auto gsync=[&]{switch(gq){case 0:asm volatile("bar.sync 1, 128;":::"memory");break;case 1:asm volatile("bar.sync 2, 128;":::"memory");break;
-        case 2:asm volatile("bar.sync 3, 128;":::"memory");break;default:asm volatile("bar.sync 4, 128;":::"memory");break;}};
-    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
-    const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
-    const u64 base=u64(prime*8+j)*N;
-    const u32 off=g*2048u+c2*8u+s;
-    u32 a[16],b[16];
-    {   const u32* a0=A+base+off;const u32* b0=B+base+off;
-        #pragma unroll
-        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}
-    }
-    const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
-    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
-    u32* const tw_=TA+int(s*292u+c2);
-    u32* const tr_=TA+int(s*292u+17u*c2);
-    #pragma unroll
-    for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
-    #pragma unroll
-    for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
-    gsync();
-    if(untw&8)bpo_discard((tl<64u?A:B)+base+g*2048u+(tl&63u)*32u);
-    #pragma unroll
-    for(u32 i=0;i<16;++i)a[i]=tr_[i];
-    gsync();
-    #pragma unroll
-    for(u32 i=0;i<16;++i)tw_[17*i]=b[i];
-    gsync();
-    #pragma unroll
-    for(u32 i=0;i<16;++i)b[i]=tr_[i];
-    r16_dif16h<H>(a,tf,p,p2);r16_dif16h<H>(b,tf,p,p2);
-    {const u32 pinv=pxinv32(p);
-        #pragma unroll
-        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
-    r16_dit16h<H,true>(a,ti,p,p2);
-    {const u32 k8=8u*r16_brev4(c2);
-        #pragma unroll
-        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);
-        a[0]=H?pxadd(a[0],0u,p2):pzred(a[0],p);}
-    gsync();
-    #pragma unroll
-    for(u32 i=0;i<16;++i)tr_[i]=a[i];
-    gsync();
-    #pragma unroll
-    for(u32 i=0;i<16;++i)a[i]=tw_[17*i];
-    r16_dit16h<H,true>(a,ti,p,p2);
-#if BPO_P2W==2   // diag ablation p2w_direct: 512-thread structure, production 4 x 32 B stores (isolates the tile)
-    {u32* o=C+base+(c2*256u+g*8u+s);
-        #pragma unroll
-        for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];}
-    return;
-#endif
-    __syncthreads();   // every group's TA reads done: the tile overlays all four regions
-    {u32* const tq=TAall+(c2*32u+((8u*gq+s)^(8u*(c2&3u))));   // column c = c2 + 16 c1 (c & 3 = c2 & 3), slot 8 gq + s
-        #pragma unroll
-        for(u32 c1=0;c1<16;++c1)tq[512u*c1]=a[c1];}
-    __syncthreads();
-    {const u32 k=threadIdx.x>>5,l=threadIdx.x&31u;   // warp k: columns k + 16 i, lane = slot (32 blockIdx.x + l)
-        const u32* const tq=TAall+(k*32u+(l^(8u*(k&3u))));
-        u32* const o=C+base+(k*256u+32u*blockIdx.x+l);
-        #pragma unroll
-        for(u32 i=0;i<16;++i)o[4096u*i]=tq[512u*i];}
-}
-extern "C" __global__ void __launch_bounds__(512,2) bpo_middle_r16(const u32* A,const u32* B,u32* C,
-    const u32* primes,const u64* r16,u32 N,u32 untw){
-    __shared__ u32 TA[4*8*292];   // 4 group transpose buffers (37.4 KB); after the last DIT16 the 256 x 32 output tile
-    (void)N;
-#if BPO_NH30
-    if(primes[blockIdx.z]<(1u<<30))bpo_r16w_body<true>(TA,A,B,C,primes,r16,untw);else
-#endif
-    bpo_r16w_body<false>(TA,A,B,C,primes,r16,untw);
-}
-#else
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
     __shared__ u32 TA[8*292];   // one transpose buffer (A, then B, then the inverse): 9.3 KB, occupancy reg-limited
@@ -1182,7 +1095,6 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,co
 #endif
     bpo_r16_body<false>(TA,A,B,C,primes,r16,N,untw);
 }
-#endif
 // P3 radix-16 (bpo_last_r16, FHERMA_P3R16): same values as bpo_last_cm3 (BPO_P3T 260). Block (column c, prime), 128 threads.
 // Phase J: thread t owns slots t and t+128: 8 digit words each (coalesced), F (cross untwiddle * t1) Shoup product,
 // lazy 8-point J-DIT, tile X[d][sl + sl/16] (digit stride 272 = 16 mod 32). Phase R: thread (d = tid/16, a = tid%16)
