@@ -429,7 +429,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     constexpr bool S6=(F&64)!=0;
     constexpr u32 XD=(F&96)?320u:288u,XS=(F&96)?8*320:8*288+32;   // 128 B aligned (prime,digit) regions
     const u32 stm=(pfstep>>29)&3u;const bool ldn=(pfstep>>28)&1u;pfstep&=0x0fffffffu;   // bits 29-30 TMA store policy (xrdif6 stm), 28 input loads normal (L2-retained for the next prime group)
+#ifdef BPO_P1WP
+    const u32 id=(F&0x1000000u)?bpo_wp_sid:blockIdx.x,c=id&255u,op=id>>8;   // sched diag: work-pulled tile
+#else
     const u32 id=blockIdx.x,c=id&255u,op=id>>8;
+#endif
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
     const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
@@ -582,6 +586,11 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             if(S6){   // rows 64rr+8w+gid: twist, J-DIF, R-DIF stages len 256 (rr^2) and 128 (rr^1) in registers
                 const u32 rl=8*warp+gid;
+#if (defined(BPO_P1WP)||defined(BPO_P2WP))&&!defined(BPO_WP_CTR_DECL)
+#define BPO_WP_CTR_DECL 1
+__device__ unsigned bpo_wp_ctr[4096];   // sched diag: per-launch work counters (zeroed by the host once per graph run)
+__shared__ unsigned bpo_wp_sid;          // the block's current tile
+#endif
 #ifdef BPO_P1TW   // p1tw (flag 0x400000, kernel bpo_first_xt): twist argument = T1[((u*2 + c/128)*256 + 64 rr + rl)*4 + tig]
                 constexpr bool TW=(F&0x400000u)!=0;
                 const u64* const t1=twist+((size_t(u)*2u+(c>>7))*256u+rl)*4u+tig;(void)t1;
@@ -627,7 +636,12 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             constexpr u32 NC=BPO_X_NC;
             const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=(F&4)?STS+q*256u:stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
-            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm);   // flag 131072: one pass
+            if(F&131072u)xrdif6q<F>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),
+#ifdef BPO_P1EL   // sched diag: quads 2-3 (P2 group 1, read second under p1rev) stored evict_last
+                (u>=2u)?2u:stm);
+#else
+                stm);
+#endif   // flag 131072: one pass
             else{
             #pragma unroll
             for(u32 g=0;g<4/NC;++g){const u32 j=4*(warp&1u)+NC*g;
@@ -679,6 +693,22 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xb<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+#endif
+#if defined(BPO_P1WP)&&defined(BPO_P1RV)
+// sched diag: work-pulling persistent bpo_first_xr (grid = resident slots; tiles 0..511 from bpo_wp_ctr[logR >> 8])
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xw(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    unsigned* const ctr=bpo_wp_ctr+(logR>>8);
+    for(;;){
+        __syncthreads();
+        if(threadIdx.x==0)bpo_wp_sid=atomicAdd(ctr,1u);
+        __syncthreads();
+        if(bpo_wp_sid>=512u)break;
+        bpo_first_xb<BPO_XF|0x400000u|0x800000u|0x1000000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+    }
 }
 #endif
 // T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)

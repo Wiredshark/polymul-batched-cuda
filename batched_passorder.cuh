@@ -985,6 +985,11 @@ template<bool H,bool CI>__device__ __forceinline__ void r16_dit16h(u32 (&v)[16],
 // FHERMA_P2_OLD=1 compiles the old body (BPO_P2_OLD).
 template<class T>__device__ __forceinline__ T* bpo_opq(T* p){asm("mov.b64 %0, %0;":"+l"(p));return p;}
 __device__ __forceinline__ u64 bpo_tw8(const char* tb,u32 s8,u32 k){return __ldg(reinterpret_cast<const u64*>(tb+u64(s8)*k));}
+#if (defined(BPO_P1WP)||defined(BPO_P2WP))&&!defined(BPO_WP_CTR_DECL)
+#define BPO_WP_CTR_DECL 1
+__device__ unsigned bpo_wp_ctr[4096];   // sched diag: per-launch work counters (zeroed by the host once per graph run)
+__shared__ unsigned bpo_wp_sid;          // the block's current tile
+#endif
 #ifdef BPO_P2CU   // p2cu (kernel bpo_middle_r16c): per prime 256 words, [0,128) = r16[0,128), [128,256) = r16[256,384) (the
 // radix-16 stage twiddles tf / ti actually read: t[16 j], t[32 j], t[64]); 32 KB for K = 16; filled by the host (build_tabs)
 __constant__ unsigned long long bpo_p2cu[BCRT_K*256];
@@ -997,7 +1002,11 @@ template<bool H>
 __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32,u32 untw){
     constexpr u32 N=65536u;
+#ifdef BPO_P2WP   // sched diag: work-pulled tile (g, j, prime) = (t&31, (t>>5)&7, t>>8)
+    const u32 g=bpo_wp_sid&31u,j=(bpo_wp_sid>>5)&7u,prime=bpo_wp_sid>>8,p=primes[prime];
+#else
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+#endif
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
 #ifdef BPO_P2MT   // p2mt (MT, kernel bpo_middle_r16m): r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
     const u64* tf=r16+u64(prime)*(MT?1024u:512u);const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);(void)tmf;(void)tmi;
@@ -1087,6 +1096,24 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16c(const u32* A,c
     if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true,true,true>(TA,A,B,C,primes,r16,N,untw);else
 #endif
     bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
+}
+#endif
+#if defined(BPO_P2WP)&&defined(BPO_P2CU)
+// sched diag: work-pulling persistent bpo_middle_r16c (grid = resident slots; 256 * (N & 255) tiles from bpo_wp_ctr[N >> 8])
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16w(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    __shared__ u32 TA[8*292];
+    unsigned* const ctr=bpo_wp_ctr+(N>>8);const u32 tiles=256u*(N&255u);
+    for(;;){
+        __syncthreads();
+        if(threadIdx.x==0)bpo_wp_sid=atomicAdd(ctr,1u);
+        __syncthreads();
+        const u32 t=bpo_wp_sid;if(t>=tiles)break;
+#if BPO_NH30
+        if(primes[t>>8]<(1u<<30))bpo_r16_body<true,true,true>(TA,A,B,C,primes,r16,N,untw);else
+#endif
+        bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
+    }
 }
 #endif
 // r16x init (once): per prime [0,512) = r16, [512+16i+c2] = r16[(c2 brev4(i))&255], [768+16i+c2] = r16[256+((brev4(c2) i)&255)]; grid K, 1024 threads
