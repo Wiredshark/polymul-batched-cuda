@@ -990,7 +990,7 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     constexpr u32 N=65536u;
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
-#ifdef BPO_P2MT   // wl2 p2mt: r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
+#ifdef BPO_P2MT   // p2mt: r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
     const u64* tf=r16+u64(prime)*1024u;const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);
 #else
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
@@ -1049,6 +1049,9 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
+#ifdef BPO_P2MT
+extern "C" __global__ void bpo_p2mt_on(){}   // marker: bpo_middle_r16 takes the r16x table (stride 1024 per prime)
+#endif
 #else
 template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u32* C,
     const u32* primes,const u64* r16,u32 N,u32 untw){
@@ -1638,7 +1641,7 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
     u64 F;
-#ifdef BPO_P3F   // wl2 p3f: untwist argument = precomputed F table [prime][c][t] (the values of the block below; 2 KB lane-contiguous per block)
+#ifdef BPO_P3F   // p3f: untwist argument = precomputed F table [prime][c][t] (the values of the block below, bpo_ftab_init; 2 KB lane-contiguous per block)
     F=__ldg(untwist+(u64(prime)*65536u+(c*256u+t)));(void)itw;
 #else
     {
@@ -1698,6 +1701,19 @@ template<bool H>__device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C
         for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
     }
 }
+#ifdef BPO_P3F
+// p3f table init (once, outside run): F[prime][c][t] = the bpo_p3b_body F factor (same formula), grid (256, K), 256 threads
+extern "C" __global__ void __launch_bounds__(256) bpo_ftab_init(const u64* untwist,const u32* primes,u64* out){
+    constexpr u32 N=65536u,logR=8u;
+    const u32 c=blockIdx.x,prime=blockIdx.y,t=threadIdx.x,p=primes[prime];
+    const u64* itw=untwist+(u64)prime*weighted_root_stride(N);
+    const u32 k1=__brev(t)>>(32-logR);
+    const u32 wv=mul_shoup(u32(bm_root(itw,2u*c*k1,N,p)),itw[1+(c&127u)],p);
+    const u64 m0=itw[0];u32 q=wv*u32(m0>>32)+__umulhi(wv,u32(m0));
+    const u64 rem=(u64(wv)<<32)-u64(q)*p;if(rem>=p)++q;
+    out[(u64(prime)*256u+c)*256u+t]=u64(wv)|(u64(q)<<32);
+}
+#endif
 extern "C" __global__ void __maxnreg__(32) bpo_last_cm3(const u32* C,u32* D,const u32* primes,
     const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
     __shared__ __align__(128) u32 X[8*288];__shared__ __align__(8) u64 bar;
