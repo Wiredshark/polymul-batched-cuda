@@ -22,13 +22,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <thread>
-#include <functional>
-#include <atomic>
-#include <sched.h>
-#include <pthread.h>
-#include <sys/resource.h>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
+#ifndef PIN_DEFAULT
+#define PIN_DEFAULT 2   // candidate 10: default chain-phase pin pattern (lock)
+#endif
 #if defined(FHERMA_POOL_NEW)
 static constexpr bool pool_new_built=true;
 #else
@@ -210,12 +209,12 @@ struct Cuda {
         root_cache=std::make_unique<L2RootCachePolicy>(a,dev,base,extent);
     }
     KProf kp;
-    std::function<void(CUfunction)> post_launch,pre_launch;   // ld4: stamp after each stage launch
+    std::function<void()> pre_launch,post_launch;   // candidate 10: pin bookkeeping during the production capture only
     void klaunch(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 bx,u32 smem,void** params){
-        if(pre_launch)pre_launch(fn);
+        if(pre_launch)pre_launch();
         if(kp.tracing(stream)){CUevent e0=kp.pre(stream);check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));kp.post(e0,fn,gx,gy,gz,bx,smem,stream);}
         else check(cuLaunchKernel(fn,gx,gy,gz,bx,1,1,smem,stream,params,nullptr));
-        if(post_launch)post_launch(fn);}
+        if(post_launch)post_launch();}
     template<class...Args>void launch(CUfunction fn,u32 gx,u32 gy,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,128,0,params);}
     template<class...Args>void launch_ntt(CUfunction fn,u32 gx,u32 gy,u32 threads,u32 shared_bytes,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,1,threads,shared_bytes,params);}
     template<class...Args>void launch3(CUfunction fn,u32 gx,u32 gy,u32 gz,u32 threads,Args...args){void* params[]={static_cast<void*>(&args)...};klaunch(fn,gx,gy,gz,threads,0,params);}
@@ -330,10 +329,8 @@ struct State {
         if(cuda)cuda->kp.report();
         if(ht_run.on&&ht_run.c)std::fprintf(stderr,"{\"hostt\":true,\"n\":%d,\"stage\":%d,\"crew\":%u,\"chunk_mb\":%zu,\"run_pre_us\":%.1f,\"launch_us\":%.1f,\"out_us\":%.1f,\"sync_us\":%.1f,\"run_us\":%.1f,\"h2d_us\":%.0f,\"d2h_us\":%.0f,\"h2d_cp\":%.0f,\"h2d_wait\":%.0f,\"d2h_cp\":%.0f,\"d2h_wait\":%.0f}\n",
             ht_run.c,int(stg.ok),stg.crew?stg.crew->size():0u,stg.chunk>>20,ht_run.med(0),ht_run.med(1),ht_run.med(2),ht_run.med(3),ht_run.med(4),ht_hook.med(0),ht_hook.med(1),ht_hook.med(2),ht_hook.med(3),ht_hook.med(4),ht_hook.med(5));
-        try{if(lever_env("FHERMA_LD5",false))run_ld5();else run_ld6();}catch(const std::exception& e){std::printf("{\"diag\":\"ld6\",\"err\":\"%.120s\"}\n",e.what());}
-        try{run_launch_diag();}catch(const std::exception& e){std::printf("{\"diag\":\"ld\",\"err\":\"%.120s\"}\n",e.what());}
         free_stage();
-        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,tabs_ms,tabs_why.c_str());
+        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"pin\":%d,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,pin_ok?pin_pat:0,tabs_ms,tabs_why.c_str());
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -939,8 +936,29 @@ struct State {
     // Whole batch as one CUDA graph (pointers are fixed at init): one launch per run.
     // Candidate 3 tables (once, before the graph capture, outside run; device-side init kernels, no host copies). Any failed
     // precondition / allocation / launch leaves that lever's pointer 0: its launch sites keep the production kernel.
-    // FHERMA_TABS_FAIL=mask (test only): forced failure, 1 p1tw, 2 p2mt, 4 p3f, 8 p2cu, 16 p1rev, 32 p3t2.
+    // FHERMA_TABS_FAIL=mask (test only): forced failure, 1 p1tw, 2 p2mt, 4 p3f, 8 p2cu, 16 p1rev, 32 p3t2, 64 pin, 128 pinned capture (candidate 9).
     bool tabs_done=false,tabs_any=false;double tabs_ms=0;std::string tabs_why;
+    // candidate 10: chain-phase pin patterns in graph variant 6 (2 chains; product i on chain i%2). Point m of product i
+    // = its start (m=0) or the end of its launch m; the patterns wait on points of the other chain's earlier products:
+    // 1 k0: odd i starts after i-1 started. 2 lock: odd i's launch m+1 waits for i-1's point m, every m (each chain-1
+    // stage starts after the same chain-0 stage started). 3 k0_d3: k0 + even i starts after i-1's launch 3 ended.
+    // 4 pairbar_crt: even i waits for i-1's last-but-one launch end, odd i for i-3's (both previous CRTs started).
+    static constexpr int PIN_PTS=9;
+    int pin_pat=0;bool pin_ok=false;std::vector<CUevent> pin_E;std::vector<int> pin_rc;int pin_cur=-1,pin_m=0;
+    void pin_wait(int src,int m){if(src<0||m<0||m>=PIN_PTS||pin_rc[size_t(src)]<=m)return;auto& d=*cuda;static auto sw=d.driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
+        d.check(sw(d.stream,pin_E[size_t(src)*PIN_PTS+size_t(m)],0));}
+    void pin_rec(int i,int m){if(m>=PIN_PTS)return;auto& d=*cuda;static auto er=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");
+        d.check(er(pin_E[size_t(i)*PIN_PTS+size_t(m)],d.stream));pin_rc[size_t(i)]=m+1;}
+    void pin_begin(u32 iu){const int i=int(iu);pin_cur=i;pin_m=0;pin_rc[size_t(i)]=0;const bool odd=i%2==1;
+        switch(pin_pat){
+            case 1:case 2:if(odd)pin_wait(i-1,0);break;
+            case 3:if(odd)pin_wait(i-1,0);else if(i>=2)pin_wait(i-1,3);break;
+            case 4:if(!odd&&i>=2)pin_wait(i-1,pin_rc[size_t(i-1)]-2);else if(odd&&i>=3)pin_wait(i-3,pin_rc[size_t(i-3)]-2);break;
+            default:break;}
+        pin_rec(i,0);}
+    void pin_pre(){if(pin_cur<0||pin_m==0)return;if(pin_pat==2&&pin_cur%2==1)pin_wait(pin_cur-1,pin_m);}
+    void pin_post(){if(pin_cur<0)return;++pin_m;pin_rec(pin_cur,pin_m);}
+    void pin_why(const char* x){if(!tabs_why.empty())tabs_why+=' ';tabs_why+=x;}
     void build_tabs(){
         if(tabs_done||!cuda){return;}tabs_done=true;auto& d=*cuda;
         tabs_any=d.bpo_first_xt||d.bpo_first_xr||d.bpo_middle_r16m||d.bpo_middle_r16c||d.bpo_last_cm3f;if(!tabs_any){return;}
@@ -971,7 +989,7 @@ struct State {
         if(d.bpo_last_cm3t){if(!p3f_ftab||!d.bpo_last_cm3f||n!=65536||(n/256)%p3cb_env()||(fail&32))why("p3t2:pre");else p3t2_ok=true;}   // p3t2: needs the p3f launch; grid cols / P3CB
         tabs_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();}
     void build_graph(){
-        build_tabs();ld3_init();ld4_init();
+        build_tabs();
         auto& d=*cuda;
         // L2 schedule unit (default on for the pass-order point; FHERMA_L2G=0 off, =g forces g, =k hints only):
         // one P2+P3 unit = (product, g primes) whose C workspace is g*8*N words per chain; g is the largest
@@ -1008,6 +1026,13 @@ struct State {
         if(const char* e=std::getenv("FHERMA_P1S_COLS")){const u32 v=u32(std::atoi(e));if(v&&v<=cols&&cols%v==0)p1s_cols=v;}
         if(const char* e=std::getenv("FHERMA_P1S_QUADS")){const u32 v=u32(std::atoi(e));if(v&&v<=k/4&&(k/4)%v==0)p1s_quads=v;}
         if(cuda->bpo_p1a&&cuda->bpo_p1b)for(u32 c=0;c<std::min(chains,bcount);++c)wsT[c]=d.alloc(size_t(2)*4*p1s_quads*8*p1s_cols*256*4);
+        pin_pat=PIN_DEFAULT;if(const char* pe=std::getenv("FHERMA_PIN")){char* e=nullptr;const long v=std::strtol(pe,&e,10);if(e==pe||*e||v<0||v>4)pin_why("pin:env");else pin_pat=int(v);}
+        bool pin_want=pin_pat>0;bool pin_force_cap=false;   // TABS_FAIL bit 128 (test): throw inside the pinned capture
+        {const char* fe=std::getenv("FHERMA_TABS_FAIL");if(pin_want&&fe&&(std::strtoul(fe,nullptr,0)&64ul)){pin_want=false;pin_why("pin:pre");}if(fe&&(std::strtoul(fe,nullptr,0)&128ul))pin_force_cap=true;}
+        if(pin_want&&pin_E.empty()){std::vector<CUevent> ev(size_t(bcount)*PIN_PTS,nullptr);bool ok=true;
+            for(auto& e:ev)if(ecreate(&e,CU_EVENT_DISABLE_TIMING)!=CUDA_SUCCESS){e=nullptr;ok=false;break;}
+            if(ok){pin_E=std::move(ev);pin_rc.assign(bcount,0);}else{auto ed=d.driver.get<decltype(&::cuEventDestroy)>("cuEventDestroy_v2");for(auto e:ev)if(e)ed(e);pin_want=false;pin_why("pin:ev");}}
+        if(pin_want){cuda->pre_launch=[this]{pin_pre();};cuda->post_launch=[this]{pin_post();};}
         for(int variant=0;variant<(po_available()?8:1);++variant){
             l2g=variant==7?l2g7:l2g6;
             p23db_now=p23db_env(variant==7);
@@ -1024,16 +1049,30 @@ struct State {
             CUstream cs[4]{graph_stream};CUevent fork=nullptr,join[4]{};
             for(u32 c=1;c<S;++c){if(!chain_streams[c])d.check(screate(&chain_streams[c],CU_STREAM_NON_BLOCKING));cs[c]=chain_streams[c];}
             if(p23db_now)for(u32 c=0;c<S;++c)if(!side_streams[c])d.check(screate(&side_streams[c],CU_STREAM_NON_BLOCKING));
-            d.check(begin(graph_stream,CU_STREAM_CAPTURE_MODE_RELAXED));d.kp.begin_variant(variant);
-            if(variant==6)ld3_node(false);   // ld3 head stamp
+            for(int attempt=0;attempt<2;++attempt){
+            // candidate 9: variant 6, 2 chains: chain-1 product 2j+1 starts only after chain-0 product 2j has started
+            // (pv114: the fast state has the two P1s overlapping; this pin keeps chain 1 from running ahead).
+            const bool pinv=variant==6&&attempt==0&&pin_want&&S==2;bool capt=false;
+            try{
+            d.check(begin(graph_stream,CU_STREAM_CAPTURE_MODE_RELAXED));capt=true;d.kp.begin_variant(variant);
             if(S>1){d.check(ecreate(&fork,CU_EVENT_DISABLE_TIMING));d.check(erecord(fork,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],fork,0));}
-            for(u32 i=0;i<bcount;++i){d.stream=cs[i%S];cur_ws=i%S;d.kp.product=int(i);d.kp.chain=int(i%S);next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;if(variant==6&&S==2&&lever_env("FHERMA_PIN",false)){static auto ec5=d.driver.get<decltype(&::cuEventCreate)>("cuEventCreate");if(!pin_ev5)d.check(ec5(&pin_ev5,CU_EVENT_DISABLE_TIMING));pin_ok=true;if(i%2==0)d.check(erecord(pin_ev5,cs[0]));else d.check(swait(cs[1],pin_ev5,0));}compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);}
+            for(u32 i=0;i<bcount;++i){d.stream=cs[i%S];cur_ws=i%S;d.kp.product=int(i);d.kp.chain=int(i%S);next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;
+                if(pinv){if(pin_force_cap&&i==1)throw std::runtime_error("forced pin capture failure");pin_begin(i);}
+                compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);pin_cur=-1;}
             d.stream=graph_stream;cur_ws=0;next_a=next_b=0;
             for(u32 c=1;c<S;++c){d.check(ecreate(&join[c],CU_EVENT_DISABLE_TIMING));d.check(erecord(join[c],cs[c]));d.check(swait(graph_stream,join[c],0));}
-            if(variant==6)ld3_node(true);   // ld3 tail stamp + slot bump
-            d.kp.end_variant();CUgraph g=nullptr;d.check(endc(graph_stream,&g));
-            d.check(inst(&graph_execs[variant],g,0));if(variant==6&&ld3_on)ld3_graph=g;else d.check(gdestroy(g));   // ld3 keeps the graph (re-instantiation line)
+            d.kp.end_variant();CUgraph g=nullptr;capt=false;d.check(endc(graph_stream,&g));
+            const CUresult ir=inst(&graph_execs[variant],g,0);gdestroy(g);d.check(ir);
+            if(variant==6)pin_ok=pinv;
+            break;
+            }catch(...){
+                if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}
+                d.stream=graph_stream;cur_ws=0;next_a=next_b=0;graph_execs[variant]=nullptr;pin_cur=-1;
+                if(!pinv){throw;}
+                pin_why("pin:cap");   // pinned capture failed: capture the unpinned graph instead
+            }}
         }
+        cuda->pre_launch=nullptr;cuda->post_launch=nullptr;pin_cur=-1;
         l2g=l2g6;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;l2on=false;graph_exec=graph_execs[0]?graph_execs[0]:graph_execs[4]?graph_execs[4]:graph_execs[6];
     }
     // FHERMA_PO=1 selects the pass-order pipeline (default off until it wins A/B).
@@ -1041,524 +1080,14 @@ struct State {
     int want_po()const{const char* e=std::getenv("FHERMA_POY");if(e&&*e=='1')return 5;e=std::getenv("FHERMA_POX");if(e&&*e=='1')return 4;e=std::getenv("FHERMA_POCH");if(e&&*e=='1')return 3;e=std::getenv("FHERMA_POCM");if(e&&*e=='1')return 2;e=std::getenv("FHERMA_PO");if(e&&*e=='1')return 1;
         e=std::getenv("FHERMA_PO_DEFAULT");if(e)return std::atoi(e);
         return std::getenv("FHERMA_V14")?0:4;}   // default: pass-order, column-major, chains, P2->P3 untwiddle, P1 L2 prefetch
-    // ---- launch diag ld1 (on 6a3f4ed = candidate 8; diag build only): how the production work is SUBMITTED, at exit
-    // on the real batch. Same kernels, same per-chain order, same chains/workspaces as graph variant 6; only the
-    // number of graphs, which streams/threads launch them, the context sync mode and the wait call change.
-    std::vector<CUevent> ld_events;
-    CUevent ld_ev(bool timing){auto& D=cuda->driver;static auto ecreate=D.get<decltype(&::cuEventCreate)>("cuEventCreate");
-        CUevent e=nullptr;cuda->check(ecreate(&e,timing?0u:unsigned(CU_EVENT_DISABLE_TIMING)));ld_events.push_back(e);return e;}
-    u32 ld_chains(){return std::min(std::max(1u,std::min(default_chains(),4u)),bcount);}
-    void ld_state(bool on){
-        if(on){l2on=true;pox=true;po=2;p1x=p1x_default();xoff=0;p23db_now=p23db_env(false);}
-        else{l2on=false;pox=false;po=0;p1x=0;xoff=0;p23db_now=false;cur_ws=0;next_a=next_b=0;cuda->stream=graph_stream;}
-    }
-    void ld_one(u32 i,u32 S,const CUstream* cs){const size_t stride=size_t(n)*l*4;auto& d=*cuda;
-        d.stream=cs[i%S];cur_ws=i%S;next_a=i+S<bcount?a_all+(i+S)*stride:0;next_b=i+S<bcount?b_all+(i+S)*stride:0;
-        ld5_begin(i);ld4_begin(i);compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);ld4_end();ld5_end();}
-    // products [i0,i1) of the variant-6 schedule; only>=0: just chain `only`'s products, captured on that chain's stream
-    CUgraphExec ld_cap(u32 i0,u32 i1,int only,CUevent head=nullptr,CUevent tail=nullptr){
-        auto& d=*cuda;auto& D=d.driver;
-        static auto begin=D.get<decltype(&::cuStreamBeginCapture)>("cuStreamBeginCapture_v2");
-        static auto endc=D.get<decltype(&::cuStreamEndCapture)>("cuStreamEndCapture");
-        static auto inst=D.get<decltype(&::cuGraphInstantiateWithFlags)>("cuGraphInstantiateWithFlags");
-        static auto gdestroy=D.get<decltype(&::cuGraphDestroy)>("cuGraphDestroy");
-        static auto erecord=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        static auto swait=D.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        static auto erecf=D.get<decltype(&::cuEventRecordWithFlags)>("cuEventRecordWithFlags");   // external record nodes (timing)
-        const u32 S=ld_chains();CUstream cs[4]{graph_stream};for(u32 c=1;c<S;++c)cs[c]=chain_streams[c];
-        const CUstream cap=only>=0?cs[only]:graph_stream;CUgraphExec ge=nullptr;bool capt=false;
-        ld_state(true);
-        try{
-            d.stream=cap;d.check(begin(cap,CU_STREAM_CAPTURE_MODE_RELAXED));capt=true;
-            if(head)d.check(erecf(head,cap,CU_EVENT_RECORD_EXTERNAL));
-            if((ld4_cap||ld5_cap)&&only<0)ld3_node(false);
-            if(only<0&&S>1){CUevent f=ld_ev(false);d.check(erecord(f,graph_stream));for(u32 c=1;c<S;++c)d.check(swait(cs[c],f,0));}
-            for(u32 i=i0;i<i1;++i){if(only>=0&&int(i%S)!=only)continue;ld_one(i,S,cs);}
-            d.stream=cap;
-            if(only<0)for(u32 c=1;c<S;++c){CUevent j=ld_ev(false);d.check(erecord(j,cs[c]));d.check(swait(graph_stream,j,0));}
-            if(tail)d.check(erecf(tail,cap,CU_EVENT_RECORD_EXTERNAL));
-            if((ld4_cap||ld5_cap)&&only<0)ld3_node(true);
-            CUgraph g=nullptr;capt=false;d.check(endc(cap,&g));const CUresult r=inst(&ge,g,0);gdestroy(g);d.check(r);
-        }catch(...){if(capt){CUgraph g=nullptr;endc(cap,&g);if(g)gdestroy(g);}ge=nullptr;}
-        ld_state(false);return ge;
-    }
-    // two parked launcher threads (created once for the diag), each launches its own (graph, stream) job
-    struct LdCrew {
-        std::vector<std::thread> th;std::mutex m;std::condition_variable go,fin;uint64_t gen=0;unsigned left=0;bool quit=false;
-        std::vector<std::pair<CUgraphExec,CUstream>> jobs;CUresult err=CUDA_SUCCESS;
-        decltype(&::cuGraphLaunch) gl=nullptr;
-        void start(unsigned nt,CUcontext ctx,decltype(&::cuCtxSetCurrent) setcur,decltype(&::cuGraphLaunch) g){gl=g;
-            for(unsigned t=0;t<nt;++t)th.emplace_back([=,this]{setcur(ctx);uint64_t seen=0;for(;;){{std::unique_lock<std::mutex> lk(m);go.wait(lk,[&]{return quit||gen!=seen;});if(quit)return;seen=gen;}
-                CUresult r=t<jobs.size()?gl(jobs[t].first,jobs[t].second):CUDA_SUCCESS;{std::lock_guard<std::mutex> lk(m);if(r!=CUDA_SUCCESS)err=r;if(--left==0)fin.notify_one();}}});}
-        void launch(){{std::lock_guard<std::mutex> lk(m);left=unsigned(th.size());++gen;}go.notify_all();std::unique_lock<std::mutex> lk(m);fin.wait(lk,[&]{return left==0;});}
-        ~LdCrew(){{std::lock_guard<std::mutex> lk(m);quit=true;}go.notify_all();for(auto& t:th)t.join();}
-    };
-    struct LdSub { std::vector<std::pair<CUgraphExec,CUstream>> g; u32 direct=0; bool thr=false; int wait=0; CUevent pre=nullptr,head=nullptr,tail=nullptr; };
-    double ld_once(const LdSub& s,LdCrew* crew,double* lau){
-        auto& d=*cuda;auto& D=d.driver;
-        static auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");static auto erecord=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        static auto esync=D.get<decltype(&::cuEventSynchronize)>("cuEventSynchronize");static auto sq=D.get<decltype(&::cuStreamQuery)>("cuStreamQuery");
-        static auto swait=D.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        static CUevent fin_ev=ld_ev(false);
-        const auto t0=std::chrono::steady_clock::now();
-        if(s.pre)d.check(erecord(s.pre,graph_stream));
-        if(s.direct){const u32 S=ld_chains();CUstream cs[4]{graph_stream};for(u32 c=1;c<S;++c)cs[c]=chain_streams[c];
-            ld_state(true);for(u32 i=0;i<s.direct;++i)ld_one(i,S,cs);ld_state(false);
-            for(u32 c=1;c<S;++c){static CUevent dj[4]{};if(!dj[c])dj[c]=ld_ev(false);d.check(erecord(dj[c],cs[c]));d.check(swait(graph_stream,dj[c],0));}}
-        if(s.thr&&crew){crew->jobs=s.g;crew->launch();d.check(crew->err);}
-        else for(const auto& x:s.g)d.check(glaunch(x.first,x.second));
-        const auto t1=std::chrono::steady_clock::now();
-        if(s.wait==0)d.check(d.cuCtxSynchronize());
-        else{for(const auto& x:s.g)if(x.second!=graph_stream){static CUevent cj[4]{};const u32 c=x.second==chain_streams[1]?1:x.second==chain_streams[2]?2:3;if(!cj[c])cj[c]=ld_ev(false);d.check(erecord(cj[c],x.second));d.check(swait(graph_stream,cj[c],0));}
-            d.check(erecord(fin_ev,graph_stream));
-            if(s.wait==1)d.check(esync(fin_ev));else{CUresult r;while((r=sq(graph_stream))==CUDA_ERROR_NOT_READY){}d.check(r);}}
-        const auto t2=std::chrono::steady_clock::now();
-        *lau=std::chrono::duration<double,std::micro>(t1-t0).count();return std::chrono::duration<double,std::micro>(t2-t0).count();
-    }
-    void run_launch_diag(){
-        if(!lever_env("FHERMA_LDIAG",false)||!graph_execs[6]||bcount<2)return;
-        auto& d=*cuda;auto& D=d.driver;
-        auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        typedef CUresult (*FlagsSet)(unsigned);typedef CUresult (*FlagsGet)(unsigned*);
-        auto fset=reinterpret_cast<FlagsSet>(dlsym(D.handle,"cuCtxSetFlags"));auto fget=reinterpret_cast<FlagsGet>(dlsym(D.handle,"cuCtxGetFlags"));
-        auto setcur=D.get<decltype(&::cuCtxSetCurrent)>("cuCtxSetCurrent");auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-        const auto T0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-T0).count();};
-        const size_t bytes=size_t(bcount)*n*l*4;const u32 S=ld_chains(),B=bcount;
-        const int R=std::getenv("FHERMA_LD_R")?std::max(3,std::atoi(std::getenv("FHERMA_LD_R"))):15;
-        unsigned flags0=0;if(fget)fget(&flags0);
-        std::printf("{\"diag\":\"ld\",\"k\":\"info\",\"B\":%u,\"chains\":%u,\"R\":%d,\"ctx_flags\":%u,\"setflags\":%d,\"hostt_launch_us\":%.1f,\"hostt_run_us\":%.1f}\n",
-            B,S,R,flags0,fset?1:0,ht_run.med(1),ht_run.med(4));std::fflush(stdout);
-        CUdeviceptr ref=0;try{ref=d.alloc(bytes);}catch(...){ref=0;}
-        const CUgraphExec prod=graph_execs[6];LdSub P;P.g={{prod,graph_stream}};double lau=0;
-        ld_once(P,nullptr,&lau);if(ref){d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());}
-        std::vector<char> h1(size_t(32)<<20),h2(size_t(32)<<20);
-        auto exact=[&](const LdSub& s,LdCrew* crew)->int{if(!ref)return -1;double x;d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());ld_once(s,crew,&x);d.check(d.cuCtxSynchronize());
-            for(size_t off=0;off<bytes;off+=h1.size()){const size_t len=std::min(h1.size(),bytes-off);d.check(d.cuMemcpyDtoH(h1.data(),ref+off,len));d.check(d.cuMemcpyDtoH(h2.data(),out_all+off,len));if(std::memcmp(h1.data(),h2.data(),len))return 0;}
-            return 1;};
-        LdCrew crew2;if(setcur)crew2.start(2,d.context,setcur,glaunch);
-        auto med=[](std::vector<double> v){std::sort(v.begin(),v.end());return v.empty()?0.0:v[v.size()/2];};
-        auto line=[&](const char* nm,LdSub s,unsigned flags,bool evs){
-            if(el()>240){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"skipped\":\"time\"}\n",nm);return;}
-            for(const auto& x:s.g)if(!x.first){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"err\":\"capture\"}\n",nm);return;}
-            bool fl=flags!=~0u;if(fl&&(!fset||fset(flags)!=CUDA_SUCCESS)){std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"err\":\"setflags\"}\n",nm);return;}
-            std::vector<double> tp,tv,lp,lv,hd,bd,tl;double a=0,b2=0;
-            for(int w=0;w<2;++w){ld_once(P,nullptr,&a);ld_once(s,&crew2,&a);}
-            for(int r=0;r<R;++r){tp.push_back(ld_once(P,nullptr,&a));lp.push_back(a);const double t=ld_once(s,&crew2,&b2);tv.push_back(t);lv.push_back(b2);
-                if(evs){float x=0,y=0;if(eel(&x,s.pre,s.head)==CUDA_SUCCESS&&eel(&y,s.head,s.tail)==CUDA_SUCCESS){hd.push_back(1e3*x);bd.push_back(1e3*y);tl.push_back(t-1e3*(x+y));}}}
-            const int ex=exact(s,&crew2);
-            if(fl)fset(flags0);
-            const double mv=med(tv),mp=med(tp);
-            if(evs)std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"us\":%.1f,\"prod_us\":%.1f,\"vs\":%.4f,\"ex\":%d,\"lau\":%.1f,\"lau_p\":%.1f,\"head_us\":%.1f,\"body_us\":%.1f,\"tail_us\":%.1f}\n",nm,mv,mp,mp>0?mv/mp:0,ex,med(lv),med(lp),med(hd),med(bd),med(tl));
-            else std::printf("{\"diag\":\"ld\",\"v\":\"%s\",\"us\":%.1f,\"prod_us\":%.1f,\"vs\":%.4f,\"ex\":%d,\"lau\":%.1f,\"lau_p\":%.1f,\"n\":%zu}\n",nm,mv,mp,mp>0?mv/mp:0,ex,med(lv),med(lp),s.g.size());
-            std::fflush(stdout);
-            for(const auto& x:s.g)if(x.first!=prod)ged(x.first);};
-        auto split=[&](u32 parts){LdSub s;for(u32 j=0;j<parts;++j)s.g.push_back({ld_cap(j*B/parts,(j+1)*B/parts,-1),graph_stream});return s;};
-        auto headg=[&](u32 h){LdSub s;s.g={{ld_cap(0,h,-1),graph_stream},{ld_cap(h,B,-1),graph_stream}};return s;};
-        auto perch=[&](bool thr){LdSub s;s.thr=thr;for(u32 c=0;c<S;++c)s.g.push_back({ld_cap(0,B,int(c)),c?chain_streams[c]:graph_stream});return s;};
-        auto direct=[&](u32 h){LdSub s;s.direct=h;s.g={{ld_cap(h,B,-1),graph_stream}};return s;};
-        auto prodw=[&](int w){LdSub s=P;s.wait=w;return s;};
-        {LdSub s=P;line("ctrl",s,~0u,false);}
-        for(int pass=0;pass<2;++pass){char nm[32];auto N=[&](const char* b){std::snprintf(nm,sizeof nm,"%s%s",b,pass?"_r":"");return nm;};
-            {LdSub s;s.g={{ld_cap(0,B,-1),graph_stream}};line(N("recap"),s,~0u,false);}                       // recaptured production graph: capture itself
-            {LdSub s;s.pre=ld_ev(true);s.head=ld_ev(true);s.tail=ld_ev(true);s.g={{ld_cap(0,B,-1,s.head,s.tail),graph_stream}};line(N("ev"),s,~0u,true);}   // head/body/tail
-            for(u32 p:{2u,4u,8u,16u,32u,64u,128u})if(p<=B){char b[16];std::snprintf(b,sizeof b,"split%u",p);line(N(b),split(p),~0u,false);}
-            for(u32 h:{2u,4u})if(h<B){char b[16];std::snprintf(b,sizeof b,"head%u",h);line(N(b),headg(h),~0u,false);}
-            if(S>1){line(N("perchain"),perch(false),~0u,false);if(setcur)line(N("perch_thr"),perch(true),~0u,false);}
-            for(u32 h:{2u,4u})if(h<B){char b[16];std::snprintf(b,sizeof b,"direct%u",h);line(N(b),direct(h),~0u,false);}
-            line(N("spin"),P,unsigned(CU_CTX_SCHED_SPIN),false);line(N("yield"),P,unsigned(CU_CTX_SCHED_YIELD),false);line(N("block"),P,unsigned(CU_CTX_SCHED_BLOCKING_SYNC),false);
-            line(N("wait_ev"),prodw(1),~0u,false);line(N("wait_poll"),prodw(2),~0u,false);}
-        {LdSub s=P;line("ctrl_end",s,~0u,false);}
-        std::printf("{\"diag\":\"ld\",\"k\":\"done\",\"s\":%.1f}\n",el());std::fflush(stdout);
-        (void)ref;   // freed with the other device buffers
-        auto edes=D.get<decltype(&::cuEventDestroy)>("cuEventDestroy_v2");for(auto e:ld_events)edes(e);ld_events.clear();
-    }
-    // ---- ld3 (diag build on c89e973 = 6a3f4ed + ld1 helpers; nothing in fherma_h2d / fherma_d2h): the slow GPU-body state.
-    // Graph variant 6 carries a head and a tail stamp kernel (one writer block per SM: %clock64 + %globaltimer into slot
-    // *ctr) and a 1-thread bump of ctr: per launch, body = max tail time - min head time, effective SM clock = per-SM
-    // cycles / ns over the whole body. run() takes NVML / host snapshots before the launch and after the synchronize.
-    struct Ld3Nvml {
-        void* h=nullptr;void* dev=nullptr;bool ok=false;size_t pstride=24;
-        int (*init)()=nullptr;int (*byPci)(const char*,void**)=nullptr;int (*clock)(void*,int,unsigned*)=nullptr;int (*power)(void*,unsigned*)=nullptr;
-        int (*temp)(void*,int,unsigned*)=nullptr;int (*pstate)(void*,int*)=nullptr;int (*reasons)(void*,unsigned long long*)=nullptr;
-        int (*util)(void*,unsigned*)=nullptr;int (*procs)(void*,unsigned*,void*)=nullptr;int (*viol)(void*,int,unsigned long long*)=nullptr;
-        template<class F> void sym(F& f,const char* a,const char* b=nullptr){void* p=dlsym(h,a);if(!p&&b)p=dlsym(h,b);f=reinterpret_cast<F>(p);}
-        void open(const char* pci){h=dlopen("libnvidia-ml.so.1",RTLD_NOW);if(!h)return;
-            sym(init,"nvmlInit_v2","nvmlInit");sym(byPci,"nvmlDeviceGetHandleByPciBusId_v2","nvmlDeviceGetHandleByPciBusId");sym(clock,"nvmlDeviceGetClockInfo");
-            sym(power,"nvmlDeviceGetPowerUsage");sym(temp,"nvmlDeviceGetTemperature");sym(pstate,"nvmlDeviceGetPerformanceState");
-            sym(reasons,"nvmlDeviceGetCurrentClocksEventReasons","nvmlDeviceGetCurrentClocksThrottleReasons");sym(util,"nvmlDeviceGetUtilizationRates");
-            procs=reinterpret_cast<decltype(procs)>(dlsym(h,"nvmlDeviceGetComputeRunningProcesses_v3"));if(!procs){procs=reinterpret_cast<decltype(procs)>(dlsym(h,"nvmlDeviceGetComputeRunningProcesses_v2"));}
-            if(!procs){procs=reinterpret_cast<decltype(procs)>(dlsym(h,"nvmlDeviceGetComputeRunningProcesses"));pstride=16;}
-            sym(viol,"nvmlDeviceGetViolationStatus");
-            if(!init||!byPci||init()!=0||byPci(pci,&dev)!=0)return;ok=true;}
-    } ld3_nv;
-    struct Ld3Snap { unsigned clk=0,pw=0,tmp=0,ut=0,np=0,no=0;int ps=-1;unsigned long long rs=0,pv=0,tv=0;double cost=0; };
-    void ld3_snap(Ld3Snap& s,bool full){
-        const auto t=std::chrono::steady_clock::now();auto& N=ld3_nv;
-        if(N.ok){if(N.clock)N.clock(N.dev,1,&s.clk);if(N.reasons)N.reasons(N.dev,&s.rs);   // pre-launch: 2 calls only
-            if(full){if(N.pstate)N.pstate(N.dev,&s.ps);unsigned long long v[2]{};if(N.viol&&N.viol(N.dev,0,v)==0)s.pv=v[1];if(N.viol&&N.viol(N.dev,1,v)==0)s.tv=v[1];if(N.power)N.power(N.dev,&s.pw);if(N.temp)N.temp(N.dev,0,&s.tmp);unsigned u[2]{};if(N.util&&N.util(N.dev,u)==0)s.ut=u[0];
-                if(N.procs){alignas(8) unsigned char buf[64*24];unsigned cnt=64;if(N.procs(N.dev,&cnt,buf)==0){s.np=cnt;const unsigned me=unsigned(getpid());
-                    for(unsigned i=0;i<cnt&&i<64;++i){unsigned pid;std::memcpy(&pid,buf+i*N.pstride,4);if(pid!=me)++s.no;}}}}}
-        s.cost=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t).count();}
-    struct Ld3Rec { int cond=-1,slot=-1,cpu0=-1,cpu1=-1;double lau=0,host=0,load=0;long ivcsw=0;Ld3Snap a,b; };
-    std::vector<Ld3Rec> ld3_recs;int ld3_slots=0;bool ld3_on=false,ld3_live=false;Ld3Rec ld3_cur;
-    CUmodule ld3_mod=nullptr;CUfunction ld3_stamp=nullptr,ld3_bump=nullptr;CUdeviceptr ld3_buf=0,ld3_flag=0,ld3_ctr=0;CUgraph ld3_graph=nullptr;
-    static constexpr int LD3_SLOTS=704;
-    void ld3_init(){
-        if(ld3_mod||!lever_env("FHERMA_LD3",true))return;auto& d=*cuda;
-        const char* src="extern \"C\" __global__ void ld3_stamp(unsigned long long* buf,unsigned* flag,const unsigned* ctr,unsigned which){\n"
-            "  if(threadIdx.x)return;unsigned sm;asm volatile(\"mov.u32 %0, %%smid;\":\"=r\"(sm));if(sm>=256)return;const unsigned slot=*ctr;if(slot>=704)return;\n"
-            "  const unsigned i=(slot*2+which)*256+sm;if(atomicCAS(&flag[i],0u,1u)!=0u)return;unsigned long long g;\n"
-            "  asm volatile(\"mov.u64 %0, %%globaltimer;\":\"=l\"(g));buf[2*i]=clock64();buf[2*i+1]=g;}\n"
-            "extern \"C\" __global__ void ld3_bump(unsigned* ctr){*ctr+=1u;}\n";
-        nvrtcProgram p=nullptr;if(d.nvrtcCreateProgram(&p,src,"ld3.cu",0,nullptr,nullptr)!=NVRTC_SUCCESS)return;
-        const char* opt[]={"--gpu-architecture=compute_80"};
-        if(d.nvrtcCompileProgram(p,1,opt)!=NVRTC_SUCCESS){d.nvrtcDestroyProgram(&p);return;}
-        size_t sz=0;d.nvrtcGetPTXSize(p,&sz);std::vector<char> ptx(sz);d.nvrtcGetPTX(p,ptx.data());d.nvrtcDestroyProgram(&p);
-        if(d.cuModuleLoadData(&ld3_mod,ptx.data())!=CUDA_SUCCESS){ld3_mod=nullptr;return;}
-        d.check(d.cuModuleGetFunction(&ld3_stamp,ld3_mod,"ld3_stamp"));d.check(d.cuModuleGetFunction(&ld3_bump,ld3_mod,"ld3_bump"));
-        ld3_buf=d.alloc(size_t(LD3_SLOTS)*2*256*16);ld3_flag=d.alloc(size_t(LD3_SLOTS)*2*256*4);ld3_ctr=d.alloc(256);
-        auto ms=d.driver.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");d.check(ms(ld3_flag,0,size_t(LD3_SLOTS)*2*256*4));d.check(ms(ld3_ctr,0,256));d.check(ms(ld3_buf,0,size_t(LD3_SLOTS)*2*256*16));
-        char pci[32]{};CUdevice dev=0;d.cuDeviceGet(&dev,0);auto gp=d.driver.get<decltype(&::cuDeviceGetPCIBusId)>("cuDeviceGetPCIBusId");gp(pci,32,dev);ld3_nv.open(pci);
-        ld3_recs.reserve(256);ld3_on=true;}
-    void ld3_node(bool tail){   // inside the variant-6 capture, on graph_stream
-        if(!ld3_on)return;auto& d=*cuda;int sms=0;CUdevice dev=0;d.cuDeviceGet(&dev,0);
-        auto attr=d.driver.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);
-        unsigned which=tail?1u:0u;void* a[]={&ld3_buf,&ld3_flag,&ld3_ctr,&which};
-        d.check(d.cuLaunchKernel(ld3_stamp,unsigned(std::max(1,sms)*4),1,1,32,1,1,0,graph_stream,a,nullptr));
-        if(tail){void* b[]={&ld3_ctr};d.check(d.cuLaunchKernel(ld3_bump,1,1,1,1,1,1,0,graph_stream,b,nullptr));}}
-    struct Ld3Host { int cpu=-1;long iv=0; };
-    static Ld3Host ld3_host(){Ld3Host h;h.cpu=sched_getcpu();struct rusage u{};if(getrusage(RUSAGE_THREAD,&u)==0)h.iv=u.ru_nivcsw;return h;}
-    void ld3_rec_before(Ld3Rec& r){static const bool pre=lever_env("FHERMA_LD3_PRE",false);if(pre)ld3_snap(r.a,false);const Ld3Host h=ld3_host();r.cpu0=h.cpu;r.ivcsw=-h.iv;}
-    void ld3_rec_after(Ld3Rec& r){const Ld3Host h=ld3_host();r.cpu1=h.cpu;r.ivcsw+=h.iv;if(ld3_nv.ok&&ld3_nv.power)ld3_nv.power(ld3_nv.dev,&r.b.pw);if(ld3_nv.ok&&ld3_nv.clock)ld3_nv.clock(ld3_nv.dev,2,&r.b.clk);double la[1]{};if(getloadavg(la,1)==1)r.load=la[0];}
-    // the exit loop: conditions around production launches (5 reps each)
-    void run_ld3(){
-        if(!ld3_on||!graph_execs[6])return;auto& d=*cuda;auto& D=d.driver;
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ginst=D.get<decltype(&::cuGraphInstantiateWithFlags)>("cuGraphInstantiateWithFlags");
-        auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;const int ncase=int(ld3_recs.size());
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        auto plain2g=[&]{const size_t two=size_t(2)<<30;d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));if(two>bytes)d.check(d.cuMemcpyHtoD(b_all,hb.data(),std::min(bytes,two-bytes)));};
-        auto once=[&](int cond,CUgraphExec ge,bool outalloc){Ld3Rec r;r.cond=cond;r.slot=ld3_slots++;ld3_rec_before(r);
-            const auto t1=std::chrono::steady_clock::now();d.check(glaunch(ge,graph_stream));const auto t2=std::chrono::steady_clock::now();
-            {std::vector<uint32_t> o;if(outalloc){o.reserve(count);advise_unused_output_thp(output_thp_stats,o.data(),1,count,o.capacity(),host_page_size);set_size_no_init(o,count);}
-             d.check(d.cuCtxSynchronize());}
-            const auto t3=std::chrono::steady_clock::now();ld3_rec_after(r);
-            r.lau=std::chrono::duration<double,std::micro>(t2-t1).count();r.host=std::chrono::duration<double,std::micro>(t3-t1).count();ld3_recs.push_back(r);};
-        std::atomic<bool> stop{false};std::atomic<int> up{0};
-        auto with_threads=[&](int nt,bool copy,const std::function<void()>& f){std::vector<std::thread> th;stop=false;up=0;
-            for(int t=0;t<nt;++t)th.emplace_back([&,copy]{std::vector<char> s,dd;if(copy){s.assign(size_t(64)<<20,1);dd.assign(size_t(64)<<20,0);}
-                ++up;volatile unsigned long x=0;while(!stop.load(std::memory_order_relaxed)){if(copy)std::memcpy(dd.data(),s.data(),s.size());else x=x+1;}});
-            while(up.load()<nt)std::this_thread::yield();f();stop=true;for(auto& t:th)t.join();};
-        const char* cn[]={"c_ref","c_spin16","c_memcpy16","c_pin","c_plain2g","c_plain2g_st","c_fresh1","c_fresh2","c_b2b","c_outalloc","c_noout","c_ref_end"};
-        const int R=5;CUgraphExec P=graph_execs[6];
-        for(int r=0;r<R;++r){h2d_staged();once(0,P,false);}
-        for(int r=0;r<R;++r){h2d_staged();with_threads(16,false,[&]{once(1,P,false);});}
-        for(int r=0;r<R;++r){h2d_staged();with_threads(16,true,[&]{once(2,P,false);});}
-        {cpu_set_t old;CPU_ZERO(&old);pthread_getaffinity_np(pthread_self(),sizeof old,&old);cpu_set_t one;CPU_ZERO(&one);CPU_SET(std::max(0,sched_getcpu()),&one);
-         pthread_setaffinity_np(pthread_self(),sizeof one,&one);for(int r=0;r<R;++r){h2d_staged();once(3,P,false);}pthread_setaffinity_np(pthread_self(),sizeof old,&old);}
-        for(int r=0;r<R;++r){plain2g();once(4,P,false);}
-        for(int r=0;r<R;++r){plain2g();h2d_staged();once(5,P,false);}
-        if(ld3_graph)for(int r=0;r<R;++r){CUgraphExec ge=nullptr;if(ginst(&ge,ld3_graph,0)!=CUDA_SUCCESS)break;h2d_staged();once(6,ge,false);h2d_staged();once(7,ge,false);ged(ge);}
-        for(int r=0;r<R;++r)once(8,P,false);
-        for(int r=0;r<R;++r){h2d_staged();once(9,P,true);h2d_staged();once(10,P,false);}
-        for(int r=0;r<R;++r){h2d_staged();once(11,P,false);}
-        // stamps -> body and effective SM clock per slot
-        std::vector<unsigned long long> sb(size_t(LD3_SLOTS)*2*256*2);std::vector<unsigned> fl(size_t(LD3_SLOTS)*2*256);
-        d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(sb.data(),ld3_buf,sb.size()*8));d.check(d.cuMemcpyDtoH(fl.data(),ld3_flag,fl.size()*4));
-        auto slotv=[&](int s,double& body,double& clk,int& nsm){body=-1;clk=-1;nsm=0;if(s<0||s>=LD3_SLOTS)return;unsigned long long g0=~0ull,g1=0;std::vector<double> c;
-            for(int m=0;m<256;++m){const size_t h=size_t(s*2)*256+m,t=size_t(s*2+1)*256+m;
-                if(fl[h]){g0=std::min(g0,sb[2*h+1]);}if(fl[t]){g1=std::max(g1,sb[2*t+1]);}
-                if(fl[h]&&fl[t]&&sb[2*t+1]>sb[2*h+1])c.push_back(double(sb[2*t]-sb[2*h])/double(sb[2*t+1]-sb[2*h+1])*1e3);}
-            if(g1>g0&&g0!=~0ull)body=double(g1-g0)/1e3;nsm=int(c.size());if(!c.empty()){std::sort(c.begin(),c.end());clk=c[c.size()/2];}};
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        auto line=[&](const char* nm,int i0,const std::vector<int>& idx){std::vector<double> bo,ck,ca,cb,pw,tm,ut,lau,cost,costb,iv,pv,tv;unsigned long long rs=0;int ps=-1,np=0,no=0,mig=0,nsm=0;double ld=0,bmin=1e30,bmax=0;
-            for(int k:idx){const auto& r=ld3_recs[k];double b,c;int ns;slotv(r.slot,b,c,ns);bo.push_back(b);ck.push_back(c);nsm=ns;bmin=std::min(bmin,b);bmax=std::max(bmax,b);
-                ca.push_back(r.a.clk);cb.push_back(r.b.clk);pw.push_back(r.b.pw/1000.0);tm.push_back(r.b.tmp);ut.push_back(r.b.ut);lau.push_back(r.lau);cost.push_back(r.a.cost);costb.push_back(r.b.cost);
-                iv.push_back(double(r.ivcsw));if(k>0){pv.push_back(double(r.b.pv-ld3_recs[k-1].b.pv)/1e3);tv.push_back(double(r.b.tv-ld3_recs[k-1].b.tv)/1e3);}rs|=r.a.rs|r.b.rs;ps=r.b.ps;np=std::max(np,int(r.b.np));no=std::max(no,int(r.b.no));mig+=r.cpu0!=r.cpu1;ld=r.load;}
-            std::printf("{\"diag\":\"ld3\",\"v\":\"%s\",%s\"body\":%.1f,\"bmin\":%.1f,\"bmax\":%.1f,\"clk\":%.0f,\"nclk\":\"%.0f/%.0f\",\"ps\":%d,\"rs\":\"%llx\",\"pviol\":%.0f,\"tviol\":%.0f,\"W\":%.0f,\"C\":%.0f,\"ut\":%.0f,\"procs\":\"%d/%d\",\"mig\":%d,\"ivcs\":%.0f,\"ld\":%.1f,\"lau\":%.0f,\"nva\":%.0f,\"nvb\":%.0f,\"nsm\":%d}\n",
-                nm,i0>=0?(std::string("\"i\":")+std::to_string(i0)+",").c_str():"",med(bo),bmin,bmax,med(ck),med(ca),med(cb),ps,rs,med(pv),med(tv),med(pw),med(tm),med(ut),np,no,mig,med(iv),ld,med(lau),med(cost),med(costb),nsm);std::fflush(stdout);};
-        unsigned devslots=0;d.check(d.cuMemcpyDtoH(&devslots,ld3_ctr,4));std::printf("{\"diag\":\"ld3\",\"k\":\"info\",\"devslots\":%u,",devslots);std::printf("\"nvml\":%d,\"pstride\":%zu,\"cases\":%d,\"slots\":%d,\"B\":%u}\n",ld3_nv.ok?1:0,ld3_nv.pstride,ncase,ld3_slots,bcount);
-        for(int c=0;c<12;++c){std::vector<int> idx;for(int k=ncase;k<int(ld3_recs.size());++k)if(ld3_recs[k].cond==c)idx.push_back(k);if(!idx.empty())line(cn[c],-1,idx);}
-        for(int k=0;k<ncase&&k<16;++k)line("case",k,{k});   // the timed cases LAST (the site keeps the log tail)
-    }
-    // ---- ld4 (diag build on 6763c29 = ld3): per-stage timeline of both chains. A 1-thread stamp node (%globaltimer,
-    // %clock64 into slot *ctr) before each stamped product and after each of its launches; stamped = product pairs
-    // (2j, 2j+1) with j < 4, j >= pairs-4 or j % 4 == 0 (both chains). Optional phase pin: chain-1 product 2j+1 waits
-    // for chain-0 product 2j's event recorded after its launch number ld4_lock (0 = at its start).
-    static constexpr int LD4_K=8;
-    CUfunction ld4_stf=nullptr;CUdeviceptr ld4_buf=0;bool ld4_cap=false;int ld4_cur=-1,ld4_k=0,ld4_kmax=0,ld4_lock=-1;bool ld4_stp=false;
-    CUfunction ld4_fn[LD4_K]{};CUevent ld4_lockev=nullptr;
-    unsigned ld4_nidx()const{return bcount*LD4_K;}
-    bool ld4_stamped(u32 i)const{const u32 j=i/2,np=bcount/2;return j<4||j+4>=np||j%4==0;}
-    void ld4_emit(int k){auto& d=*cuda;unsigned idx=unsigned(ld4_cur*LD4_K+k),nidx=ld4_nidx();void* a[]={&ld4_buf,&ld3_ctr,&idx,&nidx};
-        d.check(d.cuLaunchKernel(ld4_stf,1,1,1,1,1,1,0,d.stream,a,nullptr));}
-    void ld4_begin(u32 i){if(!ld4_cap)return;ld4_cur=int(i);ld4_k=0;ld4_stp=ld4_stamped(i)&&ld4_stf;auto& d=*cuda;
-        static auto erec=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");static auto sw=d.driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        if(ld4_lock>=0){if(i%2==0&&ld4_lock==0)d.check(erec(ld4_lockev,d.stream));if(i%2==1)d.check(sw(d.stream,ld4_lockev,0));}
-        if(ld4_stp)ld4_emit(0);}
-    void ld4_after(CUfunction f){if(!ld4_cap||ld4_cur<0)return;++ld4_k;auto& d=*cuda;
-        if(ld4_stp&&ld4_k<LD4_K){if(ld4_cur==0)ld4_fn[ld4_k]=f;ld4_kmax=std::max(ld4_kmax,ld4_k);ld4_emit(ld4_k);}
-        if(ld4_lock>0&&ld4_cur%2==0&&ld4_k==ld4_lock){static auto erec=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");d.check(erec(ld4_lockev,d.stream));}}
-    void ld4_end(){ld4_cur=-1;ld4_stp=false;}
-    void ld4_init(){
-        if(!ld3_mod||ld4_stf)return;auto& d=*cuda;
-        const char* src="extern \"C\" __global__ void ld4_st(unsigned long long* buf,const unsigned* ctr,unsigned idx,unsigned nidx){\n"
-            "  const unsigned slot=*ctr;if(slot>=704)return;unsigned long long g;asm volatile(\"mov.u64 %0, %%globaltimer;\":\"=l\"(g));\n"
-            "  const unsigned long long i=(unsigned long long)slot*nidx+idx;buf[2*i]=g;buf[2*i+1]=clock64();}\n";
-        nvrtcProgram p=nullptr;if(d.nvrtcCreateProgram(&p,src,"ld4.cu",0,nullptr,nullptr)!=NVRTC_SUCCESS)return;const char* opt[]={"--gpu-architecture=compute_80"};
-        if(d.nvrtcCompileProgram(p,1,opt)!=NVRTC_SUCCESS){d.nvrtcDestroyProgram(&p);return;}
-        size_t sz=0;d.nvrtcGetPTXSize(p,&sz);std::vector<char> ptx(sz);d.nvrtcGetPTX(p,ptx.data());d.nvrtcDestroyProgram(&p);
-        CUmodule m=nullptr;if(d.cuModuleLoadData(&m,ptx.data())!=CUDA_SUCCESS)return;d.check(d.cuModuleGetFunction(&ld4_stf,m,"ld4_st"));
-        const size_t bb=size_t(LD3_SLOTS)*ld4_nidx()*16;ld4_buf=d.alloc(bb);auto ms=d.driver.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");d.check(ms(ld4_buf,0,bb));
-        auto ec=d.driver.get<decltype(&::cuEventCreate)>("cuEventCreate");d.check(ec(&ld4_lockev,CU_EVENT_DISABLE_TIMING));
-        d.post_launch=[this](CUfunction f){ld5_post();ld4_after(f);};d.pre_launch=[this](CUfunction){ld5_pre();};}
-    struct Ld4M { double body=-1,clk=-1,gap=-1,per=-1,lead=-1,trail=-1,g0=0,g1=0,off0=0,offm=0,off1=0,fr[6]{};double st[2][LD4_K]{},sum[2][LD4_K]{};bool ok=false; };
-    Ld4M ld4_metrics(const std::vector<unsigned long long>& sb,int slot,const std::vector<unsigned long long>& s3,const std::vector<unsigned>& f3){
-        Ld4M m;const unsigned nidx=ld4_nidx();const int K=ld4_kmax;if(slot<0||slot>=LD3_SLOTS||K<2)return m;
-        auto t=[&](u32 i,int k)->double{const unsigned long long v=sb[2*(size_t(slot)*nidx+i*LD4_K+k)];return v?double(v)/1e3:-1.0;};   // us
-        {double b=-1,c=-1;int ns=0;ld4_g0=ld4_g1=0;ld3_slot_from(s3,f3,slot,b,c,ns);m.body=b;m.clk=c;m.g0=ld4_g0;m.g1=ld4_g1;}
-        const u32 np=bcount/2;std::vector<double> st[2][LD4_K],gp,pe;
-        for(u32 i=0;i<bcount;++i){if(!ld4_stamped(i)||t(i,0)<0||t(i,K)<0)continue;const int c=int(i%2);for(int k=1;k<=K;++k)st[c][k].push_back(t(i,k)-t(i,k-1));
-            if(i+2<bcount&&ld4_stamped(i+2)&&t(i+2,0)>0){gp.push_back(t(i+2,0)-t(i,K));pe.push_back(t(i+2,0)-t(i,0));}}
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        for(int c=0;c<2;++c)for(int k=1;k<=K;++k){m.st[c][k]=med(st[c][k]);for(double x:st[c][k])m.sum[c][k]+=x;}m.gap=med(gp);m.per=med(pe);
-        auto off=[&](u32 j)->double{return t(2*j,0)>0&&t(2*j+1,0)>0?t(2*j+1,0)-t(2*j,0):0;};
-        u32 jm=(np/2)/4*4;m.off0=off(0);m.offm=off(jm);m.off1=off(np-1);
-        auto cls=[&](int k){return k==1?1:k==K?4:(k%2==0?2:3);};   // P1, P2, P3, CRT
-        double tot=0;
-        for(u32 j=0;j<np;++j){const u32 a=2*j,b=2*j+1;if(!ld4_stamped(a)||t(a,0)<0||t(b,0)<0||t(a,K)<0||t(b,K)<0)continue;
-            const double w0=std::max(t(a,0),t(b,0)),w1=std::min(t(a,K),t(b,K));if(w1<=w0)continue;
-            std::vector<double> e{w0,w1};for(int k=0;k<=K;++k){for(u32 p:{a,b}){const double x=t(p,k);if(x>w0&&x<w1)e.push_back(x);}}std::sort(e.begin(),e.end());
-            auto at=[&](u32 p,double x){for(int k=1;k<=K;++k)if(x<t(p,k))return cls(k);return 0;};
-            for(size_t q=0;q+1<e.size();++q){const double len=e[q+1]-e[q],mid=(e[q]+e[q+1])/2;const int x=at(a,mid),y=at(b,mid);tot+=len;
-                const int f=(x==1&&y==1)?0:(x==2&&y==2)?1:(x==3&&y==3)?2:((x==1&&(y==2||y==3))||(y==1&&(x==2||x==3)))?3:((x==1&&y==4)||(y==1&&x==4))?4:5;m.fr[f]+=len;}}
-        if(tot>0)for(double& v:m.fr)v/=tot;
-        {double f=1e300,e=0;for(u32 i=0;i<bcount;++i){if(t(i,0)>0)f=std::min(f,t(i,0));if(t(i,K)>0)e=std::max(e,t(i,K));}if(m.g0>0&&f<1e300){m.lead=f-m.g0;m.trail=m.g1-e;}}
-        m.ok=true;return m;}
-    double ld4_g0=0,ld4_g1=0;
-    void ld3_slot_from(const std::vector<unsigned long long>& sb,const std::vector<unsigned>& fl,int s,double& body,double& clk,int& nsm){
-        body=-1;clk=-1;nsm=0;if(s<0||s>=LD3_SLOTS)return;unsigned long long g0=~0ull,g1=0;std::vector<double> c;
-        for(int m=0;m<256;++m){const size_t h=size_t(s*2)*256+m,t=size_t(s*2+1)*256+m;if(fl[h])g0=std::min(g0,sb[2*h+1]);if(fl[t])g1=std::max(g1,sb[2*t+1]);
-            if(fl[h]&&fl[t]&&sb[2*t+1]>sb[2*h+1])c.push_back(double(sb[2*t]-sb[2*h])/double(sb[2*t+1]-sb[2*h+1])*1e3);}
-        if(g1>g0&&g0!=~0ull){body=double(g1-g0)/1e3;ld4_g0=double(g0)/1e3;ld4_g1=double(g1)/1e3;}nsm=int(c.size());if(!c.empty()){std::sort(c.begin(),c.end());clk=c[c.size()/2];}}
-    void run_ld4(){
-        if(!ld3_on||!ld4_stf||!graph_execs[6]||bcount<16)return;auto& d=*cuda;auto& D=d.driver;
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ginst=D.get<decltype(&::cuGraphInstantiateWithFlags)>("cuGraphInstantiateWithFlags");
-        auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;const int ncase=int(ld3_recs.size());
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes);d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());   // last case's output
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        auto once=[&](int cond,CUgraphExec ge){Ld3Rec r;r.cond=cond;r.slot=ld3_slots++;const auto t1=std::chrono::steady_clock::now();d.check(glaunch(ge,graph_stream));
-            const auto t2=std::chrono::steady_clock::now();d.check(d.cuCtxSynchronize());const auto t3=std::chrono::steady_clock::now();ld3_rec_after(r);
-            r.lau=std::chrono::duration<double,std::micro>(t2-t1).count();r.host=std::chrono::duration<double,std::micro>(t3-t1).count();ld3_recs.push_back(r);};
-        const int R=12;CUgraphExec P=graph_execs[6];
-        for(int r=0;r<R;++r){h2d_staged();once(20,P);}
-        for(int r=0;r<R;++r)once(21,P);
-        if(ld3_graph)for(int r=0;r<R;++r){CUgraphExec ge=nullptr;if(ginst(&ge,ld3_graph,0)!=CUDA_SUCCESS)break;h2d_staged();once(23,ge);h2d_staged();once(22,ge);ged(ge);}
-        // phase pins: chain-1 product 2j+1 starts after chain-0 product 2j's launch number k (0 = its start)
-        const int K=ld4_kmax;const int locks[4]={0,1,3,std::max(1,K-1)};int exv[4]{};
-        for(int v=0;v<4;++v){ld4_lock=locks[v];ld4_cap=true;CUgraphExec ge=ld_cap(0,bcount,-1);ld4_cap=false;ld4_lock=-1;if(!ge){exv[v]=-2;continue;}
-            for(int r=0;r<R;++r){h2d_staged();once(30+v,ge);}
-            d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());h2d_staged();d.check(glaunch(ge,graph_stream));d.check(d.cuCtxSynchronize());
-            {std::vector<char> h1(size_t(32)<<20),h2(size_t(32)<<20);exv[v]=1;for(size_t off=0;off<bytes&&exv[v];off+=h1.size()){const size_t len=std::min(h1.size(),bytes-off);
-                d.check(d.cuMemcpyDtoH(h1.data(),ref+off,len));d.check(d.cuMemcpyDtoH(h2.data(),out_all+off,len));if(std::memcmp(h1.data(),h2.data(),len))exv[v]=0;}}
-            ld3_slots++;ged(ge);}   // the exactness launch used one slot too
-        d.check(d.cuCtxSynchronize());
-        std::vector<unsigned long long> sb(size_t(LD3_SLOTS)*ld4_nidx()*2),s3(size_t(LD3_SLOTS)*2*256*2);std::vector<unsigned> f3(size_t(LD3_SLOTS)*2*256);
-        d.check(d.cuMemcpyDtoH(sb.data(),ld4_buf,sb.size()*8));d.check(d.cuMemcpyDtoH(s3.data(),ld3_buf,s3.size()*8));d.check(d.cuMemcpyDtoH(f3.data(),ld3_flag,f3.size()*4));
-        unsigned devslots=0;d.check(d.cuMemcpyDtoH(&devslots,ld3_ctr,4));
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        auto nm=[&](CUfunction f)->const char*{for(const auto& x:d.kp.names)if(x.fn==f)return x.name;return "?";};
-        std::string sn;for(int k=1;k<=K;++k){sn+=nm(ld4_fn[k]);if(k<K)sn+=",";}
-        std::printf("{\"diag\":\"ld4\",\"k\":\"info\",\"K\":%d,\"stages\":\"%.200s\",\"slots\":%d,\"devslots\":%u,\"cases\":%d}\n",K,sn.c_str(),ld3_slots,devslots,ncase);
-        double split=std::getenv("FHERMA_LD4_SPLIT")?std::atof(std::getenv("FHERMA_LD4_SPLIT")):0;
-        std::vector<Ld4M> M(ld3_recs.size());for(size_t q=0;q<ld3_recs.size();++q)M[q]=ld4_metrics(sb,ld3_recs[q].slot,s3,f3);
-        if(split<=0){std::vector<double> b;for(size_t q=ncase;q<M.size();++q)if(ld3_recs[q].cond>=20&&ld3_recs[q].cond<=22&&M[q].body>0)b.push_back(M[q].body);
-            std::sort(b.begin(),b.end());split=bcount==128?14600.0:(b.empty()?0:b.front()*1.015);}
-        auto stg=[&](const Ld4M& m,int c){std::string s;char x[24];for(int k=1;k<=K;++k){std::snprintf(x,sizeof x,"%.1f%s",m.st[c][k],k<K?"/":"");s+=x;}return s;};
-        auto sums=[&](const Ld4M& m,int c){std::string s;char x[24];for(int k=1;k<=K;++k){std::snprintf(x,sizeof x,"%.0f%s",m.sum[c][k],k<K?"/":"");s+=x;}return s;};
-        auto grp=[&](const char* tag,const std::vector<size_t>& ix){if(ix.empty()){std::printf("{\"diag\":\"ld4\",\"g\":\"%s\",\"n\":0}\n",tag);return;}
-            Ld4M a;std::vector<double> v[17];std::vector<double> sv[2][LD4_K],su[2][LD4_K];
-            for(size_t q:ix){const Ld4M& m=M[q];v[0].push_back(m.body);v[1].push_back(m.clk);v[2].push_back(m.gap);v[3].push_back(m.per);v[4].push_back(m.off0);v[5].push_back(m.offm);v[6].push_back(m.off1);
-                for(int f=0;f<6;++f)v[7+f].push_back(m.fr[f]);v[13].push_back(ld3_recs[q].b.pw/1000.0);v[14].push_back(m.lead);v[15].push_back(m.trail);v[16].push_back(ld3_recs[q].b.clk);for(int c=0;c<2;++c)for(int k=1;k<=K;++k){sv[c][k].push_back(m.st[c][k]);su[c][k].push_back(m.sum[c][k]);}}
-            for(int c=0;c<2;++c)for(int k=1;k<=K;++k){a.st[c][k]=med(sv[c][k]);a.sum[c][k]=med(su[c][k]);}
-            std::printf("{\"diag\":\"ld4\",\"g\":\"%s\",\"n\":%zu,\"body\":%.0f,\"clk\":%.0f,\"W\":%.0f,\"mclk\":%.0f,\"s0\":\"%s\",\"s1\":\"%s\",\"gap\":%.1f,\"per\":%.1f,\"lead\":%.1f,\"trail\":%.1f}\n",tag,ix.size(),med(v[0]),med(v[1]),med(v[13]),med(v[16]),stg(a,0).c_str(),stg(a,1).c_str(),med(v[2]),med(v[3]),med(v[14]),med(v[15]));
-            std::printf("{\"diag\":\"ld4\",\"g\":\"%s_ph\",\"off\":\"%.0f/%.0f/%.0f\",\"p1p1\":%.3f,\"p2p2\":%.3f,\"p3p3\":%.3f,\"p1p23\":%.3f,\"p1crt\":%.3f,\"other\":%.3f}\n",tag,med(v[4]),med(v[5]),med(v[6]),med(v[7]),med(v[8]),med(v[9]),med(v[10]),med(v[11]),med(v[12]));
-            std::printf("{\"diag\":\"ld4\",\"g\":\"%s_sum\",\"t0\":\"%s\",\"t1\":\"%s\"}\n",tag,sums(a,0).c_str(),sums(a,1).c_str());
-            std::fflush(stdout);};
-        {int cnt[3][2]{};for(size_t q=ncase;q<M.size();++q){const int c=ld3_recs[q].cond;if(c>=20&&c<=22&&M[q].body>0)cnt[c-20][M[q].body>=split]++;}
-         std::printf("{\"diag\":\"ld4\",\"k\":\"states\",\"split\":%.0f,\"ref\":\"%d/%d\",\"b2b\":\"%d/%d\",\"fresh2\":\"%d/%d\"}\n",split,cnt[0][0],cnt[0][1],cnt[1][0],cnt[1][1],cnt[2][0],cnt[2][1]);}
-        const char* pn[4]={"pin_k0","pin_k1","pin_k3","pin_kK1"};
-        for(int v=0;v<4;++v){std::vector<double> b;std::vector<size_t> ix;for(size_t q=ncase;q<M.size();++q)if(ld3_recs[q].cond==30+v&&M[q].body>0){b.push_back(M[q].body);ix.push_back(q);}
-            if(b.empty()){std::printf("{\"diag\":\"ld4\",\"v\":\"%s\",\"ex\":%d,\"n\":0}\n",pn[v],exv[v]);continue;}
-            std::vector<double> o0,om,p1;for(size_t q:ix){o0.push_back(M[q].off0);om.push_back(M[q].offm);p1.push_back(M[q].fr[0]);}
-            std::printf("{\"diag\":\"ld4\",\"v\":\"%s\",\"lock\":%d,\"ex\":%d,\"body\":%.0f,\"bmin\":%.0f,\"bmax\":%.0f,\"off\":\"%.0f/%.0f\",\"p1p1\":%.3f}\n",pn[v],locks[v],exv[v],med(b),*std::min_element(b.begin(),b.end()),*std::max_element(b.begin(),b.end()),med(o0),med(om),med(p1));}
-        {std::vector<size_t> fa,sl;for(size_t q=ncase;q<M.size();++q){const int c=ld3_recs[q].cond;if(c>=20&&c<=22&&M[q].body>0)(M[q].body>=split?sl:fa).push_back(q);}grp("fast",fa);grp("slow",sl);}
-        for(int q=0;q<ncase&&q<12;++q){const Ld4M& m=M[q];   // real timed cases LAST
-            std::printf("{\"diag\":\"ld4\",\"case\":%d,\"body\":%.0f,\"clk\":%.0f,\"W\":%.0f,\"mclk\":%u,\"s0\":\"%s\",\"s1\":\"%s\",\"off\":\"%.0f/%.0f/%.0f\",\"p1p1\":%.3f,\"p1p23\":%.3f,\"lead\":%.0f,\"trail\":%.0f}\n",
-                q,m.body,m.clk,ld3_recs[q].b.pw/1000.0,ld3_recs[q].b.clk,stg(m,0).c_str(),stg(m,1).c_str(),m.off0,m.offm,m.off1,m.fr[0],m.fr[3],m.lead,m.trail);}
-        std::fflush(stdout);
-    }
-    // ---- ld5 (diag build on 73ddc3c = ld4, production graph pinned as candidate 9): pin-pattern search.
-    // A pattern is a list of cross-chain graph dependencies: for every product i with i%2 == dpar, before its launch
-    // number dk+1 (dk = 0: at its start) it waits for the event recorded after launch sk of product i+rel (sk = 0: at
-    // that product's start, sk = K: at its end). Same kernels, same per-chain order: exact.
-    struct Ld5Rule { int dpar,rel,dk,sk; };
-    std::vector<Ld5Rule> ld5_rules;bool ld5_on=false,ld5_cap=false;bool pin_ok=false;CUevent pin_ev5=nullptr;std::vector<std::vector<CUevent>> ld5_ev;int ld5_cur=-1,ld5_k=0;
-    void ld5_prepare(){auto& d=*cuda;auto ec=d.driver.get<decltype(&::cuEventCreate)>("cuEventCreate");
-        while(ld5_ev.size()<ld5_rules.size()){ld5_ev.emplace_back(bcount,nullptr);for(auto& e:ld5_ev.back())d.check(ec(&e,CU_EVENT_DISABLE_TIMING));}}
-    void ld5_waits(int i,int k){auto& d=*cuda;static auto sw=d.driver.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        for(size_t r=0;r<ld5_rules.size();++r){const auto& R=ld5_rules[r];if(i%2!=R.dpar||R.dk!=k)continue;const int s=i+R.rel;if(s>=0&&s<int(bcount))d.check(sw(d.stream,ld5_ev[r][s],0));}}
-    void ld5_records(int i,int k){auto& d=*cuda;static auto er=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        for(size_t r=0;r<ld5_rules.size();++r){const auto& R=ld5_rules[r];const int t=i-R.rel;if(R.sk!=k||t<0||t>=int(bcount)||t%2!=R.dpar)continue;d.check(er(ld5_ev[r][i],d.stream));}}
-    void ld5_begin(u32 i){if(!ld5_on)return;ld5_cur=int(i);ld5_k=0;ld5_waits(int(i),0);ld5_records(int(i),0);}
-    void ld5_pre(){if(ld5_on&&ld5_cur>=0&&ld5_k>0)ld5_waits(ld5_cur,ld5_k);}
-    void ld5_post(){if(!ld5_on||ld5_cur<0)return;++ld5_k;ld5_records(ld5_cur,ld5_k);}
-    void ld5_end(){ld5_cur=-1;}
-    void run_ld5(){
-        if(!ld3_on||!ld4_stf||!graph_execs[6]||bcount<4)return;auto& d=*cuda;auto& D=d.driver;
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        const auto T0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-T0).count();};
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;const int ncase=int(ld3_recs.size());const int K=ld4_kmax>0?ld4_kmax:6;
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes);d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        auto once=[&](int cond,CUgraphExec ge){Ld3Rec r;r.cond=cond;r.slot=ld3_slots++;d.check(glaunch(ge,graph_stream));d.check(d.cuCtxSynchronize());ld3_rec_after(r);ld3_recs.push_back(r);};
-        auto exact=[&](CUgraphExec ge)->int{d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());h2d_staged();ld3_slots++;d.check(glaunch(ge,graph_stream));d.check(d.cuCtxSynchronize());
-            std::vector<char> h1(size_t(32)<<20),h2(size_t(32)<<20);for(size_t off=0;off<bytes;off+=h1.size()){const size_t len=std::min(h1.size(),bytes-off);
-                d.check(d.cuMemcpyDtoH(h1.data(),ref+off,len));d.check(d.cuMemcpyDtoH(h2.data(),out_all+off,len));if(std::memcmp(h1.data(),h2.data(),len))return 0;}return 1;};
-        typedef std::vector<Ld5Rule> Rs;
-        auto k0=Rs{{1,-1,0,0}};auto add=[](Rs a,const Rs& b){a.insert(a.end(),b.begin(),b.end());return a;};
-        Rs lock,lock1,pbar{{0,-1,0,K},{1,-3,0,K}},pcrt{{0,-1,0,K-1},{1,-3,0,K-1}};
-        for(int s=1;s<=K;++s){lock.push_back({1,-1,s-1,s-1});lock1.push_back({1,-1,s-1,std::min(K,s)});}
-        struct P { const char* nm; Rs r; bool pinned; };
-        const std::vector<P> pats={
-            {"none",Rs{},false},                                   // natural (unpinned) schedule
-            {"k0",k0,false},                                       // (a) candidate 9: chain-1 product starts after chain-0's matching product starts
-            {"pairbar",pbar,false},                                // (b) pair 2j+2/2j+3 starts after BOTH 2j and 2j+1 end
-            {"pairbar_crt",pcrt,false},                            // (c) ... after both previous products' CRT START (P1s overlap the CRTs)
-            {"k0_d2",add(k0,Rs{{0,-1,0,2}}),false},                // (d) k0 + chain-0 product 2j+2 waits for chain-1 2j+1 stage k end, k=2,3,4
-            {"k0_d3",add(k0,Rs{{0,-1,0,3}}),false},
-            {"k0_d4",add(k0,Rs{{0,-1,0,4}}),false},
-            {"k0_d1",add(k0,Rs{{0,-1,0,1}}),false},                // (h) same with k=1: chain 0's next P1 waits for chain 1's P1 end
-            {"pairstart",add(k0,Rs{{0,-1,0,0}}),false},            // (h) k0 both ways: product 2j+2 starts after 2j+1 starts (pairs start in lockstep)
-            {"lock",lock,false},                                   // (e) chain-1 stage s of 2j+1 waits for chain-0 stage s START of 2j, every s
-            {"lock1",lock1,false},                                 // (f) chain 1 one stage behind: waits for chain-0 stage s END
-            {"p2sep",add(k0,Rs{{1,-1,1,2},{1,-1,3,4}}),false},     // (g) k0 + chain-1 P2 groups start after chain-0's same P2 group ENDS
-            {"p2max",add(k0,Rs{{1,-1,1,1},{1,-1,3,3}}),false}};    // (g) k0 + chain-1 P2 groups start when chain-0's same P2 group STARTS
-        const int R=12,RS=4;
-        std::vector<unsigned long long> sb,s3;std::vector<unsigned> f3;
-        struct Res { int ex=-1;std::vector<int> body_ix,st_ix; };std::vector<Res> res(pats.size());
-        ld5_cap=true;
-        for(size_t p=0;p<pats.size();++p){if(el()>200)break;
-            ld5_rules=pats[p].r;ld5_prepare();
-            for(int st=0;st<2;++st){ld5_on=!ld5_rules.empty();ld4_cap=st==1;CUgraphExec ge=ld_cap(0,bcount,-1);ld4_cap=false;ld5_on=false;
-                if(!ge){res[p].ex=-2;break;}
-                if(st==0){h2d_staged();once(-2,ge);res[p].ex=exact(ge);for(int r=0;r<R;++r){h2d_staged();res[p].body_ix.push_back(int(ld3_recs.size()));once(40+int(p),ge);}}
-                else{h2d_staged();once(-2,ge);for(int r=0;r<RS;++r){h2d_staged();res[p].st_ix.push_back(int(ld3_recs.size()));once(60+int(p),ge);}}
-                ged(ge);}}
-        ld5_rules.clear();ld5_cap=false;
-        d.check(d.cuCtxSynchronize());
-        sb.resize(size_t(LD3_SLOTS)*ld4_nidx()*2);s3.resize(size_t(LD3_SLOTS)*2*256*2);f3.resize(size_t(LD3_SLOTS)*2*256);
-        d.check(d.cuMemcpyDtoH(sb.data(),ld4_buf,sb.size()*8));d.check(d.cuMemcpyDtoH(s3.data(),ld3_buf,s3.size()*8));d.check(d.cuMemcpyDtoH(f3.data(),ld3_flag,f3.size()*4));
-        unsigned devslots=0;d.check(d.cuMemcpyDtoH(&devslots,ld3_ctr,4));
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        std::printf("{\"diag\":\"ld5\",\"k\":\"info\",\"K\":%d,\"slots\":%d,\"devslots\":%u,\"cases\":%d,\"pin_prod\":%d,\"s\":%.1f}\n",K,ld3_slots,devslots,ncase,int(pin_ok),el());
-        for(size_t p=0;p<pats.size();++p){std::vector<double> b,sbd,o0,om,o1,f[5];
-            for(int q:res[p].body_ix){const Ld4M m=ld4_metrics(sb,ld3_recs[q].slot,s3,f3);if(m.body>0)b.push_back(m.body);}
-            for(int q:res[p].st_ix){const Ld4M m=ld4_metrics(sb,ld3_recs[q].slot,s3,f3);if(m.body>0)sbd.push_back(m.body);o0.push_back(m.off0);om.push_back(m.offm);o1.push_back(m.off1);for(int x=0;x<5;++x)f[x].push_back(m.fr[x]);}
-            if(b.empty()){std::printf("{\"diag\":\"ld5\",\"v\":\"%s\",\"ex\":%d,\"n\":0}\n",pats[p].nm,res[p].ex);continue;}
-            std::printf("{\"diag\":\"ld5\",\"v\":\"%s\",\"ex\":%d,\"body\":%.0f,\"bmin\":%.0f,\"bmax\":%.0f,\"sbody\":%.0f,\"off\":\"%.0f/%.0f/%.0f\",\"p1p1\":%.3f,\"p2p2\":%.3f,\"p3p3\":%.3f,\"p1p23\":%.3f,\"p1crt\":%.3f}\n",
-                pats[p].nm,res[p].ex,med(b),*std::min_element(b.begin(),b.end()),*std::max_element(b.begin(),b.end()),med(sbd),med(o0),med(om),med(o1),med(f[0]),med(f[1]),med(f[2]),med(f[3]),med(f[4]));std::fflush(stdout);}
-        for(int q=0;q<ncase&&q<12;++q){const Ld4M m=ld4_metrics(sb,ld3_recs[q].slot,s3,f3);   // real timed cases (candidate-9 graph) LAST
-            std::printf("{\"diag\":\"ld5\",\"case\":%d,\"body\":%.0f,\"clk\":%.0f,\"W\":%.0f,\"mclk\":%u}\n",q,m.body,m.clk,ld3_recs[q].b.pw/1000.0,ld3_recs[q].b.clk);}
-        std::fflush(stdout);
-    }
-    // ---- ld6 (diag build on 39eaf7f = ld5; production graph unpinned = candidate 8 schedule): slow-state rates.
-    // Patterns none, k0, lock, k0_d3, pairbar_crt (ld5 rules). Block 1: rounds of one rep per pattern (round-robin,
-    // start pattern rotated per round), each rep preceded by the staged h2d of both inputs (same path as the h2d hook)
-    // and an idle sleep G (harness-like gap). Every 5th round also one ld4-stamped rep per pattern (off, phase
-    // fractions). Block 2: rounds back to back (no h2d, no gap). slow = body > 14.9 ms, mid = body > 14.7 ms.
-    std::vector<std::chrono::steady_clock::time_point> ld6_entry;
-    void run_ld6(){
-        if(!ld3_on||!ld4_stf||!graph_execs[6]||bcount<4)return;auto& d=*cuda;auto& D=d.driver;
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;const int ncase=int(ld3_recs.size());const int K=ld4_kmax>0?ld4_kmax:6;
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes);d.check(dtod(ref,out_all,bytes));d.check(d.cuCtxSynchronize());
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        auto once=[&](int cond,CUgraphExec ge){Ld3Rec r;r.cond=cond;r.slot=ld3_slots++;d.check(glaunch(ge,graph_stream));d.check(d.cuCtxSynchronize());ld3_rec_after(r);ld3_recs.push_back(r);};
-        auto exact=[&](CUgraphExec ge)->int{d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());h2d_staged();ld3_slots++;d.check(glaunch(ge,graph_stream));d.check(d.cuCtxSynchronize());
-            std::vector<char> h1(size_t(32)<<20),h2(size_t(32)<<20);for(size_t off=0;off<bytes;off+=h1.size()){const size_t len=std::min(h1.size(),bytes-off);
-                d.check(d.cuMemcpyDtoH(h1.data(),ref+off,len));d.check(d.cuMemcpyDtoH(h2.data(),out_all+off,len));if(std::memcmp(h1.data(),h2.data(),len))return 0;}return 1;};
-        // the harness gap: real run-entry interval minus the measured staged h2d and the run itself
-        double ivl=-1;{std::vector<double> v;for(size_t i=1;i<ld6_entry.size();++i)v.push_back(std::chrono::duration<double,std::milli>(ld6_entry[i]-ld6_entry[i-1]).count());
-            if(!v.empty()){std::sort(v.begin(),v.end());ivl=v[v.size()/2];}}
-        double h2dms=0;{const auto a=clk::now();h2d_staged();h2dms=std::chrono::duration<double,std::milli>(clk::now()-a).count();}
-        double G=ivl>0?ivl-h2dms-16.0:100.0;if(const char* e=std::getenv("FHERMA_LD6_GAP"))G=std::atof(e);G=std::max(5.0,std::min(250.0,G));
-        auto pre=[&]{h2d_staged();std::this_thread::sleep_for(std::chrono::microseconds(long(G*1000)));};
-        typedef std::vector<Ld5Rule> Rs;auto k0=Rs{{1,-1,0,0}};auto add=[](Rs a,const Rs& b){a.insert(a.end(),b.begin(),b.end());return a;};
-        Rs lock,pcrt{{0,-1,0,K-1},{1,-3,0,K-1}};for(int s=1;s<=K;++s)lock.push_back({1,-1,s-1,s-1});
-        struct P { const char* nm; Rs r; };
-        const std::vector<P> pats={{"none",Rs{}},{"k0",k0},{"lock",lock},{"k0_d3",add(k0,Rs{{0,-1,0,3}})},{"pairbar_crt",pcrt}};
-        const int NP=int(pats.size());
-        struct Res { int ex=-1;CUgraphExec g=nullptr,gs=nullptr;std::vector<int> b1,b2,st; };std::vector<Res> res(static_cast<size_t>(NP));
-        ld5_cap=true;
-        for(int p=0;p<NP;++p){ld5_rules=pats[size_t(p)].r;ld5_prepare();
-            for(int st=0;st<2;++st){ld5_on=!ld5_rules.empty();ld4_cap=st==1;CUgraphExec ge=ld_cap(0,bcount,-1);ld4_cap=false;ld5_on=false;(st?res[size_t(p)].gs:res[size_t(p)].g)=ge;}
-            if(!res[size_t(p)].g||!res[size_t(p)].gs){res[size_t(p)].ex=-2;continue;}
-            h2d_staged();once(-2,res[size_t(p)].g);res[size_t(p)].ex=exact(res[size_t(p)].g);h2d_staged();once(-2,res[size_t(p)].gs);}
-        ld5_rules.clear();ld5_cap=false;
-        const int R1=60,R2=30;const double budget=std::getenv("FHERMA_LD6_BUDGET")?std::atof(std::getenv("FHERMA_LD6_BUDGET")):300.0;
-        const int need=ld3_slots+R1*NP+(R1/5)*NP+R2*NP+4;int r1=0,r2=0;
-        if(need<=LD3_SLOTS){
-            for(int r=0;r<R1&&el()<budget;++r,++r1){for(int q=0;q<NP;++q){const int p=(q+r)%NP;if(!res[size_t(p)].g)continue;pre();res[size_t(p)].b1.push_back(int(ld3_recs.size()));once(100+p,res[size_t(p)].g);}
-                if(r%5==2)for(int q=0;q<NP;++q){const int p=(q+r)%NP;if(!res[size_t(p)].gs)continue;pre();res[size_t(p)].st.push_back(int(ld3_recs.size()));once(120+p,res[size_t(p)].gs);}}
-            for(int r=0;r<R2&&el()<budget+60;++r,++r2)for(int q=0;q<NP;++q){const int p=(q+r)%NP;if(!res[size_t(p)].g)continue;res[size_t(p)].b2.push_back(int(ld3_recs.size()));once(140+p,res[size_t(p)].g);}}
-        for(auto& x:res){if(x.g)ged(x.g);if(x.gs)ged(x.gs);}
-        d.check(d.cuCtxSynchronize());
-        std::vector<unsigned long long> sb(size_t(LD3_SLOTS)*ld4_nidx()*2),s3(size_t(LD3_SLOTS)*2*256*2);std::vector<unsigned> f3(size_t(LD3_SLOTS)*2*256);
-        d.check(d.cuMemcpyDtoH(sb.data(),ld4_buf,sb.size()*8));d.check(d.cuMemcpyDtoH(s3.data(),ld3_buf,s3.size()*8));d.check(d.cuMemcpyDtoH(f3.data(),ld3_flag,f3.size()*4));
-        unsigned devslots=0;d.check(d.cuMemcpyDtoH(&devslots,ld3_ctr,4));
-        std::printf("{\"diag\":\"ld6\",\"k\":\"info\",\"K\":%d,\"slots\":%d,\"need\":%d,\"devslots\":%u,\"cases\":%d,\"pin_prod\":%d,\"ivl_ms\":%.1f,\"h2d_ms\":%.1f,\"gap_ms\":%.1f,\"r1\":%d,\"r2\":%d,\"s\":%.1f}\n",
-            K,ld3_slots,need,devslots,ncase,int(pin_ok),ivl,h2dms,G,r1,r2,el());
-        auto stats=[&](const char* blk,int p,const std::vector<int>& ix){std::vector<double> b;for(int q:ix){double bo,c;int ns;ld3_slot_from(s3,f3,ld3_recs[size_t(q)].slot,bo,c,ns);if(bo>0)b.push_back(bo);}
-            if(b.empty()){std::printf("{\"diag\":\"ld6\",\"b\":\"%s\",\"v\":\"%s\",\"ex\":%d,\"n\":0}\n",blk,pats[size_t(p)].nm,res[size_t(p)].ex);return;}
-            std::sort(b.begin(),b.end());int sl=0,mi=0;for(double x:b){sl+=x>14900;mi+=x>14700;}
-            std::printf("{\"diag\":\"ld6\",\"b\":\"%s\",\"v\":\"%s\",\"ex\":%d,\"n\":%zu,\"med\":%.0f,\"min\":%.0f,\"max\":%.0f,\"slow\":%d,\"mid\":%d,\"p90\":%.0f}\n",
-                blk,pats[size_t(p)].nm,res[size_t(p)].ex,b.size(),b[b.size()/2],b.front(),b.back(),sl,mi,b[std::min(b.size()-1,b.size()*9/10)]);};
-        for(int p=0;p<NP;++p)stats("b2",p,res[size_t(p)].b2);
-        for(int p=0;p<NP;++p){std::vector<std::pair<double,int>> v;for(int q:res[size_t(p)].st){const Ld4M m=ld4_metrics(sb,ld3_recs[size_t(q)].slot,s3,f3);if(m.body>0)v.push_back({m.body,q});}
-            if(v.empty())continue;std::sort(v.begin(),v.end());const Ld4M m=ld4_metrics(sb,ld3_recs[size_t(v[v.size()/2].second)].slot,s3,f3);int sl=0;for(auto& x:v)sl+=x.first>14900;
-            std::printf("{\"diag\":\"ld6\",\"b\":\"st\",\"v\":\"%s\",\"n\":%zu,\"smed\":%.0f,\"smin\":%.0f,\"smax\":%.0f,\"sslow\":%d,\"off\":\"%.0f/%.0f/%.0f\",\"p1p1\":%.3f,\"p1p23\":%.3f}\n",
-                pats[size_t(p)].nm,v.size(),m.body,v.front().first,v.back().first,sl,m.off0,m.offm,m.off1,m.fr[0],m.fr[3]);}
-        for(int p=0;p<NP;++p)stats("b1",p,res[size_t(p)].b1);
-        for(int q=0;q<ncase&&q<12;++q){double bo,c;int ns;ld3_slot_from(s3,f3,ld3_recs[size_t(q)].slot,bo,c,ns);   // real timed cases (production, unpinned) LAST
-            std::printf("{\"diag\":\"ld6\",\"case\":%d,\"body\":%.0f,\"clk\":%.0f,\"W\":%.0f,\"mclk\":%u}\n",q,bo,c,ld3_recs[size_t(q)].b.pw/1000.0,ld3_recs[size_t(q)].b.clk);}
-        std::fflush(stdout);
-    }
     fherma::Outputs run(const fherma::Inputs& in){
         (void)in;  // inputs already on the device (h2d)
-        const auto r0=std::chrono::steady_clock::now();auto r1=r0,r2=r0;ld6_entry.push_back(r0);
+        const auto r0=std::chrono::steady_clock::now();auto r1=r0,r2=r0;
         auto& d=*cuda;const size_t stride=size_t(n)*l*4,count=size_t(bcount)*n*l;
         d.kp.collect();  // previous call not yet read (no d2h in between)
         if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
             static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);if(ld3_on&&v==6){ld3_cur=Ld3Rec{};ld3_cur.slot=ld3_slots++;ld3_rec_before(ld3_cur);ld3_live=true;}r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();d.kp.run_launched(graph_stream);
+            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;d.kp.run_begin(graph_stream,v);r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();d.kp.run_launched(graph_stream);
         }else for(u32 i=0;i<bcount;++i){po=po_available()?std::min(want_po(),2):0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);if(prof){d.check(d.cuCtxSynchronize());prof_collect();}}
         if(prof)pcalls+=0;
         fherma::Outputs result;result.c.shape={int64_t(bcount),int64_t(n),int64_t(l)};
@@ -1573,7 +1102,6 @@ struct State {
         const auto r3=std::chrono::steady_clock::now();
         d.check(d.cuCtxSynchronize());
         const auto r4=std::chrono::steady_clock::now();
-        if(ld3_live){ld3_live=false;ld3_rec_after(ld3_cur);ld3_cur.lau=std::chrono::duration<double,std::micro>(r2-r1).count();ld3_cur.host=std::chrono::duration<double,std::micro>(r4-r1).count();ld3_recs.push_back(ld3_cur);}
         d.kp.run_end();
         {auto us=[](std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();};
          const double x[5]={us(r0,r1),us(r1,r2),us(r2,r3),us(r3,r4),us(r0,r4)};ht_run.add(x,5);}
