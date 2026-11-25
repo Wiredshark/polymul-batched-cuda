@@ -548,6 +548,27 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     }
     const u32 stride=weighted_root_stride(N);
     u64* STS=reinterpret_cast<u64*>(X+4*XS);   // flag 4: the quad's stage tables (4 x 256 u64)
+#if defined(BPO_P1TS)&&defined(BPO_P1WL)&&defined(BPO_P1TW)
+    constexpr bool TS=(F&0x400000u)!=0;   // p1ts: T1 kernels only
+    static_assert(BCRT_K==16,"p1ts: bpt staged for K = 16");
+    extern __shared__ __align__(16) uint4 bpo_p1ts_dyn[];   // [0,1024) bpt (WL layout), then T1 double buffer 2 x 1024 u64
+    uint4* const bs_=bpo_p1ts_dyn;u64* const ts_=reinterpret_cast<u64*>(bpo_p1ts_dyn+1024);
+    const u32 tcb=c>>7;
+    auto ts_fetch=[&](u32 uq){const char* g=reinterpret_cast<const char*>(twist+size_t(uq*2u+tcb)*1024u);
+        const u32 sa=u32(__cvta_generic_to_shared(ts_+(uq&1u)*1024u));
+        #pragma unroll
+        for(u32 k2=0;k2<2;++k2){const u32 ch=h+256u*k2;asm volatile("cp.async.cg.shared.global [%0],[%1],16;"::"r"(sa+16u*ch),"l"(g+16u*ch):"memory");}
+        asm volatile("cp.async.commit_group;":::"memory");};
+#ifdef BPO_P1RV
+    const bool rv_=(F&0x800000u)!=0;
+#else
+    const bool rv_=false;
+#endif
+    if(TS){
+        #pragma unroll
+        for(u32 k2=0;k2<4;++k2)bs_[h+256u*k2]=__ldg(reinterpret_cast<const uint4*>(bpt)+h+256u*k2);
+        if(r0/4<r1/4)ts_fetch(rv_?r1/4-1u:r0/4);}
+#endif
     #pragma unroll 1
     // flag 32768 (S6, without 4): the quad barrier moves from the loop top to just before the phase-A stores into X, so a
     // warp's phase-A math (MMA, reduction, twist, J-DIF, R-DIF 256/128) overlaps the other warps' phase B of the previous quad.
@@ -558,6 +579,15 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     for(u32 u=r0/4;u<r1/4;++u){
 #endif
         if(!LB)__syncthreads();   // previous quad's R-DIF reads of X (and STS) done
+#if defined(BPO_P1TS)&&defined(BPO_P1WL)&&defined(BPO_P1TW)
+        if(TS){asm volatile("cp.async.wait_group 0;":::"memory");__syncthreads();   // this quad's T1 slice landed; quad u-1 done everywhere
+            if(rv_?u>r0/4:u+1u<r1/4)ts_fetch(rv_?u-1u:u+1u);}
+#define BPO_T1LD(rr) (TS?ts_[(u&1u)*1024u+rl*4u+tig+256u*(rr)]:t1[256u*(rr)])
+#define BPO_BPLD(j) (TS?bs_[(size_t(j)*4+u)*32+lane]:__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane)))
+#else
+#define BPO_T1LD(rr) t1[256u*(rr)]
+#define BPO_BPLD(j) __ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane))
+#endif
         if(F&4){
             #pragma unroll
             for(u32 q=0;q<4;++q)if(h<256u)STS[q*256u+h]=stage_tw[size_t((BPO_RM&2)?q:4*u+q)*256+h];
@@ -574,7 +604,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             for(u32 j=0;j<8;++j){
 #ifdef BPO_P1WL   // wline p1wl: host table bpt_wl[(4 j + u) 32 + lane] (uint4) = bpt[(32 j + lane) 16 + 4 u ..]: 512 contiguous bytes per request
-                const uint4 bv=(BPO_RM&2)?make_uint4(lane*977u+j,u+lane,lane^j,j*u+1u):__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
+                const uint4 bv=(BPO_RM&2)?make_uint4(lane*977u+j,u+lane,lane^j,j*u+1u):BPO_BPLD(j);
 #else
                 const uint4 bv=(BPO_RM&2)?make_uint4(lane*977u+j,u+lane,lane^j,j*u+1u):__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
 #endif
@@ -609,7 +639,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
                 #pragma unroll
                 for(u32 rr=0;rr<4;++rr){
 #ifdef BPO_P1TW
-                    const u64 t2=(BPO_RM&2)?BPO_RMK(rl+rr,tig):TW?t1[256u*rr]:tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
+                    const u64 t2=(BPO_RM&2)?BPO_RMK(rl+rr,tig):TW?BPO_T1LD(rr):tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #else
                     const u64 t2=tw[1+128u+(((64*rr+rl)*256u+c)>>7)];
 #endif

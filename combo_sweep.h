@@ -20,7 +20,7 @@
 #include <chrono>
 
 struct BatchOvr { CUfunction fn[4]{}; unsigned smem[4]{}; unsigned sm=0; bool check=true; std::vector<std::pair<const char*,const char*>> env;
-    unsigned p1grid=0,p2grid=0,p3grid=0,crtgrid=0; bool grev=false,half=false,quiet=false; bool need[4]{}; CUdeviceptr ctr=0; };
+    unsigned p1grid=0,p2grid=0,p3grid=0,crtgrid=0; unsigned p3cb=0; bool grev=false,half=false,quiet=false; bool need[4]{}; CUdeviceptr ctr=0; };
 struct BatchRes { bool ok=false; int ex=-1; double vs=0,med=0,prod=0; };
 struct OvlTabs { CUfunction prod[4]{}; unsigned pad1=0; unsigned b=0; unsigned n=0,l=0,k=0,pf_cols=0; };
 
@@ -135,9 +135,12 @@ template<class C> inline void pipe_probes(C& d,int which,const char* tag){
 
 template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
     const std::function<BatchRes(const BatchOvr&,const char*)>& line,CUfunction& cmp){
-    // abl diag (round 35): the cost of each memory class inside the REAL pipeline. Every line = the production graph
-    // (variant 6, 2 chains, same launches) recaptured with all four stages from a diag module compiled with
-    // BPO_RM = mask (patch_abl_kern.py): the real kernels with one class removed (arithmetic kept). Timing-only (ex=0).
+    // t2sm diag (round 36): exact variants as their own kernel entries (diag modules), paired whole-batch A/B in the
+    // production graph (variant 6), every output checked (ex):
+    //  p3t2cB_rR  bpo_last_cm3t: t2n once per B columns, register cap R (B = 2 / 4; R = 40 / 48)
+    //  crtw       bpo_crt_lean with 880 B whole-chunk STG.128 output stores (BPO_CRTW)
+    //  p1ts       bpo_first_xr with bpt staged in smem once per block and the next quad's T1 slice cp.async-prefetched
+    //  allv       crtw + p3t2c2_r48 + p1ts
     if(const char* e=std::getenv("FHERMA_COMBO"))if(*e=='0')return;
     const auto t0=std::chrono::steady_clock::now();auto el=[&]{return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();};
     const double budget=std::getenv("FHERMA_COMBO_S")?std::atof(std::getenv("FHERMA_COMBO_S")):300.0;
@@ -145,18 +148,16 @@ template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
     std::string s=src;{const std::string a="extern \"C\" __global__",b="template<int SWD_> __global__";size_t p=0;while((p=s.find(a,p))!=std::string::npos){s.replace(p,a.size(),b);p+=b.size();}}
     ComboMods<C> M(d);
     const int m_rc=M.add("rc",s+"\nextern \"C\" __global__ void cb_cmp(const uint4* a,const uint4* b,unsigned long long n,unsigned* bad){unsigned c=0;for(unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x){const uint4 x=a[i],y=b[i];c+=(x.x!=y.x)|(x.y!=y.y)|(x.z!=y.z)|(x.w!=y.w);}if(c)atomicAdd(bad,c);}\n",{"cb_cmp"});
-    const std::vector<std::string> KN={"bpo_first_xr<0>","bpo_middle_r16c<0>","bpo_last_cm3f<0>","bpo_crt_lean<0>"};
-    // compute twins of the pipe diag (allC reference line)
-    const int m_c1=M.add("xa12","#define BPO_XA 12\n"+s,{"bpo_first_xr<0>"});
-    const int m_tc=M.add("twc","#define BPO_TWC 1\n"+s,{"bpo_middle_r16c<0>","bpo_last_cm3f<0>","bpo_crt_lean<0>"});
-    struct V { const char* nm; unsigned rm; int m=-1; };
-    std::vector<V> v={{"rm0",0},
-        {"t_p1ct",1},{"t_p1tw",2},{"t_p2mt",4},{"t_p2st",8},{"t_p3f",16},{"t_p3t2n",32},{"t_p3sit",64},{"t_crt",128},{"t_all",255},
-        {"d_in",256},{"d_out",512},{"d_ab",1024},{"d_c",2048},{"d_res",4096},{"d_all",7936},{"all",8191}};
-    for(auto& x:v){char b[24];std::snprintf(b,sizeof b,"rm%u",x.rm);x.m=M.add(b,"#define BPO_RM "+std::to_string(x.rm)+"u\n"+s,KN);}
+    const int m_c2=M.add("p3t2c2_r48","#define BPO_P3T2 1\n#define BPO_P3CB 2\n#define BPO_P3TR 48\n"+s,{"bpo_last_cm3t<0>"});
+    const int m_c4=M.add("p3t2c4_r48","#define BPO_P3T2 1\n#define BPO_P3CB 4\n#define BPO_P3TR 48\n"+s,{"bpo_last_cm3t<0>"});
+    const int m_c2l=M.add("p3t2c2_r40","#define BPO_P3T2 1\n#define BPO_P3CB 2\n#define BPO_P3TR 40\n"+s,{"bpo_last_cm3t<0>"});
+    const int m_cw=M.add("crtw","#define BPO_CRTW 1\n"+s,{"bpo_crt_lean<0>"});
+    const int m_ts=M.add("p1ts","#define BPO_P1TS 1\n"+s,{"bpo_first_xr<0>"});
+    const bool loc=std::getenv("FHERMA_T2SM_LOCAL")!=nullptr;   // local only: P1 compute twin at 2 / 3 blocks per SM (cycle-level)
+    const int m_t2=loc?M.add("xa12","#define BPO_XA 12\n"+s,{"bpo_first_xr<0>"}):-1,m_t3=loc?M.add("xa12m3","#define BPO_XA 12\n#define BPO_TC_MINB 3\n"+s,{"bpo_first_xr<0>"}):-1;
     M.build();
-    std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"round\":\"abl\",\"cc\":\"%d.%d\",\"sms\":%d,\"B\":%u,\"mods\":%zu,\"compile_s\":%.1f}\n",cc1,cc2,sms,T.b,M.progs.size(),el());
-    for(const auto& P:M.progs)if(!P.mod)std::printf("{\"diag\":\"abl\",\"k\":\"mod\",\"m\":\"%s\",\"err\":\"%.120s\"}\n",P.name.c_str(),P.err.c_str());
+    std::printf("{\"diag\":\"sw\",\"k\":\"combo_info\",\"round\":\"t2sm\",\"cc\":\"%d.%d\",\"sms\":%d,\"B\":%u,\"mods\":%zu,\"compile_s\":%.1f}\n",cc1,cc2,sms,T.b,M.progs.size(),el());
+    for(const auto& P:M.progs)if(!P.mod)std::printf("{\"diag\":\"t2sm\",\"k\":\"mod\",\"m\":\"%s\",\"err\":\"%.120s\"}\n",P.name.c_str(),P.err.c_str());
     std::fflush(stdout);
     cmp=M.fn(m_rc,0);
     {   // every diag module's own __constant__ p2cu table = copy of the production module's (filled by build_tabs)
@@ -165,21 +166,23 @@ template<class C> inline void run_combo(C& d,const std::string& src,OvlTabs T,
         if(gglob(&pc,&ps,d.module,"bpo_p2cu")==CUDA_SUCCESS)for(const auto& P:M.progs){CUdeviceptr wc=0;size_t ws=0;if(P.mod&&gglob(&wc,&ws,P.mod,"bpo_p2cu")==CUDA_SUCCESS&&ws==ps)cpy(wc,pc,ps);}
         d.cuCtxSynchronize();}
     const double B=T.b?double(T.b):1.0;
-    auto run=[&](const char* nm,BatchOvr o)->BatchRes{BatchRes r;if(el()>budget){std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",nm);std::fflush(stdout);return r;}
-        o.quiet=true;r=line(o,nm);return r;};
-    auto out=[&](const char* nm,const BatchRes& r,bool to){if(!r.ok)return;
-        std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"us\":%.2f,\"prod_us\":%.2f,\"vs_prod\":%.4f,\"ex\":%d%s}\n",nm,r.med/B,r.prod/B,r.vs,r.ex,to?",\"timing_only\":1":"");std::fflush(stdout);};
-    auto one=[&](const V& x,const char* sfx){char nm[40];std::snprintf(nm,sizeof nm,"%s%s",x.nm,sfx);
-        BatchOvr o;bool ok=true;for(int q=0;q<4;++q){o.fn[q]=M.fn(x.m,size_t(q));if(!o.fn[q])ok=false;}
-        if(!ok){std::printf("{\"diag\":\"abl\",\"v\":\"%s\",\"skipped\":\"module\"}\n",nm);std::fflush(stdout);return;}
-        o.check=x.rm==0;out(nm,run(nm,o),x.rm!=0);};   // rm0 (module identity) is checked: ex must be 1
-    auto allc=[&](const char* nm){BatchOvr o;CUfunction f[4]={M.fn(m_c1),M.fn(m_tc,0),M.fn(m_tc,1),M.fn(m_tc,2)};bool ok=true;for(int q=0;q<4;++q){o.fn[q]=f[q];if(!f[q])ok=false;}
-        if(!ok)return;o.check=false;out(nm,run(nm,o),true);};
-    {BatchOvr o;out("ctrl",run("ctrl",o),false);}
-    for(int pass=0;pass<2;++pass){const char* sfx=pass?"_r":"";
-        for(const auto& x:v)one(x,sfx);
-        char nm[16];std::snprintf(nm,sizeof nm,"allC%s",sfx);allc(nm);}
-    {BatchOvr o;out("ctrl_end",run("ctrl_end",o),false);}
-    std::printf("{\"diag\":\"abl\",\"k\":\"done\",\"s\":%.2f}\n",el());std::fflush(stdout);
+    auto out=[&](const char* nm,BatchOvr o){if(el()>budget){std::printf("{\"diag\":\"t2sm\",\"v\":\"%s\",\"skipped\":\"time budget\"}\n",nm);std::fflush(stdout);return;}
+        o.quiet=true;const BatchRes r=line(o,nm);if(!r.ok)return;
+        std::printf("{\"diag\":\"t2sm\",\"v\":\"%s\",\"us\":%.2f,\"prod_us\":%.2f,\"vs_prod\":%.4f,\"ex\":%d%s}\n",nm,r.med/B,r.prod/B,r.vs,r.ex,o.check?"":",\"timing_only\":1");std::fflush(stdout);};
+    if(loc){   // P1 alone in the graph (stage mask 2): production kernel, compute twin, compute twin at 3 blocks/SM
+        CUfunction f[3]={nullptr,M.fn(m_t2),M.fn(m_t3)};const char* nm[3]={"loc_p1_R","loc_p1_C","loc_p1_Cm3"};
+        for(int r=0;r<2;++r)for(int i=0;i<3;++i){BatchOvr o;o.sm=2u;o.check=false;o.fn[0]=f[i];if(i&&!f[i])continue;out(nm[i],o);}}
+    struct L { const char* nm; CUfunction f[4]; unsigned cb; };
+    CUfunction c2=M.fn(m_c2),c4=M.fn(m_c4),c2l=M.fn(m_c2l),cw=M.fn(m_cw),ts=M.fn(m_ts);
+    {auto fsa=d.driver.template get<decltype(&::cuFuncSetAttribute)>("cuFuncSetAttribute");if(ts&&fsa(ts,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,int(T.pad1+32768u))!=CUDA_SUCCESS)ts=nullptr;}
+    std::vector<L> v={{"p3t2c2_r48",{nullptr,nullptr,c2,nullptr},2},{"p3t2c4_r48",{nullptr,nullptr,c4,nullptr},4},{"p3t2c2_r40",{nullptr,nullptr,c2l,nullptr},2},
+        {"crtw",{nullptr,nullptr,nullptr,cw},0},{"p1ts",{ts,nullptr,nullptr,nullptr},0},{"allv",{ts,nullptr,c2,cw},2}};
+    {BatchOvr o;out("ctrl",o);}
+    for(int pass=0;pass<3;++pass)for(const auto& x:v){char nm[40];std::snprintf(nm,sizeof nm,"%s%s",x.nm,pass==0?"":pass==1?"_r":"_r2");
+        BatchOvr o;bool ok=true;for(int q=0;q<4;++q){o.fn[q]=x.f[q];}if((x.cb&&!o.fn[2])||(x.nm[0]=='c'&&!cw)||(x.nm[1]=='1'&&!ts)||(x.nm[0]=='a'&&(!cw||!c2||!ts)))ok=false;
+        if(o.fn[0])o.smem[0]=32768u;   // p1ts: dynamic smem
+        o.p3cb=x.cb;if(ok)out(nm,o);else{std::printf("{\"diag\":\"t2sm\",\"v\":\"%s\",\"skipped\":\"module\"}\n",nm);std::fflush(stdout);}}
+    {BatchOvr o;out("ctrl_end",o);}
+    std::printf("{\"diag\":\"t2sm\",\"k\":\"done\",\"s\":%.2f}\n",el());std::fflush(stdout);
     d.cuCtxSynchronize();cmp=nullptr;
 }

@@ -132,7 +132,11 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
 #else
 #define CRTDM ((BPO_RM&4096)?0x40000000u:1u)
 #define CRTST if(!(BPO_RM&512)||(dfl&0x40000000u))
+#ifdef BPO_CRTW   // crtw: warp w = column cc0 + w, rows h0 .. h0+31 (one 880 B output chunk per row and block)
+    const u32 i0=((blockIdx.x>>3)*4u+warp)*256u+(blockIdx.x&7u)*32u,il0=(BPO_RM&4096)?(blockIdx.x&31u)*128+warp*32:i0;   // abl: residue loads from a window
+#else
     const u32 i0=blockIdx.x*128+warp*32,il0=(BPO_RM&4096)?(blockIdx.x&31u)*128+warp*32:i0;   // abl: residue loads from a window
+#endif
 #endif
     u32* const pbuf=st+32*SST;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
     auto prefetch=[&](u32 j){
@@ -194,6 +198,17 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         #pragma unroll
         for(u32 w=0;w<L;++w)st[lane*L+w]=acc[w];
         __syncwarp();
+#ifdef BPO_CRTW
+        (void)h0;(void)cc_;
+        __syncthreads();   // all four warps' stages written
+        const u32 cc0=(blockIdx.x>>3)*4u,hb=(blockIdx.x&7u)*32u;
+        CRTST for(u32 x=threadIdx.x;x<32u*L;x+=128u){const u32 rr=x/L,q=x-rr*L;   // row hb+rr, 16 B word q of its chunk
+            u32 wv[4];
+            #pragma unroll
+            for(u32 e=0;e<4;++e){const u32 wi=4u*q+e,wq=wi/L,ww=wi-wq*L;wv[e]=stage_all[wq][rr*L+ww];}
+            uint4* const dst=reinterpret_cast<uint4*>(output+u64((hb+rr)*256u+cc0)*L)+q;const uint4 val=make_uint4(wv[0],wv[1],wv[2],wv[3]);
+            if(dfl&2)__stcs(dst,val);else *dst=val;}
+#else
         u32* const ob=output+u64(h0*256u+cc_)*L+lane;
         CRTST if(dfl&2){
             #pragma unroll
@@ -202,6 +217,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
             #pragma unroll
             for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
         }
+#endif
     }
 #undef CRTST
 #undef CRTDM
