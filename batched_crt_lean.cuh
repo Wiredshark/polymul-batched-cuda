@@ -96,7 +96,10 @@ template<u32 T> __device__ __forceinline__ void swc_tile(const u32 (&a)[2][2][4]
     imma16832(e,a[1][0][0],a[1][0][1],a[1][0][2],a[1][0][3],b0.x,b0.y);imma16832(e,a[1][1][0],a[1][1][1],a[1][1][2],a[1][1][3],b1.x,b1.y);
     swc_sts<(16*36+4*T)*4>(sb,e[0]+(e[1]<<8));swc_sts<(24*36+4*T)*4>(sb,e[2]+(e[3]<<8));
 }
-extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
+#ifndef BPO_CRTMB
+#define BPO_CRTMB 3   // diag crt4: 4
+#endif
+extern "C" __global__ void __launch_bounds__(128,BPO_CRTMB) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
     if(pfitems){
         const u32 total=gridDim.x*blockDim.x;

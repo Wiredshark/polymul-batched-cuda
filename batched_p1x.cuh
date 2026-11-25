@@ -433,6 +433,17 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
     const u32 h=threadIdx.x,lane=h&31u,warp=h>>5,gid=lane>>2,tig=lane&3;
     const u32* src=(op?b:a)+u64(BPO_XA==11?0u:c)*L;   // ablation 11: compute proxy (column-0 input, L2-resident; no stores)
     u32* dst=op?B:A;
+#if defined(BPO_P1BS)&&defined(BPO_P1WL)
+    constexpr bool BS=(F&0x2000000u)!=0;   // p1bs: bpt staged in dynamic smem (published by the barrier after the input loads)
+    static_assert(!BS||(BCRT_K==16&&(F&256)&&(F&64)),"p1bs: K = 16 and the flag-256 load path (its barrier publishes the fill)");
+    extern __shared__ __align__(16) uint4 bpo_p1bs_dyn[];
+    if(BS){
+        #pragma unroll
+        for(u32 k2=0;k2<4;++k2)bpo_p1bs_dyn[h+256u*k2]=__ldg(reinterpret_cast<const uint4*>(bpt)+h+256u*k2);}
+#define BPO_BPLD(j) (BS?bpo_p1bs_dyn[(size_t(j)*4+u)*32+lane]:__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane)))
+#else
+#define BPO_BPLD(j) __ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane))
+#endif
     if(BPO_XA==6||BPO_XA==7){   // ablation: streaming reference (6: input column + 128 KB contiguous out, 7: out only)
         u32 acc=0;
         if(BPO_XA==6)for(u32 x=h;x<256u*L;x+=256){const u32 rr=x/L,w=x-rr*L;acc^=__ldg(src+u64(rr*256u)*L+w);}
@@ -554,7 +565,7 @@ __device__ __forceinline__ void bpo_first_xb(const u32* a,const u32* b,u32* A,u3
             #pragma unroll
             for(u32 j=0;j<8;++j){
 #ifdef BPO_P1WL   // wline p1wl: host table bpt_wl[(4 j + u) 32 + lane] (uint4) = bpt[(32 j + lane) 16 + 4 u ..]: 512 contiguous bytes per request
-                const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt)+((size_t(j)*4+u)*32+lane));
+                const uint4 bv=BPO_BPLD(j);
 #else
                 const uint4 bv=__ldg(reinterpret_cast<const uint4*>(bpt+(size_t(j)*32+lane)*16)+u);
 #endif
@@ -680,6 +691,15 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xb<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
+#if defined(BPO_P1BS)&&defined(BPO_P1WL)
+// p1bs entry (diag): bpo_first_xr with bpt from 16 KB dynamic smem
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xq(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    bpo_first_xb<BPO_XF|0x400000u|0x800000u|0x2000000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+#endif
 #endif
 // T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)
 extern "C" __global__ void __launch_bounds__(512) bpo_t1_init(const u64* twist,u64* out){
