@@ -182,4 +182,91 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         }
     }
 }
+// hot diag twin (host: hot diag captures only): bpo_crt_lean reading D coefficients i0&8191 (not exact)
+extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanh(const u32* __restrict__ residues,u32* __restrict__ output,
+ const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
+    if(pfitems){
+        const u32 total=gridDim.x*blockDim.x;
+        for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
+            const u32 it=t>>8,hh=t&255u;const u32* ps=(it>=256u?pfb:pfa)+u64(it&255u)*BCRT_L+u64(hh*256u)*BCRT_L;
+            asm volatile("prefetch.global.L2 [%0];"::"l"(ps));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+BCRT_L-1));
+        }
+    }
+    constexpr u32 K=BCRT_K,SW=BCRT_SW,W=BCRT_W,L=BCRT_L,NW=64,NT=9,SST=36,F=BTC_F;
+    static_assert(K==16&&SW==16,"tensor CRT geometry");
+    constexpr u32 WO=W/32,WS=W%32;
+    static_assert(WO+1==L&&WS>0,"q = 2^W - d with W in the top limb");
+    constexpr u32 STW=32*L;   // per-warp stage words
+    static_assert(32*SST+512<=STW,"prefetch buffer aliases the output stage");
+    __shared__ __align__(16) u32 bsh[NT*2*32*2];
+    __shared__ __align__(16) u32 stage_all[4][STW];
+    const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
+    u32* st=stage_all[warp];
+    const u32 i0=blockIdx.x*128+warp*32;
+    u32* const pbuf=st+32*SST;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
+    auto prefetch=[&](u32 j){
+        #pragma unroll
+        for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+(i0&8191u)+4*ch);}
+        swc_commit();};
+    prefetch(0);
+    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
+    __syncthreads();
+    u32 acc[NW+2];   // [64..65]: scratch of the digit chains
+    #pragma unroll
+    for(u32 w=0;w<NW+2;++w)acc[w]=0;
+    #pragma unroll
+    for(u32 j=0;j<8;++j){
+        u32 a[2][2][4];
+        swc_wait0();__syncwarp();
+        {   // pbk[k] = pbuf + 32*tig + gid + 8*(k^tig) words, k = 2m + (row half)
+            const u32 pb=u32(__cvta_generic_to_shared(pbuf))+(32*tig+gid)*4;
+            const u32 p0=pb+32*(0^tig),p1=pb+32*(1^tig),p2=pb+32*(2^tig),p3=pb+32*(3^tig);
+#define SWC_FR(m,s,q0,q1) a[m][s][0]=swc_lds<(8*s)*128>(q0);a[m][s][1]=swc_lds<(8*s)*128>(q1);a[m][s][2]=swc_lds<(8*s+4)*128>(q0);a[m][s][3]=swc_lds<(8*s+4)*128>(q1);
+            SWC_FR(0,0,p0,p1) SWC_FR(0,1,p0,p1) SWC_FR(1,0,p2,p3) SWC_FR(1,1,p2,p3)
+#undef SWC_FR
+        }
+        __syncwarp();
+        if(j<7)prefetch(j+1);
+        {const u32 sb=u32(__cvta_generic_to_shared(st))+(gid*SST+tig)*4;
+            swc_tile<0>(a,bsh,lane,sb);swc_tile<1>(a,bsh,lane,sb);swc_tile<2>(a,bsh,lane,sb);swc_tile<3>(a,bsh,lane,sb);swc_tile<4>(a,bsh,lane,sb);
+            swc_tile<5>(a,bsh,lane,sb);swc_tile<6>(a,bsh,lane,sb);swc_tile<7>(a,bsh,lane,sb);swc_tile<8>(a,bsh,lane,sb);}
+        __syncwarp();
+        const u32* hs=st+lane*SST;
+        const u64 S=u64(hs[32])+(u64(hs[33])<<16)+(u64(hs[34])<<32);
+        const u32 alpha=u32((S+(u64(1)<<(F-1)))>>F);
+        switch(j){case 0:swc_digit<0,true>(acc,hs,alpha);break;case 1:swc_digit<1,true>(acc,hs,alpha);break;case 2:swc_digit<2,true>(acc,hs,alpha);break;case 3:swc_digit<3,true>(acc,hs,alpha);break;
+                  case 4:swc_digit<4,true>(acc,hs,alpha);break;case 5:swc_digit<5,true>(acc,hs,alpha);break;case 6:swc_digit<6,true>(acc,hs,alpha);break;default:swc_digit<7,true>(acc,hs,alpha);break;}
+        __syncwarp();   // stage reads of this digit done
+    }
+    {   // fold x1 = (x mod 2^W) + d*(x >> W), t = x1 - bias, one +-delta chain
+        u32 hw[10];
+        #pragma unroll
+        for(u32 w=0;w<10;++w){const u32 a_=w+WO<NW?acc[w+WO]:0,b_=w+WO+1<NW?acc[w+WO+1]:0;hw[w]=(a_>>WS)|(b_<<(32-WS));}
+        acc[WO]&=(1u<<WS)-1;
+        swc_fold(acc,hw,d);
+        const u32 br=swc_subbias(acc);
+        const bool hi=(acc[WO]>>WS)!=0u;
+        acc[WO]&=(1u<<WS)-1;
+        const u32 lt=swc_ltq(acc);
+        swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
+        acc[WO]&=(1u<<WS)-1;
+    }
+    if((dfl&1)&&i0>=8192u)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
+    const u32 cc_=i0>>8,h0=i0&255u;
+    {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
+        __syncwarp();
+        #pragma unroll
+        for(u32 w=0;w<L;++w)st[lane*L+w]=acc[w];
+        __syncwarp();
+        u32* const ob=output+u64(h0*256u+cc_)*L+lane;
+        if(dfl&2){
+            #pragma unroll
+            for(u32 rr=0;rr<32;++rr){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}
+        }else{
+            #pragma unroll
+            for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
+        }
+    }
+}
 #endif

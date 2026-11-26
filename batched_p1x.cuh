@@ -990,6 +990,6 @@ extern "C" __global__ void __launch_bounds__((BPO_XV&8)?512:256,BPO_TC_MINB) bpo
 #endif // bpo_first_xv
 #endif
 
-// sp diag (host: exit-time diag only): on-device exact compare
-extern "C" __global__ void bpo_fx_cmp(const unsigned* a,const unsigned* b,unsigned long long n,unsigned* bad){
+// hot diag (host: exit-time diag only): on-device exact compare
+extern "C" __global__ void bpo_hot_cmp(const unsigned* a,const unsigned* b,unsigned long long n,unsigned* bad){
     for(unsigned long long i=blockIdx.x*(unsigned long long)blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x)if(a[i]!=b[i]){*bad=1u;return;}}

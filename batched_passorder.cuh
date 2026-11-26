@@ -1110,6 +1110,88 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     #pragma unroll
     for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
+#ifdef BPO_P2CU   // hot diag twin of bpo_r16_body (kernel bpo_middle_r16zh): A/B loads from planes (prime*8+digit)&7
+template<bool H,bool MT=false,bool CU=false,bool LZ=false>
+__device__ __forceinline__ void bpo_r16_bodyh(u32* TA,const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32,u32 untw){
+    constexpr u32 N=65536u;
+    const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
+    const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
+#ifdef BPO_P2MT   // p2mt (MT, kernel bpo_middle_r16m): r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
+    const u64* tf=r16+u64(prime)*(MT?1024u:512u);const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);(void)tmf;(void)tmi;
+#else
+    const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
+#endif
+    const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
+#ifdef BPO_P2CU   // CU: stage twiddles from the constant table (untw bits 24-31 = global index of the group's first prime)
+    const u64* const cuf=CU?bpo_p2cu+((untw>>24)+prime)*256u:tf;const u64* const cui=CU?cuf+128u:ti;
+#define BPO_P2TF cuf
+#define BPO_P2TI cui
+#else
+#define BPO_P2TF tf
+#define BPO_P2TI ti
+#endif
+    const u64 base=u64(prime*8+j)*N;
+    const u32 off=g*2048u+c2*8u+s;
+    u32 a[16],b[16];
+    {   const u64 hb=u64((prime*8+j)&7u)*N;const u32* a0=A+hb+off;const u32* b0=B+hb+off;   // hot: planes &7
+        if(BPO_R16LZ){   // p2lz: streaming loads only (host: r16z only with untw bit 4); the runtime ldcs / plain choice made
+            // ptxas rebuild the 64-bit address of every load in this instantiation (census: +58..+105 slots)
+            #pragma unroll
+            for(u32 c1=0;c1<16;++c1){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}}
+        else{
+        #pragma unroll
+        for(u32 c1=0;c1<16;++c1){if(untw&4){a[c1]=__ldcs(a0+128u*c1);b[c1]=__ldcs(b0+128u*c1);}else{a[c1]=a0[128u*c1];b[c1]=b0[128u*c1];}}}
+    }
+    const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
+    if(BPO_R16LZ&&H){r16_dif16z(a,b,BPO_P2TF,p,p2);}   // p2lz: words < 4p
+    else{r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);}
+    u32* const tw_=TA+int(s*292u+c2);        // [17 i]: column c2 of row i
+    u32* const tr_=TA+int(s*292u+17u*c2);    // [i]: row c2
+    #pragma unroll
+#ifdef BPO_P2MT
+    for(u32 i=1;i<16;++i){const u64 w=MT?__ldg(tmf+16u*i):bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+#else
+    for(u32 i=1;i<16;++i){const u64 w=bpo_tw8(tfb,8u*c2,r16_brev4(i));a[i]=pxmshh<H>(a[i],w,p);b[i]=pxmshh<H>(b[i],w,p);}
+#endif
+    if(BPO_R16LZ&&H){a[0]=pxadd(a[0],0u,p2);b[0]=pxadd(b[0],0u,p2);}   // p2lz: word 0 < 4p -> < 2p (words 1-15: lazy Shoup < 2p)
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tw_[17*i]=a[i];
+    __syncthreads();   // every thread's A/B loads have completed (values consumed above)
+    if((untw&8)&&prime*8+j>=8u)bpo_discard((threadIdx.x<64u?A:B)+base+g*2048u+(threadIdx.x&63u)*32u);   // dead A/B lines: no write-back (P3 / next P1 overwrite them)
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=tr_[i];   // thread row t = c2: k1 = brev4(c2)
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tw_[17*i]=b[i];
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)b[i]=tr_[i];
+    r16_dif16h<H>(a,BPO_P2TF,p,p2);r16_dif16h<H>(b,BPO_P2TF,p,p2);
+    {const u32 pinv=pxinv32(p);   // Montgomery pointwise only (host selects r16 with the 2^32-folded t2nM table)
+        #pragma unroll
+        for(u32 i=0;i<16;++i)a[i]=pxmont(a[i],b[i],p,pinv);}
+    r16_dit16h<H,true>(a,BPO_P2TI,p,p2);
+    {const u32 k8=8u*r16_brev4(c2);
+        #pragma unroll
+#ifdef BPO_P2MT
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],MT?__ldg(tmi+16u*i):bpo_tw8(tib,k8,i),p);
+#else
+        for(u32 i=1;i<16;++i)a[i]=pxmshh<H>(a[i],bpo_tw8(tib,k8,i),p);   // natural c2' = i
+#endif
+        a[0]=H?pxadd(a[0],0u,p2):pzred(a[0],p);}   // all canonical (H: < 2p) for the second DIT16 (CI)
+    __syncthreads();   // forward reads of TA done
+    #pragma unroll
+    for(u32 i=0;i<16;++i)tr_[i]=a[i];   // row t = c2 (k1 = brev4(t)), column c2' = i
+    __syncthreads();
+    #pragma unroll
+    for(u32 i=0;i<16;++i)a[i]=tw_[17*i];   // register i = row i -> k1 = brev4(i): bit-reversed input
+    r16_dit16h<H,true>(a,BPO_P2TI,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
+    u32* o=C+base+(c2*256u+g*8u+s);
+    #pragma unroll
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
+}
+#endif
 #undef BPO_P2TF
 #undef BPO_P2TI
 #undef BPO_R16LZ
@@ -1142,6 +1224,15 @@ extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16z(const u32* A,c
     if(primes[blockIdx.z]<(1u<<30))bpo_r16_body<true,true,true,true>(TA,A,B,C,primes,r16,N,untw);else
 #endif
     bpo_r16_body<false,true,true>(TA,A,B,C,primes,r16,N,untw);
+}
+// hot diag twin (host: hot diag captures only): bpo_middle_r16z reading A/B planes (prime*8+digit)&7 (not exact)
+extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16zh(const u32* A,const u32* B,u32* C,
+    const u32* primes,const u64* r16,u32 N,u32 untw){
+    __shared__ u32 TA[8*292];
+#if BPO_NH30
+    if(primes[blockIdx.z]<(1u<<30))bpo_r16_bodyh<true,true,true,true>(TA,A,B,C,primes,r16,N,untw);else
+#endif
+    bpo_r16_bodyh<false,true,true>(TA,A,B,C,primes,r16,N,untw);
 }
 #endif
 #endif
@@ -1898,6 +1989,79 @@ __device__ __forceinline__ void bpo_p3t_body(u32* X0,const u32* C,u32* D,const u
         }
     }
 }
+// hot diag twin of bpo_p3t_body (kernel bpo_last_cm3th): C loads from columns c&63
+template<bool H>
+__device__ __forceinline__ void bpo_p3t_bodyh(u32* X0,const u32* C,u32* D,const u32* primes,
+    const u64* ftab,const u64* stage_itw,const u64* t2n,u32 dfl){
+    constexpr u32 N=65536u,CB=BPO_P3CB;
+    static_assert(CB>=1&&CB<=8&&(128u%CB)==0,"p3t2: columns of one block share c>>7");
+    const u32 prime=blockIdx.y,p=primes[prime],c0=blockIdx.x*CB;
+    const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
+    const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
+    const u64* sit=stage_itw+prime*256u;
+    #pragma unroll 1
+    for(u32 k=0;k<CB;++k){const u32 c=c0+k;
+        u32 yv[8];
+        {const u32* src=C+u64(prime*8u)*N+((c&63u)*256u+t);   // hot: columns &63
+            #pragma unroll
+            for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
+        const u64 F=__ldg(ftab+(u64(prime)*65536u+(c*256u+t)));
+        #pragma unroll
+        for(u32 d=0;d<8;++d)yv[d]=pxmshh<H>(yv[d],F,p);
+        if(H){
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=2)phdit1c(yv[d0],yv[d0+1],p2);
+            #pragma unroll
+            for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+                #pragma unroll
+                for(u32 d0=0;d0<8;d0+=len){
+                    #pragma unroll
+                    for(u32 jj=0;jj<half;++jj){if(jj==0)phdit1(yv[d0],yv[d0+half],p2);else phdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p,p2);}}}
+        }else{
+            #pragma unroll
+            for(u32 d0=0;d0<8;d0+=2)pzdit1c(yv[d0],yv[d0+1],p);
+            #pragma unroll
+            for(u32 len=4;len<=8;len<<=1){const u32 half=len/2;
+                #pragma unroll
+                for(u32 d0=0;d0<8;d0+=len){
+                    #pragma unroll
+                    for(u32 jj=0;jj<half;++jj){if(jj==0)pzdit1(yv[d0],yv[d0+half],sit[0],p);else pzdit(yv[d0+jj],yv[d0+jj+half],sit[jj*(256u/len)],p);}}}
+        }
+        {u32* const xw=X0+k*(8u*288u)+(t+4u*(t>>5));
+            #pragma unroll
+            for(u32 d=0;d<8;++d)xw[d*288u]=yv[d];}
+    }
+    __syncthreads();
+    const u64* const tn=t2n+(u64(prime*8u+warp)*512u+((c0>>7)*256u+lane));
+    u64 tv[8];
+    #pragma unroll
+    for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+32u*m);
+    if((dfl&1)&&lane<8u&&c0>=64u)
+        #pragma unroll
+        for(u32 k=0;k<CB;++k)bpo_discard(C+u64(prime*8u+lane)*N+((c0+k)*256u+32u*warp));   // C lines read by this warp (all used)
+#ifdef BPO_P3EL
+    const u32 pm=12u;
+#else
+    const u32 pm=4u;
+#endif
+    #pragma unroll 1
+    for(u32 k=0;k<CB;++k){const u32 c=c0+k;
+        u32 v[8];
+        u32* const base=X0+k*(8u*288u)+warp*288u;
+        {const uint4* p4=reinterpret_cast<const uint4*>(base+(8u*lane+4u*(lane>>2)));const uint4 x0=p4[0],x1=p4[1];
+         v[0]=x0.x;v[1]=x0.y;v[2]=x0.z;v[3]=x0.w;v[4]=x1.x;v[5]=x1.y;v[6]=x1.z;v[7]=x1.w;}
+        if(H)phdit_smr<false>(base,v,sit,p,p2,lane);else pzdit_smr<false>(base,v,sit,p,lane);
+        u32* const out=D+(u64(prime*8u+warp)*N+(c*256u+lane));
+        if(dfl&pm){
+            u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
+            #pragma unroll
+            for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
+        }else{
+            #pragma unroll
+            for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
+        }
+    }
+}
 #ifndef BPO_P3TR
 #define BPO_P3TR 48   // register cap (pv105: 40 spills and loses 14%; 32 spills more)
 #endif
@@ -1908,6 +2072,15 @@ extern "C" __global__ void __maxnreg__(BPO_P3TR) bpo_last_cm3t(const u32* C,u32*
     if(primes[blockIdx.y]<(1u<<30))bpo_p3t_body<true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
 #endif
     bpo_p3t_body<false>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
+}
+// hot diag twin (host: hot diag captures only): bpo_last_cm3t reading C columns c&63 (not exact)
+extern "C" __global__ void __maxnreg__(BPO_P3TR) bpo_last_cm3th(const u32* C,u32* D,const u32* primes,
+    const u64* untwist,const u64* stage_itw,const u64* t2n,u32 N,u32 logR,u32 dfl){
+    __shared__ __align__(128) u32 X[BPO_P3CB*8*288];(void)N;(void)logR;
+#if BPO_NH30
+    if(primes[blockIdx.y]<(1u<<30))bpo_p3t_bodyh<true>(X,C,D,primes,untwist,stage_itw,t2n,dfl);else
+#endif
+    bpo_p3t_bodyh<false>(X,C,D,primes,untwist,stage_itw,t2n,dfl);
 }
 #endif
 // F table init (once): F[prime][c][t] = the bpo_p3b_body F factor (same formula), grid (256, K), 256 threads
