@@ -972,7 +972,7 @@ struct State {
     // all but the last group (input kept in L2 for the re-read), 8 P3 residues of all but the last group stored evict_first
     // (the CRT reads them only after the last group; the last group's residues stay normal so the CRT can hit them in L2).
     static constexpr u32 PDL_DEFAULT=0;      // programmatic graph edges (variant 6): 1 P3->CRT, 2 CRT->next same-chain P1, 3 both; FHERMA_PDL=m overrides; tabs "pdl" = edges applied
-    static constexpr int LZMONT_DEFAULT=0;   // lazy Montgomery P2-H pointwise output (kernel bpo_middle_r16zm); FHERMA_LZMONT=0/1 overrides; tabs "lzm"
+    static constexpr int LZMONT_DEFAULT=1;   // lazy Montgomery P2-H pointwise output (kernel bpo_middle_r16zm); FHERMA_LZMONT=0/1 overrides; tabs "lzm"
     static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4|128;   // 128 (default, pv61 whole-batch p3el 0.986 / combo2 p3el+pf3q 0.979 on target): group-0 P3 residue stores evict_last (the CRT reads group 0 from L2; adds BPO_P3EL to the module); FHERMA_NO_P3EL=1 off   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
     int big_cache=-1;
     bool big_part(){if(big_cache>=0)return big_cache!=0;if(const char* e=std::getenv("FHERMA_BIG")){big_cache=*e=='1';return big_cache!=0;}
@@ -1371,7 +1371,7 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         }catch(...){if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}ge=nullptr;}
         restore();return ge;}
     void run_pdl(){
-        if(!lever_env("FHERMA_PDLDIAG",true)||!graph_execs[6]||bcount<2){return;}
+        if(!lever_env("FHERMA_PDLDIAG",false)||!graph_execs[6]||bcount<2){return;}
         auto& d=*cuda;auto& D=d.driver;
         ka_pause(false);   // the keep-warm restarted by the last fherma_d2h
         using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
