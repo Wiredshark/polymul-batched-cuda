@@ -1005,7 +1005,7 @@ struct State {
     static constexpr int P1Q3_DEFAULT=0;     // P1 quad 3: lazy phase B for its primes < 2^30 (kernel bpo_first_xzq; needs p1lz); FHERMA_P1Q3=0/1; tabs "p1q3"
     static constexpr u32 CRTL_DEFAULT=2;      // CRT shared-memory instruction diet (batched_crt_lean.cuh crtl block): mask 1 FR fragment LDS.128, 2 ST stage STS.64,
                                               // 4 BQ B-fragment LDS.128; twins exist for 1, 2, 4, 7; FHERMA_CRTL=m overrides; tabs "crtl" = mask that ran
-    static constexpr bool CLDIAG_DEFAULT=true;    // cl exit diag (crtl twins against production; FHERMA_CLDIAG=0/1 overrides)
+    static constexpr bool CLDIAG_DEFAULT=false;    // cl exit diag (crtl twins against production; FHERMA_CLDIAG=0/1 overrides)
     static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4|128;   // 128 (default, pv61 whole-batch p3el 0.986 / combo2 p3el+pf3q 0.979 on target): group-0 P3 residue stores evict_last (the CRT reads group 0 from L2; adds BPO_P3EL to the module); FHERMA_NO_P3EL=1 off   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
     int big_cache=-1;
     bool big_part(){if(big_cache>=0)return big_cache!=0;if(const char* e=std::getenv("FHERMA_BIG")){big_cache=*e=='1';return big_cache!=0;}
