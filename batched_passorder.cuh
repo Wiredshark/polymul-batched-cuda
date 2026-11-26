@@ -55,12 +55,6 @@
                 const u32 x=x8[d0+jj],y=mul_shoup(x8[d0+jj+half],sit[jj*(256u/len)],p);   \
                 x8[d0+jj]=add(x,y,p);x8[d0+jj+half]=sub(x,y,p);}}}
 
-#ifdef BPO_AB   // memd diag module only: runtime ablation mask written by the host; production module: ABX() == false
-__constant__ unsigned bpo_ab;
-#define ABX(b) ((bpo_ab&(b))!=0u)
-#else
-#define ABX(b) false
-#endif
 #ifndef BPO_ABL
 #define BPO_ABL 0
 #endif
@@ -1043,13 +1037,13 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     const u32 g=blockIdx.x,j=blockIdx.y,prime=blockIdx.z,p=primes[prime];
     const u32 lane=threadIdx.x&31u,warp=threadIdx.x>>5,s=lane&7u,c2=4u*warp+(lane>>3);
 #ifdef BPO_P2MT   // p2mt (MT, kernel bpo_middle_r16m): r16 argument = per prime 1024 words: [0,512) the r16 table, [512 + 16 i + c2] = w^(c2 brev4(i)), [768 + 16 i + c2] = w^-(brev4(c2) i)
-    const u64* tf=r16+u64(ABX(16)?0u:prime)*(MT?1024u:512u);const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);(void)tmf;(void)tmi;
+    const u64* tf=r16+u64(prime)*(MT?1024u:512u);const u64* ti=tf+256u;const u64* const tmf=tf+(512u+c2);const u64* const tmi=tf+(768u+c2);(void)tmf;(void)tmi;
 #else
     const u64* tf=r16+u64(prime)*512u;const u64* ti=tf+256u;
 #endif
     const char* tfb=reinterpret_cast<const char*>(bpo_opq(tf));const char* tib=reinterpret_cast<const char*>(bpo_opq(ti));
 #ifdef BPO_P2CU   // CU: stage twiddles from the constant table (untw bits 24-31 = global index of the group's first prime)
-    const u64* const cuf=CU?bpo_p2cu+(ABX(16)?0u:((untw>>24)+prime))*256u:tf;const u64* const cui=CU?cuf+128u:ti;
+    const u64* const cuf=CU?bpo_p2cu+((untw>>24)+prime)*256u:tf;const u64* const cui=CU?cuf+128u:ti;
 #define BPO_P2TF cuf
 #define BPO_P2TI cui
 #else
@@ -1059,8 +1053,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     const u64 base=u64(prime*8+j)*N;
     const u32 off=g*2048u+c2*8u+s;
     u32 a[16],b[16];
-    if(ABX(8)){_Pragma("unroll")for(u32 c1=0;c1<16;++c1){a[c1]=off+c1;b[c1]=off^c1;}}
-    else{   const u32* a0=A+base+off;const u32* b0=B+base+off;
+    {   const u32* a0=A+base+off;const u32* b0=B+base+off;
         if(BPO_R16LZ){   // p2lz: streaming loads only (host: r16z only with untw bit 4); the runtime ldcs / plain choice made
             // ptxas rebuild the 64-bit address of every load in this instantiation (census: +58..+105 slots)
             #pragma unroll
@@ -1115,7 +1108,7 @@ __device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* A,const u32* B,u
     r16_dit16h<H,true>(a,BPO_P2TI,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
     u32* o=C+base+(c2*256u+g*8u+s);
     #pragma unroll
-    for(u32 c1=0;c1<16;++c1)if(!ABX(32))o[4096u*c1]=a[c1];
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
 #undef BPO_P2TF
 #undef BPO_P2TI
@@ -1207,7 +1200,7 @@ template<bool H>__device__ __forceinline__ void bpo_r16_body(u32* TA,const u32* 
     r16_dit16h<H,true>(a,ti,p,p2);   // H: C words in [0,4p) (P3 starts with a Shoup product: any u32)
     u32* o=C+base+c2*256u+g*8u+s;
     #pragma unroll
-    for(u32 c1=0;c1<16;++c1)if(!ABX(32))o[4096u*c1]=a[c1];
+    for(u32 c1=0;c1<16;++c1)o[4096u*c1]=a[c1];
 }
 #endif
 extern "C" __global__ void __launch_bounds__(128) bpo_middle_r16(const u32* A,const u32* B,u32* C,
@@ -1752,7 +1745,7 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
     u32 yv[8];
     {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
         #pragma unroll
-        for(u32 d=0;d<8;++d)yv[d]=ABX(64)?(t+d):src[d*N];}
+        for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
     u64 F;
 #ifdef BPO_P3F   // p3f (PF, kernel bpo_last_cm3f): untwist argument = F table [prime][c][t] (bpo_ftab_init: the values of the block below)
     if(PF)F=__ldg(untwist+(u64(prime)*65536u+(c*256u+t)));else
@@ -1807,7 +1800,7 @@ __device__ __forceinline__ void bpo_p3b_body(u32* X,const u32* C,u32* D,const u3
     if(dfl&pm){
         u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
         #pragma unroll
-        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);if(!ABX(256))asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
+        for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
     }else{
         #pragma unroll
         for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
@@ -1841,14 +1834,14 @@ __device__ __forceinline__ void bpo_p3t_body(u32* X0,const u32* C,u32* D,const u
     const u32 prime=blockIdx.y,p=primes[prime],c0=blockIdx.x*CB;
     const u32 t=threadIdx.x,lane=t&31u,warp=t>>5;
     const u32 p2=H?__shfl_sync(0xffffffffu,2u*p,0):0u;(void)p2;
-    const u64* sit=stage_itw+(ABX(128)?0u:prime)*256u;
+    const u64* sit=stage_itw+prime*256u;
     #pragma unroll 1
     for(u32 k=0;k<CB;++k){const u32 c=c0+k;
         u32 yv[8];
         {const u32* src=C+u64(prime*8u)*N+(c*256u+t);
             #pragma unroll
-            for(u32 d=0;d<8;++d)yv[d]=ABX(64)?(t+d):src[d*N];}
-        const u64 F=__ldg(ftab+(ABX(128)?u64(t):(u64(prime)*65536u+(c*256u+t))));
+            for(u32 d=0;d<8;++d)yv[d]=src[d*N];}
+        const u64 F=__ldg(ftab+(u64(prime)*65536u+(c*256u+t)));
         #pragma unroll
         for(u32 d=0;d<8;++d)yv[d]=pxmshh<H>(yv[d],F,p);
         if(H){
@@ -1875,7 +1868,7 @@ __device__ __forceinline__ void bpo_p3t_body(u32* X0,const u32* C,u32* D,const u
             for(u32 d=0;d<8;++d)xw[d*288u]=yv[d];}
     }
     __syncthreads();
-    const u64* const tn=t2n+(ABX(128)?u64(lane):(u64(prime*8u+warp)*512u+((c0>>7)*256u+lane)));
+    const u64* const tn=t2n+(u64(prime*8u+warp)*512u+((c0>>7)*256u+lane));
     u64 tv[8];
     #pragma unroll
     for(u32 m=0;m<8;++m)tv[m]=__ldg(tn+32u*m);
@@ -1898,10 +1891,10 @@ __device__ __forceinline__ void bpo_p3t_body(u32* X0,const u32* C,u32* D,const u
         if(dfl&pm){
             u64 pol;if(dfl&pm&8u)asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));
             #pragma unroll
-            for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);if(!ABX(256))asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
+            for(u32 m=0;m<8;++m){const u32 r=pxmsh(v[m],tv[m],p);asm volatile("st.global.L2::cache_hint.u32 [%0], %1, %2;"::"l"(out+32u*m),"r"(r),"l"(pol):"memory");}
         }else{
             #pragma unroll
-            for(u32 m=0;m<8;++m){const u32 r_=pxmsh(v[m],tv[m],p);if(!ABX(256))out[32u*m]=r_;}
+            for(u32 m=0;m<8;++m)out[32u*m]=pxmsh(v[m],tv[m],p);
         }
     }
 }
