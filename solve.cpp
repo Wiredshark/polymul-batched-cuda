@@ -69,7 +69,7 @@
 #define KA_DEFAULT 3
 #endif
 #ifndef KW_LOAD
-#define KW_LOAD 12   // production warm load from the end of fherma_init (1 = candidate 15; 7 duty90, 8 duty80, 12 device-paced duty)
+#define KW_LOAD 8   // production warm load from the end of fherma_init (1 = candidate 15; 7 duty90, 8 duty80, 12 device-paced duty)
 #endif
 #ifndef KW_IDLE7
 #define KW_IDLE7 (1.0/9.0)   // load 7: host idle after each dummy graph, in graph times (one line)
