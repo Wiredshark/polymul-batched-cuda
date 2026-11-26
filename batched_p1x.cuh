@@ -813,8 +813,11 @@ __device__ __forceinline__ void zrdif6q(u32* const base0,const u32 so,const u64*
         asm volatile("cp.async.bulk.commit_group;":::"memory");}
 #endif
 }
-// one prime quad of bpo_first_xbz (phase A + phase B), LZ per Z1-Z6
-template<u32 F,bool LZ,bool PW=false>
+// one prime quad of bpo_first_xbz (phase A + phase B), LZ per Z1-Z6. Q3 (p1q3 twin bpo_first_xzq): in a canonical quad,
+// phase B (warp pair per prime) takes the LZ body for the primes < 2^30 (r < BPO_NH30): its input is phase A's canonical
+// [0,p) output (inside Z4's [0,2p)), Z6 makes its A/B words canonical, so the output is bit-identical; phase A (lanes =
+// four primes) and the 31-bit prime stay canonical. Warp-uniform branch.
+template<u32 F,bool LZ,bool PW=false,bool Q3=false>
 __device__ __forceinline__ void xz_quad(const u32 u,const u32 (&af)[8][2][4],u32* const X,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,
     const u64* ctab,const XTMap* tmA,const XTMap* tmB,const u32 c,const u32 op,const u32 lane,const u32 warp,const u32 gid,const u32 tig,const u32 stm){
     constexpr u32 MT=2,XD=320u,XS=8*320;
@@ -867,14 +870,15 @@ __device__ __forceinline__ void xz_quad(const u32 u,const u32 (&af)[8][2][4],u32
         __syncthreads();
         {const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
-            zrdif6q<F,LZ,PW>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);}
+            if(!LZ&&Q3&&r<u32(BPO_NH30))zrdif6q<F,true,PW>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);
+            else zrdif6q<F,LZ,PW>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);}
 #if BPO_X_HAS_TMA
         if(lane==0)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable
 #endif
 }
 // bpo_first_xb restricted to the production flag set (S6, flags 256/512/4096/8192/131072, p1tw, p1rev), loop body per quad
 // instantiated twice (LZ for quads of primes < 2^30, canonical otherwise).
-template<u32 F,bool PW=false>
+template<u32 F,bool PW=false,bool Q3=false>
 __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
     const XTMap* tmA,const XTMap* tmB,u32* X){
@@ -980,7 +984,7 @@ __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u
         if(true)xz_quad<F,true,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);else
 #endif
         if(4u*u+3u<u32(BPO_NH30))xz_quad<F,true,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);
-        else xz_quad<F,false,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);}
+        else xz_quad<F,false,PW,Q3>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);}
 #if BPO_X_HAS_TMA
     if(lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
 #endif
@@ -991,6 +995,13 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xbz<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+// p1q3 twin (host: FHERMA_P1Q3 / P1Q3_DEFAULT): bpo_first_xz with the lazy phase B for the primes < 2^30 of the canonical quad
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xzq(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    bpo_first_xbz<BPO_XF|0x400000u|0x800000u,false,true>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 // pdl twin (host: FHERMA_PDL bit 2 / PDL_DEFAULT): bpo_first_xz whose TMA-issuing lanes execute griddepcontrol.wait before
 // each A/B store. Before the first store a block only reads its input, the tables and its own smem, so with a programmatic

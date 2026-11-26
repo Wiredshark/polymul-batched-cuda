@@ -434,9 +434,17 @@ template<u32 FL> __device__ __forceinline__ void swcl_body(const u32* __restrict
     }
 }
 #define SWCL_K(nm,fl) extern "C" __global__ void __launch_bounds__(128,3) nm(const u32* __restrict__ residues,u32* __restrict__ output, const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){swcl_body<fl>(residues,output,bfrag,N,d,pfa,pfb,pfitems,dfl);}
+#ifndef BPO_CRTL_M
+#define BPO_CRTL_M 7u   // host passes the configured mask: only the twin that can run is compiled (init trim)
+#endif
+#if BPO_CRTL_M==1
 SWCL_K(bpo_crt_l1,1u)
+#elif BPO_CRTL_M==2
 SWCL_K(bpo_crt_l2,2u)
+#elif BPO_CRTL_M==4
 SWCL_K(bpo_crt_l4,4u)
+#elif BPO_CRTL_M==7
 SWCL_K(bpo_crt_l7,7u)
+#endif
 #undef SWCL_K
 #endif
