@@ -272,4 +272,171 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanp(const u32* __r
         }
     }
 }
+// ---- crtl (FHERMA_CRTL mask, CRTL_DEFAULT): bpo_crt_lean with fewer shared-memory instructions. Same bytes through shared
+// memory, same arithmetic (exact by construction: only which lane / word / register holds a value changes).
+//  bit 1 FR: A-fragment row (gid, m, h) is coefficient 16m + 2gid + h (was 16m + 8h + gid). The fragment words (h = 0, 1)
+//      of one prime row and m-tile are then 2 adjacent coefficients = one LDS.64 straight into the IMMA operand pair
+//      (a0,a1) / (a2,a3): 8 LDS.64 instead of 16 LDS per digit (conflict-free under the existing pbuf swizzle: bank
+//      ((16m + 2gid) ^ 8tig) + h). The h stage keeps one row per coefficient, row c at c*36 + 4*(c>>3) words: writer bank
+//      8gid + 4(gid>>2) + col, reader LDS.128 chunk c + (c>>3) mod 8: both conflict-free.
+//  bit 2 ST: tiles 2p, 2p+1 stored as one STS.64 at column x(tig) + 4p, x = 2*(tig&1) + 16*(tig>>1) (bank 4*gid + x:
+//      conflict-free per half-warp; with FR: column 2*tig + 8p, bank 8gid + 4(gid>>2) + 2tig): 4 x 4 STS.64 + 4 STS (tile 8) = 20 instead of 36 STS per digit. The reader loads the
+//      same 9 LDS.128 and renames registers (compile-time word map swcl_wpos).
+//  bit 4 BQ: B fragments relaid [T][lane][s][2] at the block's smem fill: one LDS.128 per tile, 9 instead of 18 LDS.64.
+// Per warp per digit: 79 -> 50 shared instructions with all three (smem wavefronts unchanged).
+__host__ __device__ constexpr u32 swcl_wpos(bool fr,bool st,u32 k){return (!st||k>=32u)?k:fr?(2u*(k&3u)+8u*((k>>2)>>1)+((k>>2)&1u)):(2u*(k&1u)+16u*((k>>1)&1u)+4u*((k>>2)>>1)+((k>>2)&1u));}
+// stage row offset (words) of the C-fragment row (m, h) of row-group 0 (the lane part is in the base)
+__host__ __device__ constexpr u32 swcl_row(bool fr,u32 m,u32 h){return fr?((16u*m+h)*36u+8u*m):((16u*m+8u*h)*36u);}
+template<u32 OFF> __device__ __forceinline__ uint2 swcl_lds2(u32 base){uint2 v;asm volatile("ld.shared.v2.u32 {%0,%1}, [%2+%3];":"=r"(v.x),"=r"(v.y):"r"(base),"n"(OFF):"memory");return v;}
+template<u32 OFF> __device__ __forceinline__ void swcl_sts2(u32 base,u32 v0,u32 v1){asm volatile("st.shared.v2.u32 [%0+%1], {%2,%3};"::"r"(base),"n"(OFF),"r"(v0),"r"(v1):"memory");}
+template<u32 OFF> __device__ __forceinline__ uint4 swcl_lds4(u32 base){uint4 v;asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4+%5];":"=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w):"r"(base),"n"(OFF):"memory");return v;}
+// digit J from register h (AIN form of swc_digit: alpha*NP + OFF folded into the column sums)
+template<u32 J> __device__ __forceinline__ void swcl_digit(u32 (&acc)[66],const u32 (&h)[32],u32 alpha){
+    constexpr u32 o=SWC_POS[J]/32,sh=SWC_POS[J]%32;
+    u32 xe[16],xo[16];
+    #pragma unroll
+    for(u32 i=0;i<16;++i){xe[i]=h[2*i]+alpha*swc_np16(2*i)+swc_of16(2*i);xo[i]=h[2*i+1]+alpha*swc_np16(2*i+1)+swc_of16(2*i+1);}
+    swc_mac<(1u<<sh)>(acc+o,xe);
+    if(sh<16)swc_mac<(1u<<((sh+16)&31))>(acc+o,xo);else swc_mac<(1u<<((sh+16)&31))>(acc+o+1,xo);
+    i64 c=0;
+    #pragma unroll
+    for(u32 w=16;w<=18;++w){
+        const u32 ex=w==16?(alpha<<sh):(w==17&&sh?(alpha>>((32-sh)&31)):0u);
+        const i64 t=i64(acc[o+w])-i64(ex)+c;acc[o+w]=u32(t);c=t>>32;}
+}
+template<u32 FL,u32 T> __device__ __forceinline__ void swcl_b(const u32* bsh,u32 lane,uint2& b0,uint2& b1){
+    if(FL&4u){const uint4 v=*reinterpret_cast<const uint4*>(bsh+(T*32+lane)*4);b0=make_uint2(v.x,v.y);b1=make_uint2(v.z,v.w);}
+    else{b0=*reinterpret_cast<const uint2*>(bsh+((T*2+0)*32+lane)*2);b1=*reinterpret_cast<const uint2*>(bsh+((T*2+1)*32+lane)*2);}
+}
+template<u32 M> __device__ __forceinline__ void swcl_mm(const u32 (&a)[2][2][4],uint2 b0,uint2 b1,u32 (&c)[4]){
+    c[0]=c[1]=c[2]=c[3]=0;
+    imma16832(c,a[M][0][0],a[M][0][1],a[M][0][2],a[M][0][3],b0.x,b0.y);imma16832(c,a[M][1][0],a[M][1][1],a[M][1][2],a[M][1][3],b1.x,b1.y);
+}
+// one tile T, 32-bit stores (column 4T + tig in the base)
+template<u32 FL,u32 T> __device__ __forceinline__ void swcl_tile1(const u32 (&a)[2][2][4],const u32* bsh,u32 lane,u32 sb){
+    constexpr bool FR=(FL&1u)!=0;uint2 b0,b1;swcl_b<FL,T>(bsh,lane,b0,b1);u32 c[4];
+    swcl_mm<0>(a,b0,b1,c);swc_sts<(swcl_row(FR,0,0)+4*T)*4>(sb,c[0]+(c[1]<<8));swc_sts<(swcl_row(FR,0,1)+4*T)*4>(sb,c[2]+(c[3]<<8));
+    swcl_mm<1>(a,b0,b1,c);swc_sts<(swcl_row(FR,1,0)+4*T)*4>(sb,c[0]+(c[1]<<8));swc_sts<(swcl_row(FR,1,1)+4*T)*4>(sb,c[2]+(c[3]<<8));
+}
+// tiles 2P, 2P+1 as STS.64 (column x(tig) in the base, + 4P (FR: 8P))
+template<u32 FL,u32 P> __device__ __forceinline__ void swcl_tile2(const u32 (&a)[2][2][4],const u32* bsh,u32 lane,u32 sx){
+    constexpr bool FR=(FL&1u)!=0;constexpr u32 PO=FR?8*P:4*P;
+    uint2 b0,b1,b2,b3;swcl_b<FL,2*P>(bsh,lane,b0,b1);swcl_b<FL,2*P+1>(bsh,lane,b2,b3);u32 c0[4],c1[4];
+    swcl_mm<0>(a,b0,b1,c0);swcl_mm<0>(a,b2,b3,c1);
+    swcl_sts2<(swcl_row(FR,0,0)+PO)*4>(sx,c0[0]+(c0[1]<<8),c1[0]+(c1[1]<<8));swcl_sts2<(swcl_row(FR,0,1)+PO)*4>(sx,c0[2]+(c0[3]<<8),c1[2]+(c1[3]<<8));
+    swcl_mm<1>(a,b0,b1,c0);swcl_mm<1>(a,b2,b3,c1);
+    swcl_sts2<(swcl_row(FR,1,0)+PO)*4>(sx,c0[0]+(c0[1]<<8),c1[0]+(c1[1]<<8));swcl_sts2<(swcl_row(FR,1,1)+PO)*4>(sx,c0[2]+(c0[3]<<8),c1[2]+(c1[3]<<8));
+}
+template<u32 FL> __device__ __forceinline__ void swcl_body(const u32* __restrict__ residues,u32* __restrict__ output,
+ const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
+    if(pfitems){
+        const u32 total=gridDim.x*blockDim.x;
+        for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
+            const u32 it=t>>8,hh=t&255u;const u32* ps=(it>=256u?pfb:pfa)+u64(it&255u)*BCRT_L+u64(hh*256u)*BCRT_L;
+            asm volatile("prefetch.global.L2 [%0];"::"l"(ps));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+32));asm volatile("prefetch.global.L2 [%0];"::"l"(ps+BCRT_L-1));
+        }
+    }
+    constexpr bool FR=(FL&1u)!=0,ST=(FL&2u)!=0,BQ=(FL&4u)!=0;
+    constexpr u32 K=BCRT_K,SW=BCRT_SW,W=BCRT_W,L=BCRT_L,NW=64,NT=9,SST=36,F=BTC_F;
+    static_assert(K==16&&SW==16&&NT==9,"tensor CRT geometry");
+    constexpr u32 WO=W/32,WS=W%32;
+    static_assert(WO+1==L&&WS>0,"q = 2^W - d with W in the top limb");
+    constexpr u32 STW=32*L;                         // per-warp stage words
+    constexpr u32 SGW=FR?32*SST+12:32*SST;          // h-stage words (FR: 4 words of pad after every 8 rows); prefetch buffer after it
+    static_assert(SGW+512<=STW&&SGW%4==0,"prefetch buffer aliases the output stage");
+    __shared__ __align__(16) u32 bsh[NT*2*32*2];
+    __shared__ __align__(16) u32 stage_all[4][STW];
+    const u32 warp=threadIdx.x>>5,lane=threadIdx.x&31,gid=lane>>2,tig=lane&3;
+    u32* st=stage_all[warp];
+    const u32 i0=blockIdx.x*128+warp*32;
+    u32* const pbuf=st+SGW;   // [r][32 coefficients], coefficient index ^ 8*(r&3) (conflict-free fragment reads)
+    auto prefetch=[&](u32 j){
+        #pragma unroll
+        for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
+        swc_commit();};
+    prefetch(0);
+    if(BQ){for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128){const u32 w=x&1u,ln=(x>>1)&31u,s=(x>>6)&1u,T=x>>7;bsh[((T*32+ln)*2+s)*2+w]=bfrag[x];}}
+    else{for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];}
+    __syncthreads();
+    u32 acc[NW+2];   // [64..65]: scratch of the digit chains
+    #pragma unroll
+    for(u32 w=0;w<NW+2;++w)acc[w]=0;
+    const u32 stb=u32(__cvta_generic_to_shared(st));
+    #pragma unroll
+    for(u32 j=0;j<8;++j){
+        u32 a[2][2][4];
+        swc_wait0();__syncwarp();
+        if(FR){   // prime row r = tig + 4*k4 (s = k4>>1, regs 2*(k4&1) + h); m-tile m: coefficients 16m + 2gid + (0, 1) = one LDS.64
+            const u32 pq=u32(__cvta_generic_to_shared(pbuf))+tig*128u;
+            const u32 q0=pq+(((2u*gid)^(8u*tig))*4u),q1=pq+(((16u+2u*gid)^(8u*tig))*4u);
+#define SWCL_FR(m,q) {uint2 v=swcl_lds2<0>(q);a[m][0][0]=v.x;a[m][0][1]=v.y;v=swcl_lds2<512>(q);a[m][0][2]=v.x;a[m][0][3]=v.y;                       v=swcl_lds2<1024>(q);a[m][1][0]=v.x;a[m][1][1]=v.y;v=swcl_lds2<1536>(q);a[m][1][2]=v.x;a[m][1][3]=v.y;}
+            SWCL_FR(0,q0) SWCL_FR(1,q1)
+#undef SWCL_FR
+        }else{   // pbk[k] = pbuf + 32*tig + gid + 8*(k^tig) words, k = 2m + (row half)
+            const u32 pb=u32(__cvta_generic_to_shared(pbuf))+(32*tig+gid)*4;
+            const u32 p0=pb+32*(0^tig),p1=pb+32*(1^tig),p2=pb+32*(2^tig),p3=pb+32*(3^tig);
+#define SWC_FR(m,s,q0,q1) a[m][s][0]=swc_lds<(8*s)*128>(q0);a[m][s][1]=swc_lds<(8*s)*128>(q1);a[m][s][2]=swc_lds<(8*s+4)*128>(q0);a[m][s][3]=swc_lds<(8*s+4)*128>(q1);
+            SWC_FR(0,0,p0,p1) SWC_FR(0,1,p0,p1) SWC_FR(1,0,p2,p3) SWC_FR(1,1,p2,p3)
+#undef SWC_FR
+        }
+        __syncwarp();
+        if(j<7)prefetch(j+1);
+        {const u32 sr=stb+(FR?(2u*gid*SST+4u*(gid>>2)):gid*SST)*4u;   // row-group 0 row of this lane's gid
+            if(ST){const u32 sx=sr+(FR?2u*tig:(2u*(tig&1u)+16u*(tig>>1)))*4u;
+                swcl_tile2<FL,0>(a,bsh,lane,sx);swcl_tile2<FL,1>(a,bsh,lane,sx);swcl_tile2<FL,2>(a,bsh,lane,sx);swcl_tile2<FL,3>(a,bsh,lane,sx);
+                swcl_tile1<FL,8>(a,bsh,lane,sr+tig*4u);}
+            else{const u32 sb=sr+tig*4u;
+                swcl_tile1<FL,0>(a,bsh,lane,sb);swcl_tile1<FL,1>(a,bsh,lane,sb);swcl_tile1<FL,2>(a,bsh,lane,sb);swcl_tile1<FL,3>(a,bsh,lane,sb);swcl_tile1<FL,4>(a,bsh,lane,sb);
+                swcl_tile1<FL,5>(a,bsh,lane,sb);swcl_tile1<FL,6>(a,bsh,lane,sb);swcl_tile1<FL,7>(a,bsh,lane,sb);swcl_tile1<FL,8>(a,bsh,lane,sb);}}
+        __syncwarp();
+        const u32* hs=st+lane*SST+(FR?4u*(lane>>3):0u);   // this lane's coefficient row
+        u32 v[36];
+        #pragma unroll
+        for(u32 c4=0;c4<9;++c4){const uint4 q=reinterpret_cast<const uint4*>(hs)[c4];v[4*c4]=q.x;v[4*c4+1]=q.y;v[4*c4+2]=q.z;v[4*c4+3]=q.w;}
+        u32 h[32];
+        #pragma unroll
+        for(u32 k=0;k<32;++k)h[k]=v[swcl_wpos(FR,ST,k)];
+        const u64 S=u64(v[32])+(u64(v[33])<<16)+(u64(v[34])<<32);
+        const u32 alpha=u32((S+(u64(1)<<(F-1)))>>F);
+        switch(j){case 0:swcl_digit<0>(acc,h,alpha);break;case 1:swcl_digit<1>(acc,h,alpha);break;case 2:swcl_digit<2>(acc,h,alpha);break;case 3:swcl_digit<3>(acc,h,alpha);break;
+                  case 4:swcl_digit<4>(acc,h,alpha);break;case 5:swcl_digit<5>(acc,h,alpha);break;case 6:swcl_digit<6>(acc,h,alpha);break;default:swcl_digit<7>(acc,h,alpha);break;}
+        __syncwarp();   // stage reads of this digit done
+    }
+    {   // fold x1 = (x mod 2^W) + d*(x >> W), t = x1 - bias, one +-delta chain
+        u32 hw[10];
+        #pragma unroll
+        for(u32 w=0;w<10;++w){const u32 a_=w+WO<NW?acc[w+WO]:0,b_=w+WO+1<NW?acc[w+WO+1]:0;hw[w]=(a_>>WS)|(b_<<(32-WS));}
+        acc[WO]&=(1u<<WS)-1;
+        swc_fold(acc,hw,d);
+        const u32 br=swc_subbias(acc);
+        const bool hi=(acc[WO]>>WS)!=0u;
+        acc[WO]&=(1u<<WS)-1;
+        const u32 lt=swc_ltq(acc);
+        swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
+        acc[WO]&=(1u<<WS)-1;
+    }
+    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
+    const u32 cc_=i0>>8,h0=i0&255u;   // lane owns coefficient i0 + lane in every variant
+    {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
+        __syncwarp();
+        #pragma unroll
+        for(u32 w=0;w<L;++w)st[lane*L+w]=acc[w];
+        __syncwarp();
+        u32* const ob=output+u64(h0*256u+cc_)*L+lane;
+        if(dfl&2){
+            #pragma unroll
+            for(u32 rr=0;rr<32;++rr){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}
+        }else{
+            #pragma unroll
+            for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
+        }
+    }
+}
+#define SWCL_K(nm,fl) extern "C" __global__ void __launch_bounds__(128,3) nm(const u32* __restrict__ residues,u32* __restrict__ output, const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){swcl_body<fl>(residues,output,bfrag,N,d,pfa,pfb,pfitems,dfl);}
+SWCL_K(bpo_crt_l1,1u)
+SWCL_K(bpo_crt_l2,2u)
+SWCL_K(bpo_crt_l4,4u)
+SWCL_K(bpo_crt_l7,7u)
+#undef SWCL_K
 #endif

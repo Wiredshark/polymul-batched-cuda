@@ -22,17 +22,7 @@
 // tables built from the parameters: primes, twiddles, CRT tables); launched back to back, at most two graphs queued
 // (the stop wait covers at most the one running and the one queued). 2 repeats ~45 ms of spin
 // then 3 dummy graphs; 3 repeats ~800 ms of dummy graphs then ~200 ms of spin. A failure building the dummy graph
-// falls back to the spin ("kw:graph"). Duty-cycled loads (lr diag, selectable): 4 one dummy graph, wait for it, then idle one
-// graph time (50%); 5 the same with three graph times idle (25%); 6 dummy graphs for 1 s of every 3 s, the spin in between.
-// The idle of 4 / 5 is a wait on the stop condition, so a stop request ends it at once (the stop wait stays bounded by the
-// item running). 7 / 8 / 9 duty 90 / 80 / 70 % (host idle KW_IDLE7, KW_IDLE8, 3/7 of a graph time after each graph); 12 device-paced
-// duty: each dummy graph is followed on the stream by pause kernels (one 32-thread block sleeping on the global timer, <= 500 us
-// each) for KW_PAUSE12 graph times, two items in flight as load 1; 13 load 1 with every dummy buffer (inputs, workspaces,
-// output, both chains) a view of one KW13_MB physical chunk: one cuMemCreate handle mapped at every KW13_MB step of one
-// reserved VA range of the full dummy size, so the kernels, grids and occupancy are the production ones while the whole
-// load stays resident in L2 (racing writes between the chains are fine: private, discarded). Failure -> load 1 ("kw:alias"); 10 enter-then-hold:
-// load 1 for the first 2 s after every (re)start, then 4; 11 periodic: load 1 for 1 s of every 3 s, 4 in between.
-// The lifecycle above is the same for every load. Level (KA_DEFAULT below, FHERMA_KA=<0..3> overrides; same lifecycle at every
+// falls back to the spin ("kw:graph"). The lifecycle above is the same for every load. Level (KA_DEFAULT below, FHERMA_KA=<0..3> overrides; same lifecycle at every
 // level): 0 off, 1 one 32-thread block, 2 one 32-thread block per SM, 3 four 256-thread blocks per SM. Any failure
 // (kernel JIT, stream, events, thread, launch, stop timeout) leaves it off and is named in the tabs line ("ka" =
 // level in use, "kaw" = longest stop wait in fherma_h2d in microseconds, "kw" = warm load in use, "kwg" = one dummy
@@ -67,26 +57,11 @@
 #include <condition_variable>
 #include <functional>
 #include <atomic>
-#include <sched.h>
 #ifndef KA_DEFAULT
 #define KA_DEFAULT 3
 #endif
 #ifndef KW_LOAD
-#define KW_LOAD 13   // production warm load from the end of fherma_init (1 = candidate 15; 7 duty90, 8 duty80, 12 device-paced duty,
-                     // 13 = load 1 resident in L2: every dummy buffer aliased onto one KW13_MB physical chunk)
-#endif
-#ifndef KW_IDLE7
-#define KW_IDLE7 (1.0/9.0)   // load 7: host idle after each dummy graph, in graph times (one line)
-#endif
-#ifndef KW_IDLE8
-#define KW_IDLE8 0.25         // load 8: the same
-#endif
-#ifndef KW13_MB
-#define KW13_MB 8   // load 13: physical footprint of the whole dummy pipeline in MB (rounded to the VMM granularity)
-#endif
-#ifndef KW_PAUSE12
-#define KW_PAUSE12 0.5        // load 12: device-side pause after each dummy graph, in graph times (pause kernels <= 500 us queued
-                              // behind the graph: no host wake-up in the cycle, so the duty is exact: 1 / (1 + KW_PAUSE12))
+#define KW_LOAD 1
 #endif
 #include <cmath>
 #ifndef PIN_DEFAULT
@@ -219,7 +194,7 @@ struct Cuda {
     std::unique_ptr<L2RootCachePolicy> root_cache;
     CUfunction prepare,forward,pointwise,inverse,finish,reconstruct,transpose_inputs,transpose_output,reconstruct_explicit,middle_local,inverse_finish,fourstep_forward,fourstep_middle,fourstep_inverse;
     CUfunction weighted_prepare,weighted_forward,weighted_middle,weighted_inverse,reconstruct_weighted8,reconstruct_weighted8_subwarp16;
-    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_first_xt=nullptr,bpo_first_xr=nullptr,bpo_first_xz=nullptr,bpo_middle_r16zb=nullptr,bpo_last_cm3tb=nullptr,bpo_first_xzp=nullptr,bpo_middle_r16zm=nullptr,bpo_last_cm3tp=nullptr,bpo_crt_leanp=nullptr,bpo_pdl_cmp=nullptr,bpo_middle_r16m=nullptr,bpo_middle_r16c=nullptr,bpo_middle_r16z=nullptr,bpo_last_cm3f=nullptr,bpo_last_cm3t=nullptr,bpo_t1_init=nullptr,bpo_r16x_init=nullptr,bpo_ftab_init=nullptr,bpo_p3crt_x=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
+    CUfunction batched_prepfwd=nullptr,batched_forward=nullptr,batched_inverse=nullptr,batched_middle=nullptr,batched_crt=nullptr,batched_prepare2=nullptr,batched_prepare3=nullptr,batched_crt_tc=nullptr,batched_prepare_tc=nullptr,batched_prepfwd_tc=nullptr,bpo_first=nullptr,bpo_middle=nullptr,bpo_last=nullptr,bpo_last_cm=nullptr,bpo_crt_cm=nullptr,bpo_crt_tc_cm=nullptr,bpo_crt_lean=nullptr,bpo_first_tc=nullptr,bpo_first_tcp=nullptr,bpo_last_cm2=nullptr,bpo_middle_db=nullptr,bpo_first_tc2=nullptr,bpo_first_tc3=nullptr,bpo_middle_smr=nullptr,bpo_last_cm3=nullptr,bpo_first_tc2n=nullptr,bpo_first_tc2g=nullptr,bpo_p1a=nullptr,bpo_p1b=nullptr,bpo_first_x=nullptr,bpo_first_xv=nullptr,bpo_last_cm3v=nullptr,bpo_middle_smrv=nullptr,bpo_crt_tc_cmv=nullptr,bpo_first_w=nullptr,bpo_middle_r16=nullptr,bpo_last_r16=nullptr,bpo_middle_r16x=nullptr,bpo_fxt_init=nullptr,bpo_first_xt=nullptr,bpo_first_xr=nullptr,bpo_first_xz=nullptr,bpo_middle_r16zb=nullptr,bpo_last_cm3tb=nullptr,bpo_first_xzp=nullptr,bpo_middle_r16zm=nullptr,bpo_last_cm3tp=nullptr,bpo_crt_leanp=nullptr,bpo_crt_l1=nullptr,bpo_crt_l2=nullptr,bpo_crt_l4=nullptr,bpo_crt_l7=nullptr,bpo_pdl_cmp=nullptr,bpo_middle_r16m=nullptr,bpo_middle_r16c=nullptr,bpo_middle_r16z=nullptr,bpo_last_cm3f=nullptr,bpo_last_cm3t=nullptr,bpo_t1_init=nullptr,bpo_r16x_init=nullptr,bpo_ftab_init=nullptr,bpo_p3crt_x=nullptr,batched_prepare_fused,transpose_inputs_columns,weighted_prepare_columns,weighted_forward_columns,weighted_inverse_columns,reconstruct_weighted8_subwarp16_columns;
     void getfn(CUfunction* f,CUmodule m,const char* name){CUresult r=cuModuleGetFunction(f,m,name);if(r==CUDA_ERROR_NOT_FOUND){*f=nullptr;return;}check(r);kp.add_name(*f,name);}
     void check(CUresult r){if(r!=CUDA_SUCCESS){const char* message=nullptr;cuGetErrorString(r,&message);throw std::runtime_error(message?message:"CUDA error");}}
     void rcheck(nvrtcResult r){if(r!=NVRTC_SUCCESS)throw std::runtime_error("NVRTC error "+std::to_string(int(r)));}
@@ -248,7 +223,7 @@ struct Cuda {
         getfn(&batched_prepare_fused,module,"batched_prepare_fused");
         getfn(&batched_middle,module,"batched_middle");
         getfn(&batched_forward,module,"batched_forward");getfn(&batched_inverse,module,"batched_inverse");
-        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_first_xt,module,"bpo_first_xt");getfn(&bpo_first_xr,module,"bpo_first_xr");getfn(&bpo_first_xz,module,"bpo_first_xz");getfn(&bpo_middle_r16zb,module,"bpo_middle_r16zb");getfn(&bpo_last_cm3tb,module,"bpo_last_cm3tb");getfn(&bpo_first_xzp,module,"bpo_first_xzp");getfn(&bpo_middle_r16zm,module,"bpo_middle_r16zm");getfn(&bpo_last_cm3tp,module,"bpo_last_cm3tp");getfn(&bpo_crt_leanp,module,"bpo_crt_leanp");getfn(&bpo_pdl_cmp,module,"bpo_pdl_cmp");getfn(&bpo_middle_r16m,module,"bpo_middle_r16m");getfn(&bpo_middle_r16c,module,"bpo_middle_r16c");getfn(&bpo_middle_r16z,module,"bpo_middle_r16z");getfn(&bpo_last_cm3f,module,"bpo_last_cm3f");getfn(&bpo_last_cm3t,module,"bpo_last_cm3t");getfn(&bpo_t1_init,module,"bpo_t1_init");getfn(&bpo_r16x_init,module,"bpo_r16x_init");getfn(&bpo_ftab_init,module,"bpo_ftab_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");}
+        if(g_kernel_prefix.find("BCRT_W")!=std::string::npos){getfn(&batched_crt,module,"batched_crt");getfn(&batched_prepare2,module,"batched_prepare2");getfn(&batched_prepare3,module,"batched_prepare3");getfn(&batched_crt_tc,module,"batched_crt_tc");getfn(&batched_prepare_tc,module,"batched_prepare_tc");getfn(&batched_prepfwd_tc,module,"batched_prepfwd_tc");getfn(&batched_prepfwd,module,"batched_prepfwd");getfn(&bpo_first,module,"bpo_first");getfn(&bpo_middle,module,"bpo_middle");getfn(&bpo_last,module,"bpo_last");getfn(&bpo_last_cm,module,"bpo_last_cm");getfn(&bpo_crt_cm,module,"bpo_crt_cm");getfn(&bpo_crt_tc_cm,module,"bpo_crt_tc_cm");getfn(&bpo_crt_lean,module,"bpo_crt_lean");getfn(&bpo_first_tc,module,"bpo_first_tc");getfn(&bpo_first_tcp,module,"bpo_first_tcp");getfn(&bpo_last_cm2,module,"bpo_last_cm2");getfn(&bpo_middle_db,module,"bpo_middle_db");getfn(&bpo_first_tc2,module,"bpo_first_tc2");getfn(&bpo_first_tc3,module,"bpo_first_tc3");getfn(&bpo_middle_smr,module,"bpo_middle_smr");getfn(&bpo_last_cm3,module,"bpo_last_cm3");getfn(&bpo_first_tc2n,module,"bpo_first_tc2n");getfn(&bpo_first_tc2g,module,"bpo_first_tc2g");getfn(&bpo_p1a,module,"bpo_p1a");getfn(&bpo_first_x,module,"bpo_first_x");getfn(&bpo_first_xv,module,"bpo_first_xv");getfn(&bpo_last_cm3v,module,"bpo_last_cm3v");getfn(&bpo_middle_smrv,module,"bpo_middle_smrv");getfn(&bpo_crt_tc_cmv,module,"bpo_crt_tc_cmv");getfn(&bpo_first_w,module,"bpo_first_w");getfn(&bpo_p1b,module,"bpo_p1b");getfn(&bpo_middle_r16,module,"bpo_middle_r16");getfn(&bpo_last_r16,module,"bpo_last_r16");getfn(&bpo_middle_r16x,module,"bpo_middle_r16x");getfn(&bpo_fxt_init,module,"bpo_fxt_init");getfn(&bpo_first_xt,module,"bpo_first_xt");getfn(&bpo_first_xr,module,"bpo_first_xr");getfn(&bpo_first_xz,module,"bpo_first_xz");getfn(&bpo_middle_r16zb,module,"bpo_middle_r16zb");getfn(&bpo_last_cm3tb,module,"bpo_last_cm3tb");getfn(&bpo_first_xzp,module,"bpo_first_xzp");getfn(&bpo_middle_r16zm,module,"bpo_middle_r16zm");getfn(&bpo_last_cm3tp,module,"bpo_last_cm3tp");getfn(&bpo_crt_leanp,module,"bpo_crt_leanp");getfn(&bpo_crt_l1,module,"bpo_crt_l1");getfn(&bpo_crt_l2,module,"bpo_crt_l2");getfn(&bpo_crt_l4,module,"bpo_crt_l4");getfn(&bpo_crt_l7,module,"bpo_crt_l7");getfn(&bpo_pdl_cmp,module,"bpo_pdl_cmp");getfn(&bpo_middle_r16m,module,"bpo_middle_r16m");getfn(&bpo_middle_r16c,module,"bpo_middle_r16c");getfn(&bpo_middle_r16z,module,"bpo_middle_r16z");getfn(&bpo_last_cm3f,module,"bpo_last_cm3f");getfn(&bpo_last_cm3t,module,"bpo_last_cm3t");getfn(&bpo_t1_init,module,"bpo_t1_init");getfn(&bpo_r16x_init,module,"bpo_r16x_init");getfn(&bpo_ftab_init,module,"bpo_ftab_init");getfn(&bpo_p3crt_x,module,"bpo_p3crt_x");}
         getfn(&transpose_inputs_columns,module,"transpose_inputs_columns");
         getfn(&weighted_prepare_columns,module,"weighted_prepare_columns");
         getfn(&weighted_forward_columns,module,"weighted_forward_columns");
@@ -393,19 +368,14 @@ struct State {
     ~State(){
         if(cuda){try{run_rb();}catch(const std::exception& e){std::printf("{\"diag\":\"rb\",\"err\":\"%.120s\"}\n",e.what());}}
         if(cuda){try{run_pdl();}catch(const std::exception& e){std::printf("{\"diag\":\"pdl\",\"err\":\"%.120s\"}\n",e.what());}}
-        if(cuda){try{run_cs();}catch(const std::exception& e){std::printf("{\"diag\":\"cs\",\"err\":\"%.120s\"}\n",e.what());}nv_ext=false;}
-        if(cuda){try{run_sp();}catch(const std::exception& e){std::printf("{\"diag\":\"sp\",\"err\":\"%.120s\"}\n",e.what());}nv_ext=false;}
-        if(cuda){try{run_lr();}catch(const std::exception& e){std::printf("{\"diag\":\"lr\",\"err\":\"%.120s\"}\n",e.what());}nv_ext=false;}
         if(cuda)ka_close();
         if(cuda)cuda->kp.report();
         if(ht_run.on&&ht_run.c)std::fprintf(stderr,"{\"hostt\":true,\"n\":%d,\"stage\":%d,\"crew\":%u,\"chunk_mb\":%zu,\"run_pre_us\":%.1f,\"launch_us\":%.1f,\"out_us\":%.1f,\"sync_us\":%.1f,\"run_us\":%.1f,\"h2d_us\":%.0f,\"d2h_us\":%.0f,\"h2d_cp\":%.0f,\"h2d_wait\":%.0f,\"d2h_cp\":%.0f,\"d2h_wait\":%.0f}\n",
             ht_run.c,int(stg.ok),stg.crew?stg.crew->size():0u,stg.chunk>>20,ht_run.med(0),ht_run.med(1),ht_run.med(2),ht_run.med(3),ht_run.med(4),ht_hook.med(0),ht_hook.med(1),ht_hook.med(2),ht_hook.med(3),ht_hook.med(4),ht_hook.med(5));
         free_stage();
-        {auto eel=cuda?cuda->driver.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2"):nullptr;if(cuda&&!eel)eel=cuda->driver.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
-         for(u32 i=0;i<std::min(cs_n,CS_MAX);++i){float ms=-1;if(!(sp_ok&&eel&&sp_ev[i][0]&&eel(&ms,sp_ev[i][0],sp_ev[i][1])==CUDA_SUCCESS))ms=-1;const double dv=ms>=0?ms*1000.0:-1.0;
-          std::printf("{\"diag\":\"case\",\"i\":%u,\"body\":%.0f,\"launch_us\":%.1f,\"dev_us\":%.1f,\"tail_us\":%.1f,\"rec0_us\":%.1f,\"rec1_us\":%.1f,\"cpu\":%d,\"nv\":%d,\"W\":%.1f,\"kaw\":%.0f}\n",i,cs_body[i],cs_launch[i],dv,dv>=0?cs_r14[i]-dv:-1.0,sp_ok?cs_rec[i]:-1.0f,sp_ok?cs_rec1[i]:-1.0f,cs_cpu[i],cs_nv[i],cs_w[i]>=0?cs_w[i]/1000.0:-1.0,cs_kaw[i]);}}
+        for(u32 i=0;i<std::min(cs_n,CS_MAX);++i)std::printf("{\"diag\":\"case\",\"i\":%u,\"body\":%.0f,\"nv\":%d,\"W\":%.1f,\"kaw\":%.0f}\n",i,cs_body[i],cs_nv[i],cs_w[i]>=0?cs_w[i]/1000.0:-1.0,cs_kaw[i]);
         if(cs_n>CS_MAX)std::printf("{\"diag\":\"case\",\"more\":%u}\n",cs_n-CS_MAX);
-        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"p1lz\":%d,\"p2lz\":%d,\"pdl\":%d,\"lzm\":%d,\"rb2\":%d,\"rb3\":%d,\"sgn\":%d,\"pin\":%d,\"ka\":%d,\"kaw\":%.0f,\"kw\":%d,\"kwg\":%.0f,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,int(((run_v>=0?lz_var[run_v]:lz_mark)&1u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&2u)!=0),run_v>=0?int(pdl_var[run_v]):0,int(((run_v>=0?lz_var[run_v]:lz_mark)&4u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&8u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&16u)!=0),int(sgn_on),pin_ok?pin_pat:0,ka_used,ka_wmax,ka_used?kw_load:0,kw_g_us,tabs_ms,tabs_why.c_str());
+        if(tabs_done&&tabs_any)std::printf("{\"diag\":\"tabs\",\"p1tw\":%d,\"p1rev\":%d,\"p2mt\":%d,\"p2cu\":%d,\"p3f\":%d,\"p3t2\":%d,\"p1lz\":%d,\"p2lz\":%d,\"pdl\":%d,\"lzm\":%d,\"rb2\":%d,\"rb3\":%d,\"sgn\":%d,\"crtl\":%d,\"pin\":%d,\"ka\":%d,\"kaw\":%.0f,\"kw\":%d,\"kwg\":%.0f,\"ms\":%.2f,\"fallback\":\"%.120s\"}\n",int(p1tw_t1!=0),int(p1rev_ok),int(p2mt_r16x!=0),int(p2cu_ok),int(p3f_ftab!=0),p3t2_ok?int(p3cb_env()):0,int(((run_v>=0?lz_var[run_v]:lz_mark)&1u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&2u)!=0),run_v>=0?int(pdl_var[run_v]):0,int(((run_v>=0?lz_var[run_v]:lz_mark)&4u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&8u)!=0),int(((run_v>=0?lz_var[run_v]:lz_mark)&16u)!=0),int(sgn_on),((run_v>=0?lz_var[run_v]:lz_mark)&32u)?int(crtl_m):0,pin_ok?pin_pat:0,ka_used,ka_wmax,ka_used?kw_load:0,kw_g_us,tabs_ms,tabs_why.c_str());
         if(prof){pcalls/= (bcount?bcount:1);prof_report();}
         // Destroy graphs before retiring their registered host storage.
         column_pipeline.reset();
@@ -439,7 +409,8 @@ struct State {
     // Barrett shift BPO_MIXED). FHERMA_NO_H30=1: the previous all-31-bit prime set (loose bound, F = 46).
     bool h30=!std::getenv("FHERMA_NO_H30");u32 nh30=0;
     u32 root_stride_host=0;bool weighted=false;u32 short_words=0,digit_terms=0,weighted_middle_threads=128;
-    CUdeviceptr weighted_twist,positions,corrections,bias,tc_bfrag=0,tc_bpt=0,tc_rtw=0,r16tab=0,fxt=0,stage_tw=0,stage_itw=0,t2n=0,t2nM=0,t2nO=0,t2nMO=0,ctab=0,ctab_wl=0,tc_bpt_wl=0,p1tw_t1=0,p2mt_r16x=0,p3f_ftab=0;bool p2cu_ok=false,p1rev_ok=false,p3t2_ok=false,p1lz_on=false,p2lz_on=false;u32 lz_mark=0,lz_var[8]{};u32 pdl_m=0,pdl_var[8]{};int pdl_i=-1;bool lzm_on=false,rb2_on=false,rb3_on=false,sgn_on=false;std::vector<CUgraphNode> pn_p1,pn_p3,pn_crt;int run_v=-1;std::vector<u32> tc_bfrag_host,tc_bpt_host;std::vector<u64> tc_rtw_host;
+    CUdeviceptr weighted_twist,positions,corrections,bias,tc_bfrag=0,tc_bpt=0,tc_rtw=0,r16tab=0,fxt=0,stage_tw=0,stage_itw=0,t2n=0,t2nM=0,t2nO=0,t2nMO=0,ctab=0,ctab_wl=0,tc_bpt_wl=0,p1tw_t1=0,p2mt_r16x=0,p3f_ftab=0;bool p2cu_ok=false,p1rev_ok=false,p3t2_ok=false,p1lz_on=false,p2lz_on=false;u32 lz_mark=0,lz_var[8]{};u32 crtl_m=0;   // crtl: CRT twin mask in use (0 = bpo_crt_lean)
+    CUfunction crtl_fn(u32 m)const{auto& d=*cuda;return m==1u?d.bpo_crt_l1:m==2u?d.bpo_crt_l2:m==4u?d.bpo_crt_l4:m==7u?d.bpo_crt_l7:nullptr;}u32 pdl_m=0,pdl_var[8]{};int pdl_i=-1;bool lzm_on=false,rb2_on=false,rb3_on=false,sgn_on=false;std::vector<CUgraphNode> pn_p1,pn_p3,pn_crt;int run_v=-1;std::vector<u32> tc_bfrag_host,tc_bpt_host;std::vector<u64> tc_rtw_host;
     // sgn (candidate 15): balanced digits + 15 lazy primes. Any setup failure re-runs the whole init with the candidate 14
     // prime set and kernels (tabs fallback "sgn:pre"), never a mix.
     void sgn_reset(){cuda.reset();tabs_done=tabs_any=false;tabs_why.clear();tabs_ms=0;p1tw_t1=p2mt_r16x=p3f_ftab=0;
@@ -962,7 +933,7 @@ struct State {
             else if(g2<pg){for(u32 s0=r0;s0<r0+pg;s0+=g2)p23(s0,g2,wsG[cur_ws]);}else p23(r0,pg,Cg);
         }
         if(!(sm&32)){}else if(fxon)d.launch3(d.bpo_p3crt_x,8u,256u,1u,64u,C,out,tc_bfrag,r16tab,t2nM,n,delta);
-        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&!std::getenv("FHERMA_NO_CRTPF");d.launch(d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?((pdl_m&3u)&&d.bpo_crt_leanp?d.bpo_crt_leanp:d.bpo_crt_lean):d.bpo_crt_tc_cm,n/128,1,A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(std::getenv("FHERMA_CRTPF_ITEMS")?u32(std::atoi(std::getenv("FHERMA_CRTPF_ITEMS"))):3u*p1_grid/4,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}   // default (pv44 sweep x:crt=pf 0.983; items = 3*p1_grid/4 capped at 2 cols (pv61 whole-batch pf3q 0.994 vs p1_grid/2; FHERMA_CRTPF_ITEMS=n overrides): L2 prefetch of the next same-chain product's P1 input; none for the last product of each chain (next_a=0); FHERMA_NO_CRTPF=1 off
+        else if(po==2&&d.bpo_crt_tc_cm&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT")){const bool pf=pox&&next_a&&!off(1)&&!std::getenv("FHERMA_NO_CRTPF");d.launch(d.bpo_crt_lean&&!std::getenv("FHERMA_CRT_OLD")?((pdl_m&3u)&&d.bpo_crt_leanp?d.bpo_crt_leanp:crtl_m&&crtl_fn(crtl_m)?(lz_mark|=32u,crtl_fn(crtl_m)):d.bpo_crt_lean):d.bpo_crt_tc_cm,n/128,1,A,out,tc_bfrag,n,delta,pf?next_a:CUdeviceptr(0),pf?next_b:CUdeviceptr(0),pf?std::min(std::getenv("FHERMA_CRTPF_ITEMS")?u32(std::atoi(std::getenv("FHERMA_CRTPF_ITEMS"))):3u*p1_grid/4,2u*cols):0u,u32(l2on&&(l2f&8)?1u:0u)|u32(l2on&&(l2f&16)?2u:0u));}   // default (pv44 sweep x:crt=pf 0.983; items = 3*p1_grid/4 capped at 2 cols (pv61 whole-batch pf3q 0.994 vs p1_grid/2; FHERMA_CRTPF_ITEMS=n overrides): L2 prefetch of the next same-chain product's P1 input; none for the last product of each chain (next_a=0); FHERMA_NO_CRTPF=1 off
         else if(po==2)d.launch(d.bpo_crt_cm,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));
         else if(d.batched_crt_tc&&tc_bfrag&&!std::getenv("FHERMA_OLD_TCCRT"))d.launch(d.batched_crt_tc,n/128,1,A,out,tc_bfrag,n,delta);
         else d.launch(d.batched_crt,n/128,1,A,out,p,mu,crt_matrix,corrections,qmod,bias,n,delta,u64(0),u64(0));mark(5);
@@ -1030,10 +1001,9 @@ struct State {
     static constexpr int RB3_DEFAULT=0;      // P3 pipe rebalance (kernel bpo_last_cm3tb = cm3t with J-DIT / R-DIT sums as IMAD); FHERMA_RB3=0/1; tabs "rb3"
     static constexpr int SGN_DEFAULT=1;      // candidate 15: balanced digits, 15 primes < 2^30 + one 31-bit (FHERMA_SGN=0: candidate 14 prime set); tabs "sgn"
     static constexpr bool RBDIAG_DEFAULT=false;   // rb exit diag (FHERMA_RBDIAG=0/1 overrides)
-    static constexpr bool SPLIT_DEFAULT=true;     // body split events per call (FHERMA_SPLIT=0 off)
-    static constexpr bool SPDIAG_DEFAULT=true;    // ramp discriminator exit diag (FHERMA_SPDIAG=0/1; FHERMA_SP_N / _W / _AB)
-    static constexpr bool CSDIAG_DEFAULT=false;    // cold-start warm-load exit diag (FHERMA_CSDIAG=0/1; FHERMA_CS_LOADS / _IDLE / _W / _N / _MAX)
-    static constexpr bool LRDIAG_DEFAULT=false;    // long-run drift exit diag (FHERMA_LRDIAG=0/1 overrides; FHERMA_LR_W / _A / _B / _MAX tune it)
+    static constexpr u32 CRTL_DEFAULT=0;      // CRT shared-memory instruction diet (batched_crt_lean.cuh crtl block): mask 1 FR fragment LDS.128, 2 ST stage STS.64,
+                                              // 4 BQ B-fragment LDS.128; twins exist for 1, 2, 4, 7; FHERMA_CRTL=m overrides; tabs "crtl" = mask that ran
+    static constexpr bool CLDIAG_DEFAULT=true;    // cl exit diag (crtl twins against production; FHERMA_CLDIAG=0/1 overrides)
     static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4|128;   // 128 (default, pv61 whole-batch p3el 0.986 / combo2 p3el+pf3q 0.979 on target): group-0 P3 residue stores evict_last (the CRT reads group 0 from L2; adds BPO_P3EL to the module); FHERMA_NO_P3EL=1 off   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
     int big_cache=-1;
     bool big_part(){if(big_cache>=0)return big_cache!=0;if(const char* e=std::getenv("FHERMA_BIG")){big_cache=*e=='1';return big_cache!=0;}
@@ -1077,15 +1047,6 @@ struct State {
     // candidate 13 evidence: last NVML sample (SM MHz, board mW; -1 none) written by the keep-warm thread; per-call records
     std::atomic<int> nv_mhz{-1},nv_mw{-1};void* nv_lib=nullptr;void* nv_dev=nullptr;int (*nv_clock)(void*,int,unsigned*)=nullptr;int (*nv_power)(void*,unsigned*)=nullptr;int (*nv_shut)()=nullptr;
     static constexpr u32 CS_MAX=40;u32 cs_n=0;float cs_body[CS_MAX]{},cs_kaw[CS_MAX]{};int cs_nv[CS_MAX]{},cs_w[CS_MAX]{};
-    // body split (SPLIT_DEFAULT / FHERMA_SPLIT): per call two timing events on the graph stream (before / after the launch, read at
-    // exit), host launch time, launch-to-sync time and the record cost; cpu = sched_getcpu() after the sync
-    CUevent sp_ev[CS_MAX][2]{};std::chrono::steady_clock::time_point sp_ta[CS_MAX]{};bool sp_ok=false;float cs_launch[CS_MAX]{},cs_r14[CS_MAX]{},cs_rec[CS_MAX]{},cs_rec1[CS_MAX]{};int cs_cpu[CS_MAX]{};
-    void sp_init(){if(!lever_env("FHERMA_SPLIT",SPLIT_DEFAULT)||!cuda)return;auto ec=cuda->driver.get<decltype(&::cuEventCreate)>("cuEventCreate");if(!ec)return;
-        for(u32 i=0;i<CS_MAX;++i)for(int j=0;j<2;++j)if(ec(&sp_ev[i][j],0)!=CUDA_SUCCESS){sp_ev[i][j]=nullptr;return;}
-        auto er=cuda->driver.get<decltype(&::cuEventRecord)>("cuEventRecord");if(!er||!graph_stream)return;   // pre-touch: the first record of a fresh event allocates lazily
-        for(u32 i=0;i<CS_MAX;++i)for(int j=0;j<2;++j)if(er(sp_ev[i][j],graph_stream)!=CUDA_SUCCESS)return;
-        if(cuda->cuCtxSynchronize()!=CUDA_SUCCESS)return;sp_ok=true;}
-
     void nv_open(){   // NVML by dlopen (absent / failing: samples stay -1, nothing else changes)
         try{nv_lib=dlopen("libnvidia-ml.so.1",RTLD_NOW|RTLD_LOCAL);if(!nv_lib){return;}
             auto ini=reinterpret_cast<int(*)()>(dlsym(nv_lib,"nvmlInit_v2"));auto bus=reinterpret_cast<int(*)(const char*,void**)>(dlsym(nv_lib,"nvmlDeviceGetHandleByPciBusId_v2"));
@@ -1097,48 +1058,19 @@ struct State {
             if(!(bus&&pci&&cuda->cuDeviceGet(&dev,0)==CUDA_SUCCESS&&pci(id,31,dev)==CUDA_SUCCESS&&bus(id,&nv_dev)==0)){if(!idx||idx(0,&nv_dev)!=0){nv_dev=nullptr;}}
         }catch(...){nv_dev=nullptr;}}
     void nv_sample(){unsigned c=0,w=0;if(!nv_dev||!nv_clock){return;}if(nv_clock(nv_dev,1,&c)==0){nv_mhz.store(int(c),std::memory_order_relaxed);}   // 1 = NVML_CLOCK_SM
-        if(nv_power&&nv_power(nv_dev,&w)==0)nv_mw.store(int(w),std::memory_order_relaxed);
-        if(nv_ext.load(std::memory_order_relaxed))nv_sample_ext();}
-    // lr diag only (nv_ext set by run_lr at exit): extra NVML reads in the same sampling point (keep-warm thread, ~100 ms)
-    std::atomic<bool> nv_ext{false};std::atomic<int> nv_temp{-1},nv_fan{-1},nv_plim{-1},nv_pst{-1},nv_mem{-1};std::atomic<long long> nv_thr{-1};std::atomic<unsigned long long> nv_thr_or{0};
-    int (*nv_tempf)(void*,int,unsigned*)=nullptr;int (*nv_fanf)(void*,unsigned*)=nullptr;int (*nv_thrf)(void*,unsigned long long*)=nullptr;int (*nv_plimf)(void*,unsigned*)=nullptr;
-    int (*nv_pstf)(void*,int*)=nullptr;struct NvViol{unsigned long long ref,viol;};int (*nv_violf)(void*,int,NvViol*)=nullptr;bool nv_ext_ok=false;
-    struct NvField{unsigned id,scope;long long ts,lat;int vtype,ret;unsigned char v[8];};int (*nv_utilf)(void*,unsigned*)=nullptr;int (*nv_fieldf)(void*,int,NvField*)=nullptr;
-    std::atomic<int> nv_ugpu{-1},nv_umem{-1},nv_mtemp{-1};
-    void nv_ext_open(){if(nv_ext_ok||!nv_lib)return;nv_ext_ok=true;
-        nv_tempf=reinterpret_cast<int(*)(void*,int,unsigned*)>(dlsym(nv_lib,"nvmlDeviceGetTemperature"));nv_fanf=reinterpret_cast<int(*)(void*,unsigned*)>(dlsym(nv_lib,"nvmlDeviceGetFanSpeed"));
-        nv_thrf=reinterpret_cast<int(*)(void*,unsigned long long*)>(dlsym(nv_lib,"nvmlDeviceGetCurrentClocksEventReasons"));
-        if(!nv_thrf)nv_thrf=reinterpret_cast<int(*)(void*,unsigned long long*)>(dlsym(nv_lib,"nvmlDeviceGetCurrentClocksThrottleReasons"));
-        nv_plimf=reinterpret_cast<int(*)(void*,unsigned*)>(dlsym(nv_lib,"nvmlDeviceGetEnforcedPowerLimit"));nv_pstf=reinterpret_cast<int(*)(void*,int*)>(dlsym(nv_lib,"nvmlDeviceGetPerformanceState"));
-        nv_violf=reinterpret_cast<int(*)(void*,int,NvViol*)>(dlsym(nv_lib,"nvmlDeviceGetViolationStatus"));
-        nv_utilf=reinterpret_cast<int(*)(void*,unsigned*)>(dlsym(nv_lib,"nvmlDeviceGetUtilizationRates"));nv_fieldf=reinterpret_cast<int(*)(void*,int,NvField*)>(dlsym(nv_lib,"nvmlDeviceGetFieldValues"));}
-    void nv_sample_ext(){unsigned v=0;int iv=0;unsigned long long r=0;
-        nv_temp.store(nv_tempf&&nv_tempf(nv_dev,0,&v)==0?int(v):-1);nv_fan.store(nv_fanf&&nv_fanf(nv_dev,&v)==0?int(v):-1);
-        nv_plim.store(nv_plimf&&nv_plimf(nv_dev,&v)==0?int(v):-1);nv_pst.store(nv_pstf&&nv_pstf(nv_dev,&iv)==0?iv:-1);
-        nv_mem.store(nv_clock&&nv_clock(nv_dev,2,&v)==0?int(v):-1);   // 2 = NVML_CLOCK_MEM
-        if(nv_thrf&&nv_thrf(nv_dev,&r)==0){nv_thr.store((long long)r);nv_thr_or.fetch_or(r);}else nv_thr.store(-1);
-        {unsigned u[2]{};if(nv_utilf&&nv_utilf(nv_dev,u)==0){nv_ugpu.store(int(u[0]));nv_umem.store(int(u[1]));}else{nv_ugpu.store(-1);nv_umem.store(-1);}}
-        {NvField fv{};fv.id=82u;int t=-1;   // 82 = NVML_FI_DEV_MEMORY_TEMP
-         if(nv_fieldf&&nv_fieldf(nv_dev,1,&fv)==0&&fv.ret==0){unsigned u32v=0;long long ll=0;double dd=0;std::memcpy(&u32v,fv.v,4);std::memcpy(&ll,fv.v,8);std::memcpy(&dd,fv.v,8);
-          t=fv.vtype==0?int(dd):(fv.vtype==1||fv.vtype==5)?int(u32v):int(ll);}nv_mtemp.store(t);}}
-    long long nv_viol(int t){NvViol x{};if(!nv_dev||!nv_violf||nv_violf(nv_dev,t,&x)!=0)return -1;return (long long)x.viol;}   // ns; 0 power, 1 thermal
+        if(nv_power&&nv_power(nv_dev,&w)==0)nv_mw.store(int(w),std::memory_order_relaxed);}
     std::atomic<int> ka_wl{0};int kw_load=0;CUgraphExec kw_g=nullptr;double kw_g_us=0;size_t kw_bytes=0;u32 kw_n=0;   // warm load (candidate 12b)
-CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_fn=nullptr,kw_pf=nullptr;int ka_sms=1;
-    // duty instrumentation (loads 4-11 host-idle duty): cycles, launch-to-completion (busy), actual idle, cycle time (us sums)
-    std::atomic<long long> kd_n{0},kd_busy{0},kd_idle{0},kd_cyc{0};
+CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_fn=nullptr;int ka_sms=1;
     bool ka_prepare(){
         auto& d=*cuda;auto& D=d.driver;
         const char* src="extern \"C\" __global__ void ka_spin(long long cyc){const long long t0=clock64();unsigned x=threadIdx.x+blockIdx.x;\n"
-            "  while(clock64()-t0<cyc){x=x*1664525u+1013904223u;asm volatile(\"\"::\"r\"(x));}}\n"
-            "extern \"C\" __global__ void kw_pause(long long ns){unsigned long long t0,t;asm volatile(\"mov.u64 %0, %%globaltimer;\":\"=l\"(t0));\n"
-            "  do{__nanosleep(2000);asm volatile(\"mov.u64 %0, %%globaltimer;\":\"=l\"(t));}while((long long)(t-t0)<ns);}\n";
+            "  while(clock64()-t0<cyc){x=x*1664525u+1013904223u;asm volatile(\"\"::\"r\"(x));}}\n";
         if(ka_fail&512ul)src="ka_spin(";   // FHERMA_TABS_FAIL bit 512: forced JIT failure (fallback test)
         nvrtcProgram pg=nullptr;const char* opt[]={"--gpu-architecture=compute_80"};bool jit=false;
         if(d.nvrtcCreateProgram(&pg,src,"ka.cu",0,nullptr,nullptr)==NVRTC_SUCCESS){
             if(d.nvrtcCompileProgram(pg,1,opt)==NVRTC_SUCCESS){size_t sz=0;if(d.nvrtcGetPTXSize(pg,&sz)==NVRTC_SUCCESS&&sz){std::vector<char> ptx(sz);
                 if(d.nvrtcGetPTX(pg,ptx.data())==NVRTC_SUCCESS&&d.cuModuleLoadData(&ka_mod,ptx.data())==CUDA_SUCCESS){
-                    if(d.cuModuleGetFunction(&ka_fn,ka_mod,"ka_spin")==CUDA_SUCCESS)jit=true;else ka_fn=nullptr;
-                    if(jit&&d.cuModuleGetFunction(&kw_pf,ka_mod,"kw_pause")!=CUDA_SUCCESS)kw_pf=nullptr;}}}
+                    if(d.cuModuleGetFunction(&ka_fn,ka_mod,"ka_spin")==CUDA_SUCCESS)jit=true;else ka_fn=nullptr;}}}
             d.nvrtcDestroyProgram(&pg);}
         if(!jit){pin_why("ka:jit");return false;}
         {CUdevice dev=0;auto attr=D.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");if(d.cuDeviceGet(&dev,0)!=CUDA_SUCCESS||attr(&ka_sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev)!=CUDA_SUCCESS||ka_sms<1)ka_sms=1;}
@@ -1162,27 +1094,16 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         using clk=std::chrono::steady_clock;auto ms=[](clk::time_point t){return std::chrono::duration<double,std::milli>(clk::now()-t).count();};
         for(;;){
             {std::unique_lock<std::mutex> lk(ka_mx);ka_cv.wait(lk,[&]{return ka_quit.load()||ka_want.load();});if(ka_quit.load())break;}
-            unsigned k=0;bool bad=false;auto t0=clk::now();unsigned sg=0;auto tn=t0;int pz=0;long long pns=0;auto tprev=t0;bool hp=false;
+            unsigned k=0;bool bad=false;auto t0=clk::now();unsigned sg=0;auto tn=t0;
             for(;!ka_quit.load()&&(deaf||ka_want.load());++k){
                 const int L=kw_g?ka_wl.load():0;bool g=false;
-                if(L==12){g=kw_pf&&pz==0;}   // no pause kernel: the spin, never the full load
-                else if(L==1||L==4||L==5||L>=7){g=true;}
+                if(L==1||L==4){g=true;}
                 else if(L==2){if(sg==0&&ms(t0)>=45.0){sg=3;}if(sg){g=true;if(--sg==0){t0=clk::now();}}}
                 else if(L==3){g=std::fmod(ms(t0),1000.0)<800.0;}
-                else if(L==6){g=std::fmod(ms(t0),3000.0)<1000.0;}
-                const auto tl=clk::now();
-                CUresult r;
-                if(L==12&&!g&&kw_pf){const long long ns=std::min(pns,500000ll);pns-=ns;--pz;long long nsv=ns;void* pa[]={&nsv};r=d.cuLaunchKernel(kw_pf,1,1,1,32,1,1,0,ka_s,pa,nullptr);}
-                else{r=g?glc(kw_g,ka_s):d.cuLaunchKernel(ka_fn,gl,1,1,bx,1,1,0,ka_s,a,nullptr);
-                    if(L==12&&g&&kw_pf){pns=(long long)(KW_PAUSE12*kw_g_us*1000.0);pz=int((pns+499999)/500000);}}
+                const CUresult r=g?glc(kw_g,ka_s):d.cuLaunchKernel(ka_fn,gl,1,1,bx,1,1,0,ka_s,a,nullptr);
                 if(r!=CUDA_SUCCESS||er(ka_ev[k&1u],ka_s)!=CUDA_SUCCESS){bad=true;break;}
                 if(k>0&&es(ka_ev[(k-1)&1u])!=CUDA_SUCCESS){bad=true;break;}
-                {const double f=L==4?1.0:L==5?3.0:L==7?1.0/9.0:L==8?0.25:L==9?3.0/7.0:L==10?(ms(t0)<2000.0?0.0:1.0):L==11?(std::fmod(ms(t0),3000.0)<1000.0?0.0:1.0):0.0;
-                 if(f>0.0){if(es(ka_ev[k&1u])!=CUDA_SUCCESS){bad=true;break;}   // duty: idle f times this graph's own time (launch to completion), woken by a stop request
-                    const double busy=ms(tl);const auto ti=clk::now();
-                    {std::unique_lock<std::mutex> lk(ka_mx);ka_cv.wait_for(lk,std::chrono::microseconds(long(1000.0*busy*f)),[&]{return ka_quit.load()||!(deaf||ka_want.load());});}
-                    if(hp){kd_cyc+=(long long)(std::chrono::duration<double,std::micro>(tl-tprev).count());kd_n+=1;}
-                    kd_busy+=(long long)(busy*1000.0);kd_idle+=(long long)(ms(ti)*1000.0);tprev=tl;hp=true;}}
+                if(L==4){if(es(ka_ev[k&1u])!=CUDA_SUCCESS){bad=true;break;}std::this_thread::sleep_for(std::chrono::microseconds(long(kw_g_us)));}
                 if(ms(tn)>=100.0){nv_sample();tn=clk::now();}}   // candidate 13 evidence: NVML every ~100 ms while the load runs
             if(k>0)es(ka_ev[(k-1)&1u]);
             if(k>1)es(ka_ev[(k-2)&1u]);
@@ -1190,32 +1111,9 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             idle();}
         idle();}
     // the private dummy batch and its pipeline graph (warm loads 1-3): built at the end of build_graph (fherma_init)
-    // load 13: one physical chunk (kw13_p bytes, >= one VMM granule) mapped at every kw13_p step of one reserved VA range
-    CUdeviceptr kw13_va=0;size_t kw13_va_sz=0,kw13_p=0;CUmemGenericAllocationHandle kw13_h=0;size_t kw13_maps=0;
-    CUdeviceptr kw13_map(size_t total){
-        auto& d=*cuda;auto& D=d.driver;
-        auto gran=D.get<decltype(&::cuMemGetAllocationGranularity)>("cuMemGetAllocationGranularity");auto mc=D.get<decltype(&::cuMemCreate)>("cuMemCreate");
-        auto ar=D.get<decltype(&::cuMemAddressReserve)>("cuMemAddressReserve");auto mm=D.get<decltype(&::cuMemMap)>("cuMemMap");
-        auto sa=D.get<decltype(&::cuMemSetAccess)>("cuMemSetAccess");
-        if(!gran||!mc||!ar||!mm||!sa)throw std::runtime_error("kw13:vmm");
-        CUdevice dev=0;d.check(d.cuDeviceGet(&dev,0));
-        CUmemAllocationProp pr{};pr.type=CU_MEM_ALLOCATION_TYPE_PINNED;pr.location.type=CU_MEM_LOCATION_TYPE_DEVICE;pr.location.id=int(dev);
-        size_t g=0;d.check(gran(&g,&pr,CU_MEM_ALLOC_GRANULARITY_MINIMUM));if(!g)throw std::runtime_error("kw13:gran");
-        double mb=KW13_MB;if(const char* e=std::getenv("FHERMA_KW13_MB")){const double v=std::atof(e);if(v>0)mb=v;}
-        size_t P=size_t(mb*1048576.0)/g*g;if(P<g)P=g;if(l2_bytes&&P>size_t(l2_bytes)/2)P=std::max(g,size_t(l2_bytes)/2/g*g);
-        const size_t T=(total+P-1)/P*P;
-        d.check(mc(&kw13_h,P,&pr,0));kw13_p=P;
-        d.check(ar(&kw13_va,T,g,0,0));kw13_va_sz=T;
-        for(size_t o=0;o<T;o+=P){d.check(mm(kw13_va+o,P,0,kw13_h,0));++kw13_maps;}
-        CUmemAccessDesc ad{};ad.location=pr.location;ad.flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE;d.check(sa(kw13_va,T,&ad,1));
-        return kw13_va;}
-    void kw13_free(){auto& D=cuda->driver;auto um=D.get<decltype(&::cuMemUnmap)>("cuMemUnmap");auto af=D.get<decltype(&::cuMemAddressFree)>("cuMemAddressFree");
-        auto rl=D.get<decltype(&::cuMemRelease)>("cuMemRelease");
-        if(kw13_va&&um)for(size_t i=0;i<kw13_maps;++i)um(kw13_va+i*kw13_p,kw13_p);
-        if(kw13_va&&af)af(kw13_va,kw13_va_sz);if(kw13_h&&rl)rl(kw13_h);kw13_va=0;kw13_va_sz=0;kw13_p=0;kw13_h=0;kw13_maps=0;}
     void kw_build(){
         int ld=KW_LOAD;
-        if(const char* e=std::getenv("FHERMA_KW")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>13)pin_why("kw:env");else ld=int(v);}
+        if(const char* e=std::getenv("FHERMA_KW")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>3)pin_why("kw:env");else ld=int(v);}
         kw_load=0;ka_wl=0;if(ld==0)return;
         auto& d=*cuda;auto& D=d.driver;
         auto begin=D.get<decltype(&::cuStreamBeginCapture)>("cuStreamBeginCapture_v2");auto endc=D.get<decltype(&::cuStreamEndCapture)>("cuStreamEndCapture");
@@ -1227,23 +1125,17 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         auto restore=[&]{A=oA;B=oB;C=oC;for(int c=0;c<4;++c){wsA[c]=owA[c];wsB[c]=owB[c];wsC[c]=owC[c];wsG[c]=owG[c];wsG2[c]=owG2[c];wsT[c]=owT[c];}
             d.stream=graph_stream;cur_ws=0;next_a=next_b=0;pin_cur=-1;cuda->pre_launch=nullptr;cuda->post_launch=nullptr;
             l2on=false;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;};
-        for(;;){
-        bool capt=false;const bool al13=ld==13;CUdeviceptr vb=0;size_t vo=0;
+        bool capt=false;
         try{
             {const char* fe=std::getenv("FHERMA_TABS_FAIL");if(fe&&(std::strtoul(fe,nullptr,0)&4096ul))throw std::runtime_error("forced");}   // bit 4096: forced dummy-graph failure
-            if(al13&&std::getenv("FHERMA_KW13_FAIL"))throw std::runtime_error("forced13");   // forced load-13 failure (test of the load-1 fallback)
             const u32 DN=std::min(8u,bcount)&~1u;const u32 S=2;
             if(DN<2||!graph_execs[6]||!graph_stream||!chain_streams[1]||!begin||!endc||!inst||!glc||!ss)throw std::runtime_error("kw");
             const size_t stride=size_t(n)*l*4,wsb=size_t(k)*8*n*4,gb=size_t(l2g)*8*n*4;
-            auto rd=[](size_t z){return (z+4095)&~size_t(4095);};
-            if(al13){size_t tot=3*rd(DN*stride);for(u32 c=0;c<S;++c)tot+=3*rd(wsb)+(owG[c]&&gb?rd(gb):0);vb=kw13_map(tot);}
-            auto al=[&](size_t z)->CUdeviceptr{if(!al13)return d.alloc(z);const CUdeviceptr p=vb+vo;vo+=rd(z);if(vo>kw13_va_sz)throw std::runtime_error("kw13");return p;};
-            const CUdeviceptr pa=al(DN*stride),pb=al(DN*stride),po_=al(DN*stride);kw_bytes=3*DN*stride;
+            const CUdeviceptr pa=d.alloc(DN*stride),pb=d.alloc(DN*stride),po_=d.alloc(DN*stride);kw_bytes=3*DN*stride;
             CUdeviceptr pA[2],pB[2],pC[2],pG[2]{};
-            for(u32 c=0;c<S;++c){pA[c]=al(wsb);pB[c]=al(wsb);pC[c]=al(wsb);kw_bytes+=3*wsb;if(owG[c]&&gb){pG[c]=al(gb);kw_bytes+=gb;}}
-            if(al13){d.check(mset(vb,0,kw13_p));kw_bytes=kw13_p;}   // the whole VA range is views of this one chunk
-            else{for(CUdeviceptr x:{pa,pb,po_})d.check(mset(x,0,DN*stride));
-            for(u32 c=0;c<S;++c){d.check(mset(pA[c],0,wsb));d.check(mset(pB[c],0,wsb));d.check(mset(pC[c],0,wsb));if(pG[c])d.check(mset(pG[c],0,gb));}}
+            for(u32 c=0;c<S;++c){pA[c]=d.alloc(wsb);pB[c]=d.alloc(wsb);pC[c]=d.alloc(wsb);kw_bytes+=3*wsb;if(owG[c]&&gb){pG[c]=d.alloc(gb);kw_bytes+=gb;}}
+            for(CUdeviceptr x:{pa,pb,po_})d.check(mset(x,0,DN*stride));
+            for(u32 c=0;c<S;++c){d.check(mset(pA[c],0,wsb));d.check(mset(pB[c],0,wsb));d.check(mset(pC[c],0,wsb));if(pG[c])d.check(mset(pG[c],0,gb));}
             d.check(d.cuCtxSynchronize());
             A=pA[0];B=pB[0];C=pC[0];wsA[1]=pA[1];wsB[1]=pB[1];wsC[1]=pC[1];for(int c=0;c<4;++c){wsG[c]=c<2?pG[c]:0;wsG2[c]=0;wsT[c]=0;}
             l2on=l2g!=0;p23db_now=false;p1x=p1x_default();po=2;pox=true;xoff=0;   // as graph variant 6
@@ -1259,13 +1151,11 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             CUgraph g=nullptr;capt=false;d.check(endc(graph_stream,&g));const CUresult ir=inst(&kw_g,g,0);gdestroy(g);d.check(ir);
             restore();
             for(int r=0;r<3;++r){const auto t=std::chrono::steady_clock::now();d.check(glc(kw_g,graph_stream));d.check(ss(graph_stream));
-                const double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t).count();kw_g_us=r?std::min(kw_g_us,us):us;}   // min of 3
-            kw_n=DN;kw_load=ld;ka_wl=ld;return;
+                kw_g_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t).count();}
+            kw_n=DN;kw_load=ld;ka_wl=ld;
         }catch(...){
             if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}
-            restore();kw_g=nullptr;kw_load=0;ka_wl=0;
-            if(al13){d.cuCtxSynchronize();kw13_free();pin_why("kw:alias");ld=1;continue;}   // load 13 failed: load 1, never off
-            pin_why("kw:graph");return;}}}
+            restore();kw_g=nullptr;kw_load=0;ka_wl=0;pin_why("kw:graph");}}
     void ka_start(int lv){if(lv<=0||!ka_fn||ka_th.joinable())return;ka_quit=false;ka_err=false;ka_idle=true;ka_want=false;
         try{ka_th=std::thread([this,lv]{ka_loop(lv);});ka_level=lv;}catch(...){ka_level=0;pin_why("ka:thread");}}
     // stop and wait (bounded): first statement of fherma_h2d (rec = true: counts toward "kaw"); fherma_run entry path
@@ -1286,7 +1176,6 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         ka_level=0;}
     int ka_used=0;unsigned long ka_fail=0;
     void ka_init(){
-        sp_init();   // body-split events (init time)
         int lv=KA_DEFAULT;
         try{
             if(const char* e=std::getenv("FHERMA_KA")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>3)pin_why("ka:env");else lv=int(v);}
@@ -1337,7 +1226,9 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
          if(want&&(!d.bpo_last_cm3tb||(fail&262144)))why("rb3:jit");else rb3_on=want;}
         if(d.bpo_last_cm3f){if(!d.bpo_ftab_init||!itw||!p||n!=65536||(fail&4))why("p3f:pre");else p3f_ftab=make(d.bpo_ftab_init,256,k,256,size_t(k)*65536,itw,false,"p3f:cuda");}
         if(d.bpo_last_cm3t){if(!p3f_ftab||!d.bpo_last_cm3f||n!=65536||(n/256)%p3cb_env()||(fail&32))why("p3t2:pre");else p3t2_ok=true;}
-        if(rb3_on&&!p3t2_ok){why("rb3:pre");rb3_on=false;}   // rb3 needs the p3t2 launch   // p3t2: needs the p3f launch; grid cols / P3CB
+        if(rb3_on&&!p3t2_ok){why("rb3:pre");rb3_on=false;}
+        {const char* ce=std::getenv("FHERMA_CRTL");const u32 want=ce?u32(std::strtoul(ce,nullptr,0)):CRTL_DEFAULT;   // crtl (bit 2097152 forces crtl:jit)
+         crtl_m=0;if(want&&(!crtl_fn(want)||(fail&2097152ul)))why("crtl:jit");else crtl_m=want;}   // rb3 needs the p3t2 launch   // p3t2: needs the p3f launch; grid cols / P3CB
         tabs_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();}
     // ---- pdl: programmatic edges in graph variant 6 (FHERMA_PDL / PDL_DEFAULT; bit 1 P3(i, last group) -> CRT(i), bit 2
     // CRT(i) -> P1(i+S), the next same-chain product). During the capture pdl_hook() records the node of every twin launch
@@ -1517,190 +1408,6 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             gdestroy(g);if(ge){why="";}
         }catch(...){if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}ge=nullptr;}
         restore();return ge;}
-    // ---- sp diag (exit time; SPDIAG_DEFAULT, FHERMA_SPDIAG=0/1): which component carries the one-way ramp. FHERMA_SP_N trials
-    // (default 45) in the lr shape under the production load (kw1, FHERMA_SP_W s, default 3): stop and wait, staged h2d of the
-    // real cases, then
-    //   N rep (as fherma_run): event e0, cuGraphLaunch (host launch_us), event e1, sync: host span hs_us (e0 call to sync
-    //       return), dev_us = e1 - e0 (device + any wait for submission), tail_us = (e0 record call to sync return) - dev_us (>= the host-to-device latency of the record);
-    //   Q rep at once: a ~3 ms spin kernel holds the stream, e0, launch (fully submitted behind the spin), e1, sync:
-    //       qdev_us = e1 - e0 = pure device time.
-    // Blocks of 5: medians of hs, launch, dev, tail, qdev; NVML (keep-warm thread sample before the stop): SM / memory clock,
-    // power, GPU / memory temperature, GPU / memory utilisation, clock-event reasons; host: CPU of the sync thread and its
-    // scaling_cur_freq (read after the reps). Then FHERMA_SP_AB pairs (default 10) without / with the two events (host span
-    // only) for the event cost. Exactness: every rep against a reference rep.
-    void run_sp(){
-        if(!lever_env("FHERMA_SPDIAG",SPDIAG_DEFAULT))return;
-        if(!graph_execs[6]||bcount<2||!ka_th.joinable()||ka_off.load()||ka_err.load()||!kw_g||!ka_fn){std::printf("{\"diag\":\"sp\",\"err\":\"pre\"}\n");return;}
-        auto& d=*cuda;auto& D=d.driver;
-        ka_pause(false);
-        using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
-        auto us=[](clk::time_point a,clk::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();};
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ss=D.get<decltype(&::cuStreamSynchronize)>("cuStreamSynchronize");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        auto ec=D.get<decltype(&::cuEventCreate)>("cuEventCreate");auto er=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
-        auto cflags=D.get<decltype(&::cuCtxGetFlags)>("cuCtxGetFlags");unsigned cf=0xffffffffu;if(cflags)cflags(&cf);
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes),bad=d.alloc(256);int sms=1;{CUdevice dev=0;d.cuDeviceGet(&dev,0);auto attr=D.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);}
-        d.check(glaunch(graph_execs[6],graph_stream));d.check(ss(graph_stream));d.check(dtod(ref,out_all,bytes));
-        auto cmp=[&]()->int{if(!d.bpo_pdl_cmp)return -1;d.check(mset(bad,0,4));unsigned long long nn=count;void* a[]={&out_all,&ref,&nn,&bad};
-            d.check(d.cuLaunchKernel(d.bpo_pdl_cmp,unsigned(sms)*4,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));unsigned b=1;d.check(d.cuMemcpyDtoH(&b,bad,4));return b==0u;};
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        nv_ext_open();nv_ext=true;kd_n=0;kd_busy=0;kd_idle=0;kd_cyc=0;
-        CUevent e0=nullptr,e1=nullptr,e2=nullptr;d.check(ec(&e0,0));d.check(ec(&e1,0));d.check(ec(&e2,0));
-        auto envd=[](const char* nm,double def){const char* e=std::getenv(nm);return e?std::atof(e):def;};
-        const double WS=envd("FHERMA_SP_W",3.0);const int NT=std::max(5,int(envd("FHERMA_SP_N",60))),NAB=int(envd("FHERMA_SP_AB",0));const int NQ=int(envd("FHERMA_SP_Q",5));const double QS=envd("FHERMA_SP_QS",3.0);
-        auto cpufreq=[](int c)->int{char p[96];std::snprintf(p,96,"/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",c);FILE* f=std::fopen(p,"r");if(!f)return -1;int v=-1;if(std::fscanf(f,"%d",&v)!=1)v=-1;std::fclose(f);return v;};
-        const int SPL=int(envd("FHERMA_SP_LOAD",kw_load));   // the production warm load (never kw1 unless it is the production load)
-        auto warm=[&]{ka_wl=SPL;ka_resume();std::this_thread::sleep_for(std::chrono::microseconds(long(WS*1e6)));ka_pause(false);};
-        auto prep=[&]{h2d_staged();d.check(d.cuCtxSynchronize());d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());};
-        long long spin_cyc=8000000ll;
-        std::printf("{\"diag\":\"sp\",\"k\":\"info\",\"load\":%d,\"kw13_mb\":%.1f,\"kw13_maps\":%zu,\"kw_mb\":%.1f,\"NQ\":%d,\"QS\":%.1f,\"pause12\":%.3f,\"idle7\":%.3f,\"idle8\":%.3f,\"N\":%d,\"W_s\":%.1f,\"ctx_flags\":\"0x%x\",\"sched\":\"%s\",\"spin_cyc\":%lld,\"kwg_us\":%.0f}\n",SPL,kw13_p/1048576.0,kw13_maps,kw_bytes/1048576.0,NQ,QS,double(KW_PAUSE12),double(KW_IDLE7),double(KW_IDLE8),NT,WS,cf,
-            cf==0xffffffffu?"?":(cf&7u)==0?"auto":(cf&7u)==1?"spin":(cf&7u)==2?"yield":(cf&7u)==4?"blocking":"?",spin_cyc,kw_g_us);std::fflush(stdout);
-        std::vector<double> H,LA,DV,TL,QD,R0,EM;std::vector<int> MH,MW,TP,MT,UG,UM,CPU,CF,RH,RM;unsigned long long thr_or=0;int ex=1,blk=0;
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        auto imean=[](const std::vector<int>& v){double s=0;int c=0;for(int x:v)if(x>=0){s+=x;++c;}return c?s/c:-1.0;};
-        for(int t=0;t<NT+NQ;++t){
-            const bool quiet=t>=NT;   // quiet block: no load at all for QS s before the rep (no SM work, no DRAM traffic)
-            if(quiet){std::this_thread::sleep_for(std::chrono::microseconds(long(QS*1e6)));nv_sample();}else warm();MH.push_back(nv_mhz.load());MW.push_back(nv_mw.load());TP.push_back(nv_temp.load());MT.push_back(nv_mtemp.load());UG.push_back(nv_ugpu.load());UM.push_back(nv_umem.load());
-            {const long long th=nv_thr.load();if(th>0)thr_or|=(unsigned long long)th;}
-            prep();
-            const auto ra=clk::now();d.check(er(e0,graph_stream));const auto r1=clk::now();d.check(glaunch(graph_execs[6],graph_stream));const auto r2=clk::now();d.check(er(e1,graph_stream));d.check(ss(graph_stream));const auto r4=clk::now();
-            float ms=0;d.check(eel(&ms,e0,e1));const int cpu=sched_getcpu();
-            nv_sample();RH.push_back(nv_mhz.load());RM.push_back(nv_mem.load());   // SM / memory clock right after the rep
-            H.push_back(us(ra,r4));LA.push_back(us(r1,r2));DV.push_back(ms*1000.0);TL.push_back(us(ra,r4)-ms*1000.0);R0.push_back(us(ra,r1));if(cmp()==0)ex=0;
-            CPU.push_back(cpu);CF.push_back(cpufreq(cpu));
-            d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());
-            d.check(er(e2,graph_stream));{void* a[]={&spin_cyc};d.check(d.cuLaunchKernel(ka_fn,1,1,1,32,1,1,0,graph_stream,a,nullptr));}
-            d.check(er(e0,graph_stream));d.check(glaunch(graph_execs[6],graph_stream));d.check(er(e1,graph_stream));d.check(ss(graph_stream));
-            d.check(eel(&ms,e0,e1));QD.push_back(ms*1000.0);if(cmp()==0)ex=0;
-            {float sm=0;d.check(eel(&sm,e2,e0));EM.push_back(sm>0?spin_cyc/(sm*1000.0):-1.0);}   // effective SM MHz: spin_cyc clock64 cycles / spin time
-            if(H.size()==5){
-                std::printf("{\"diag\":\"sp\",\"b\":%d,\"t\":%.0f,\"hs_us\":%.1f,\"launch_us\":%.1f,\"dev_us\":%.1f,\"tail_us\":%.1f,\"rec0_us\":%.1f,\"qdev_us\":%.1f,\"mhz\":%.0f,\"W\":%.1f,\"temp\":%.0f,\"mtemp\":%.0f,\"ug\":%.0f,\"um\":%.0f,\"mem\":%d,\"thr_or\":\"0x%llx\",\"cpu\":%d,\"cpukhz\":%.0f,\"kd_busy_us\":%.0f,\"kd_idle_us\":%.0f,\"kd_cyc_us\":%.0f,\"kd_duty\":%.3f,\"mhz_r\":%.0f,\"mem_r\":%.0f,\"eff_mhz\":%.0f,\"quiet\":%d,\"ex\":%d}\n",
-                    blk++,el(),med(H),med(LA),med(DV),med(TL),med(R0),med(QD),imean(MH),imean(MW)/1000.0,imean(TP),imean(MT),imean(UG),imean(UM),nv_mem.load(),thr_or,CPU.back(),imean(CF),kd_n.load()?double(kd_busy.load())/kd_n.load():-1.0,kd_n.load()?double(kd_idle.load())/kd_n.load():-1.0,
-                    kd_n.load()?double(kd_cyc.load())/kd_n.load():-1.0,kd_cyc.load()?double(kd_busy.load())/double(kd_cyc.load()):-1.0,imean(RH),imean(RM),med(EM),int(quiet),ex);std::fflush(stdout);kd_n=0;kd_busy=0;kd_idle=0;kd_cyc=0;
-                H.clear();R0.clear();EM.clear();RH.clear();RM.clear();LA.clear();DV.clear();TL.clear();QD.clear();MH.clear();MW.clear();TP.clear();MT.clear();UG.clear();UM.clear();CPU.clear();CF.clear();thr_or=0;}}
-        // event cost: pairs of trials without / with the two events (host span of the launch + sync only)
-        std::vector<double> A0,A1;
-        for(int t=0;t<2*NAB;++t){warm();prep();const bool evs=t&1;
-            const auto ra=clk::now();if(evs)d.check(er(e0,graph_stream));d.check(glaunch(graph_execs[6],graph_stream));if(evs)d.check(er(e1,graph_stream));d.check(ss(graph_stream));const auto r4=clk::now();
-            (evs?A1:A0).push_back(us(ra,r4));if(cmp()==0)ex=0;}
-        std::printf("{\"diag\":\"sp\",\"k\":\"ev_ab\",\"n\":%d,\"no_ev_us\":%.1f,\"ev_us\":%.1f,\"d_us\":%.1f,\"ex\":%d,\"s\":%.1f}\n",NAB,med(A0),med(A1),med(A1)-med(A0),ex,el());std::fflush(stdout);
-        nv_ext=false;ka_wl=kw_load;
-        d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));d.check(d.cuCtxSynchronize());}
-    // ---- cs diag (exit time; CSDIAG_DEFAULT, FHERMA_CSDIAG=0/1): every warm load from a cold start. Per load: no load at
-    // all for FHERMA_CS_IDLE s (default 8), then FHERMA_CS_N trials (default 5): load for FHERMA_CS_W s (default 6), stop
-    // and wait, staged h2d of the real cases, one timed rep of graph variant 6 (output compared with a reference rep).
-    // One line per load (flushed): the bodies in order, per trial the keep-warm thread's last NVML sample before the stop
-    // (SM MHz, W, clock-event reasons) and the stop wait. Loads FHERMA_CS_LOADS (default 1,7,8,10,11,4,1: controls first
-    // and last; 9 = duty 70 % dropped for the 4.5 min budget); wall guard FHERMA_CS_MAX s (default 285).
-    void run_cs(){
-        if(!lever_env("FHERMA_CSDIAG",CSDIAG_DEFAULT))return;
-        if(!graph_execs[6]||bcount<2||!ka_th.joinable()||ka_off.load()||ka_err.load()||!kw_g){std::printf("{\"diag\":\"cs\",\"err\":\"pre\",\"ka\":%d,\"kw\":%d}\n",int(ka_th.joinable()),int(kw_g!=nullptr));return;}
-        auto& d=*cuda;auto& D=d.driver;
-        ka_pause(false);
-        using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ss=D.get<decltype(&::cuStreamSynchronize)>("cuStreamSynchronize");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        auto ec=D.get<decltype(&::cuEventCreate)>("cuEventCreate");auto er=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes),bad=d.alloc(256);int sms=1;{CUdevice dev=0;d.cuDeviceGet(&dev,0);auto attr=D.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);}
-        d.check(glaunch(graph_execs[6],graph_stream));d.check(ss(graph_stream));d.check(dtod(ref,out_all,bytes));
-        auto cmp=[&]()->int{if(!d.bpo_pdl_cmp)return -1;d.check(mset(bad,0,4));unsigned long long nn=count;void* a[]={&out_all,&ref,&nn,&bad};
-            d.check(d.cuLaunchKernel(d.bpo_pdl_cmp,unsigned(sms)*4,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));unsigned b=1;d.check(d.cuMemcpyDtoH(&b,bad,4));return b==0u;};
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        nv_ext_open();nv_ext=true;
-        CUevent e0=nullptr,e1=nullptr;d.check(ec(&e0,0));d.check(ec(&e1,0));
-        auto envd=[](const char* nm,double def){const char* e=std::getenv(nm);return e?std::atof(e):def;};
-        const double IDLE=envd("FHERMA_CS_IDLE",8.0),WS=envd("FHERMA_CS_W",6.0),MAXS=envd("FHERMA_CS_MAX",285.0);const int NT=std::max(1,std::min(8,int(envd("FHERMA_CS_N",5))));
-        std::vector<int> loads;{const char* e=std::getenv("FHERMA_CS_LOADS");std::string x=e?e:"1,7,8,10,11,4,1";size_t p0=0;
-            while(p0<x.size()){size_t p1=x.find(',',p0);if(p1==std::string::npos)p1=x.size();const int v=std::atoi(x.substr(p0,p1-p0).c_str());if(v>=0&&v<=11&&v!=2&&v!=3)loads.push_back(v);p0=p1+1;}}
-        const char* lname[12]={"spin","kw1","kw2","kw3","duty50","duty25","g1of3","duty90","duty80","duty70","enter_hold","periodic"};
-        std::printf("{\"diag\":\"cs\",\"k\":\"info\",\"idle_s\":%.1f,\"W_s\":%.1f,\"N\":%d,\"loads\":%zu,\"kwg_us\":%.0f,\"max_s\":%.0f}\n",IDLE,WS,NT,loads.size(),kw_g_us,MAXS);std::fflush(stdout);
-        int idx=0;
-        for(const int L:loads){const double need=IDLE+NT*(WS+0.15);if(el()+need>MAXS){std::printf("{\"diag\":\"cs\",\"i\":%d,\"ld\":\"%s\",\"skip\":\"budget\",\"t\":%.0f}\n",idx++,lname[L],el());continue;}
-            std::this_thread::sleep_for(std::chrono::microseconds(long(IDLE*1e6)));   // cold: nothing queued or running
-            double body[8];int mhz[8],mw[8],ex=1;long long thr[8];double sw[8];
-            for(int t=0;t<NT;++t){ka_wl=L;ka_resume();std::this_thread::sleep_for(std::chrono::microseconds(long(WS*1e6)));
-                const auto s0=clk::now();ka_pause(false);sw[t]=std::chrono::duration<double,std::micro>(clk::now()-s0).count();
-                mhz[t]=nv_mhz.load();mw[t]=nv_mw.load();thr[t]=nv_thr.load();
-                h2d_staged();d.check(d.cuCtxSynchronize());d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());
-                d.check(er(e0,graph_stream));d.check(glaunch(graph_execs[6],graph_stream));d.check(er(e1,graph_stream));d.check(ss(graph_stream));
-                float ms=0;d.check(eel(&ms,e0,e1));body[t]=ms;if(cmp()==0)ex=0;}
-            std::string b,c,w,th,sv;char tmp[64];
-            for(int t=0;t<NT;++t){const char* sep=t?",":"";
-                std::snprintf(tmp,64,"%s%.3f",sep,body[t]);b+=tmp;std::snprintf(tmp,64,"%s%d",sep,mhz[t]);c+=tmp;
-                std::snprintf(tmp,64,"%s%.0f",sep,mw[t]>=0?mw[t]/1000.0:-1.0);w+=tmp;std::snprintf(tmp,64,"%s%llx",sep,(unsigned long long)thr[t]);th+=tmp;
-                std::snprintf(tmp,64,"%s%.1f",sep,sw[t]/1000.0);sv+=tmp;}
-            std::printf("{\"diag\":\"cs\",\"i\":%d,\"ld\":\"%s\",\"t\":%.0f,\"body\":[%s],\"mhz\":[%s],\"W\":[%s],\"thr\":\"%s\",\"sw_ms\":[%s],\"temp\":%d,\"ex\":%d}\n",
-                idx++,lname[L],el(),b.c_str(),c.c_str(),w.c_str(),th.c_str(),sv.c_str(),nv_temp.load(),ex);std::fflush(stdout);}
-        nv_ext=false;ka_wl=kw_load;
-        d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));d.check(d.cuCtxSynchronize());
-        std::printf("{\"diag\":\"cs\",\"k\":\"end\",\"s\":%.1f}\n",el());std::fflush(stdout);}
-    // ---- lr diag (exit time; LRDIAG_DEFAULT, FHERMA_LRDIAG=0/1): drift of the production body under hours-like warm load.
-    // Trial (ld9 shape, long): warm load L for W s (FHERMA_LR_W, default 3), stop and wait, staged h2d of the real cases,
-    // one timed rep of the production graph (variant 6), output compared with the first rep (exactness). Kept per trial:
-    // body, stop wait, the keep-warm thread's last NVML sample before the stop (SM clock, power, and while the diag runs
-    // temperature, fan, clock-event reasons, power limit, P-state, memory clock). NVML is read only in the keep-warm
-    // thread's sampling point and, for the violation counters, between trials; never in the timed rep or a hook.
-    // Phase A: production load (1) for FHERMA_LR_A blocks of 5 trials (default 10, ~150 s). Phase B at once (warm card):
-    // 50 % duty (4), 1 s of 3 s graphs + spin (6), 25 % duty (5), spin alone (0), FHERMA_LR_B blocks each (default 2,
-    // ~30 s), heaviest first so every load starts from a card at least as warm as its own steady state. One line per
-    // block, flushed; wall budget FHERMA_LR_MAX s (default 285).
-    void run_lr(){
-        if(!lever_env("FHERMA_LRDIAG",LRDIAG_DEFAULT))return;
-        if(!graph_execs[6]||bcount<2||!ka_th.joinable()||ka_off.load()||ka_err.load()||!kw_g){std::printf("{\"diag\":\"lr\",\"err\":\"pre\",\"ka\":%d,\"kw\":%d}\n",int(ka_th.joinable()),int(kw_g!=nullptr));return;}
-        auto& d=*cuda;auto& D=d.driver;
-        ka_pause(false);
-        using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
-        auto glaunch=D.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");auto ss=D.get<decltype(&::cuStreamSynchronize)>("cuStreamSynchronize");
-        auto dtod=D.get<decltype(&::cuMemcpyDtoD)>("cuMemcpyDtoD_v2");auto mset=D.get<decltype(&::cuMemsetD8)>("cuMemsetD8_v2");
-        auto ec=D.get<decltype(&::cuEventCreate)>("cuEventCreate");auto er=D.get<decltype(&::cuEventRecord)>("cuEventRecord");
-        auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
-        const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;
-        std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
-        d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
-        CUdeviceptr ref=d.alloc(bytes),bad=d.alloc(256);int sms=1;{CUdevice dev=0;d.cuDeviceGet(&dev,0);auto attr=D.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);}
-        d.check(glaunch(graph_execs[6],graph_stream));d.check(ss(graph_stream));d.check(dtod(ref,out_all,bytes));
-        auto cmp=[&]()->int{if(!d.bpo_pdl_cmp)return -1;d.check(mset(bad,0,4));unsigned long long nn=count;void* a[]={&out_all,&ref,&nn,&bad};
-            d.check(d.cuLaunchKernel(d.bpo_pdl_cmp,unsigned(sms)*4,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));unsigned b=1;d.check(d.cuMemcpyDtoH(&b,bad,4));return b==0u;};
-        auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
-            else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
-        nv_ext_open();nv_thr_or=0;nv_ext=true;
-        CUevent e0=nullptr,e1=nullptr;d.check(ec(&e0,0));d.check(ec(&e1,0));
-        auto envd=[](const char* nm,double def){const char* e=std::getenv(nm);return e?std::atof(e):def;};
-        const double WS=envd("FHERMA_LR_W",3.0),MAXS=envd("FHERMA_LR_MAX",285.0);const int NA=int(envd("FHERMA_LR_A",10)),NB=int(envd("FHERMA_LR_B",2));
-        struct Tr{double body,sw;int mhz,mw;};
-        auto trial=[&](int L)->Tr{ka_wl=L;ka_resume();std::this_thread::sleep_for(std::chrono::microseconds(long(WS*1e6)));
-            const auto s0=clk::now();ka_pause(false);const double sw=std::chrono::duration<double,std::micro>(clk::now()-s0).count();
-            const int mhz=nv_mhz.load(),mw=nv_mw.load();
-            h2d_staged();d.check(d.cuCtxSynchronize());d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());
-            d.check(er(e0,graph_stream));d.check(glaunch(graph_execs[6],graph_stream));d.check(er(e1,graph_stream));d.check(ss(graph_stream));
-            float ms=0;d.check(eel(&ms,e0,e1));return Tr{ms,sw,mhz,mw};};
-        const char* lname[7]={"spin","kw1","kw2","kw3","duty50","duty25","g1of3"};
-        int blk=0;
-        auto block=[&](const char* ph,int L)->bool{if(el()>MAXS)return false;
-            const long long v0=nv_viol(0),v1=nv_viol(1);nv_thr_or=0;std::vector<double> b;double mh=0,mw=0,swm=0;int nm=0,nw=0,ex=1;
-            for(int t=0;t<5;++t){const Tr x=trial(L);b.push_back(x.body);swm=std::max(swm,x.sw);if(x.mhz>0){mh+=x.mhz;++nm;}if(x.mw>0){mw+=x.mw;++nw;}const int c=cmp();if(c==0)ex=0;}
-            const long long v0b=nv_viol(0),v1b=nv_viol(1);std::vector<double> sb=b;std::sort(sb.begin(),sb.end());
-            std::printf("{\"diag\":\"lr\",\"ph\":\"%s\",\"ld\":\"%s\",\"b\":%d,\"t\":%.0f,\"med\":%.3f,\"min\":%.3f,\"mhz\":%.0f,\"W\":%.1f,\"temp\":%d,\"fan\":%d,\"thr\":\"0x%llx\",\"thr_or\":\"0x%llx\",\"vpw_ms\":%.0f,\"vth_ms\":%.0f,\"plim\":%.0f,\"ps\":%d,\"mem\":%d,\"sw_us\":%.0f,\"ex\":%d}\n",
-                ph,lname[L],blk++,el(),sb[2],sb[0],nm?mh/nm:-1.0,nw?mw/nw/1000.0:-1.0,nv_temp.load(),nv_fan.load(),(unsigned long long)nv_thr.load(),nv_thr_or.load(),
-                v0>=0&&v0b>=0?(v0b-v0)/1e6:-1.0,v1>=0&&v1b>=0?(v1b-v1)/1e6:-1.0,nv_plim.load()>=0?nv_plim.load()/1000.0:-1.0,nv_pst.load(),nv_mem.load(),swm,ex);
-            std::fflush(stdout);return true;};
-        std::printf("{\"diag\":\"lr\",\"k\":\"info\",\"W_s\":%.1f,\"A\":%d,\"B\":%d,\"max_s\":%.0f,\"kwg_us\":%.0f,\"syms\":\"%d%d%d%d%d%d\"}\n",WS,NA,NB,MAXS,kw_g_us,
-            int(nv_tempf!=nullptr),int(nv_fanf!=nullptr),int(nv_thrf!=nullptr),int(nv_plimf!=nullptr),int(nv_pstf!=nullptr),int(nv_violf!=nullptr));std::fflush(stdout);
-        for(int i=0;i<NA;++i)if(!block("A",1))break;
-        for(int L:{4,6,5,0})for(int i=0;i<NB;++i)if(!block("B",L))break;
-        nv_ext=false;ka_wl=kw_load;
-        d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));d.check(d.cuCtxSynchronize());
-        std::printf("{\"diag\":\"lr\",\"k\":\"end\",\"s\":%.1f}\n",el());std::fflush(stdout);}
     void run_pdl(){
         if(!lever_env("FHERMA_PDLDIAG",false)||!graph_execs[6]||bcount<2){return;}
         auto& d=*cuda;auto& D=d.driver;
@@ -1786,17 +1493,18 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
     // ctrl three times in the line set (start, middle, end of each round; rounds rotate). Exactness of every line on six
     // patterns (real inputs, q-1, 1, P-1, random < q, mix) against the ctrl output; then R (15) ld9 trials per line
     // (~0.8 s dummy-pipeline warm load, stop and wait, staged h2d of the last case's inputs, one timed rep).
-    CUgraphExec rb_cap(bool r2,bool r3,const char*& why){
+    CUgraphExec rb_cap(bool r2,bool r3,const char*& why,u32 cm=0xffffffffu){
         auto& d=*cuda;auto& D=d.driver;
         auto begin=D.get<decltype(&::cuStreamBeginCapture)>("cuStreamBeginCapture_v2");auto endc=D.get<decltype(&::cuStreamEndCapture)>("cuStreamEndCapture");
         auto inst=D.get<decltype(&::cuGraphInstantiateWithFlags)>("cuGraphInstantiateWithFlags");auto gdestroy=D.get<decltype(&::cuGraphDestroy)>("cuGraphDestroy");
         auto ecreate=D.get<decltype(&::cuEventCreate)>("cuEventCreate");auto erecord=D.get<decltype(&::cuEventRecord)>("cuEventRecord");auto swait=D.get<decltype(&::cuStreamWaitEvent)>("cuStreamWaitEvent");
-        const bool o2=rb2_on,o3=rb3_on;CUgraphExec ge=nullptr;bool capt=false;const size_t stride=size_t(n)*l*4;const u32 S=2;why="capture";
-        auto restore=[&]{rb2_on=o2;rb3_on=o3;d.stream=graph_stream;cur_ws=0;next_a=next_b=0;pin_cur=-1;cuda->pre_launch=nullptr;cuda->post_launch=nullptr;
+        const bool o2=rb2_on,o3=rb3_on;const u32 ocm=crtl_m;CUgraphExec ge=nullptr;bool capt=false;const size_t stride=size_t(n)*l*4;const u32 S=2;why="capture";
+        auto restore=[&]{rb2_on=o2;rb3_on=o3;crtl_m=ocm;d.stream=graph_stream;cur_ws=0;next_a=next_b=0;pin_cur=-1;cuda->pre_launch=nullptr;cuda->post_launch=nullptr;
             l2on=false;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;};
         try{
             if(!chain_streams[1]||!graph_execs[6]||bcount<2){throw std::runtime_error("pdl");}
             rb2_on=r2&&d.bpo_middle_r16zb&&p2lz_on;rb3_on=r3&&d.bpo_last_cm3tb&&p3t2_ok;if((r2&&!rb2_on)||(r3&&!rb3_on)){why="rb:pre";throw std::runtime_error("rb");}
+            if(cm!=0xffffffffu){if(cm&&!crtl_fn(cm)){why="crtl:jit";throw std::runtime_error("crtl");}crtl_m=cm;}
             l2on=l2g!=0;p23db_now=p23db_env(false);p1x=p1x_default();po=2;pox=true;xoff=0;   // as graph variant 6
             if(pin_ok){cuda->pre_launch=[this]{pin_pre();};cuda->post_launch=[this]{pin_post();};}
             CUstream cs[2]{graph_stream,chain_streams[1]};
@@ -1813,8 +1521,12 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             gdestroy(g);if(ge){why="";}
         }catch(...){if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}ge=nullptr;}
         restore();return ge;}
-    void run_rb(){
-        if(!lever_env("FHERMA_RBDIAG",RBDIAG_DEFAULT)||!graph_execs[6]||bcount<2){return;}
+    void run_rb(){run_rbx(false);run_rbx(true);}
+    // cl (rb shape): fr / st / bq / all = crtl twins 1 / 2 / 4 / 7 against production; bound-reaching patterns A (AA x AA), B (AB x AB),
+    // X (AA x AB): all digits at +max/-max alternating (gen_sgn.py; AA x AA reaches the CRT bound N S_0 at k = N-1)
+    void run_rbx(bool cl){
+        const char* dn=cl?"cl":"rb";
+        if(!(cl?lever_env("FHERMA_CLDIAG",CLDIAG_DEFAULT):lever_env("FHERMA_RBDIAG",RBDIAG_DEFAULT))||!graph_execs[6]||bcount<2){return;}
         auto& d=*cuda;auto& D=d.driver;
         ka_pause(false);   // the keep-warm restarted by the last fherma_d2h
         using clk=std::chrono::steady_clock;const auto T0=clk::now();auto el=[&]{return std::chrono::duration<double>(clk::now()-T0).count();};
@@ -1824,7 +1536,7 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         auto eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime_v2");if(!eel)eel=D.get<decltype(&::cuEventElapsedTime)>("cuEventElapsedTime");
         auto ged=D.get<decltype(&::cuGraphExecDestroy)>("cuGraphExecDestroy");
         const size_t bytes=size_t(bcount)*n*l*4,count=size_t(bcount)*n*l;
-        if(!d.bpo_pdl_cmp){std::printf("{\"diag\":\"rb\",\"err\":\"cmp\"}\n");return;}
+        if(!d.bpo_pdl_cmp){std::printf("{\"diag\":\"%s\",\"err\":\"cmp\"}\n",dn);return;}
         CUfunction ffill=nullptr;{   // adversarial fill (separate NVRTC program)
             const char* src="extern \"C\" __global__ void pd_fill(unsigned* a,unsigned* b,const unsigned* tab,unsigned L,unsigned long long cnt,unsigned pat,unsigned qtop){\n"
                 "  for(unsigned long long i=blockIdx.x*(unsigned long long)blockDim.x+threadIdx.x;i<cnt;i+=(unsigned long long)gridDim.x*blockDim.x){\n"
@@ -1832,14 +1544,14 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
                 "    unsigned long long x=i*0x9E3779B97F4A7C15ull+pat;x^=x>>31;x*=0xBF58476D1CE4E5B9ull;x^=x>>29;const unsigned r1=unsigned(x),r2=unsigned(x>>32);\n"
                 "    const unsigned ra=w==L-1?r1%qtop:r1,rb=w==L-1?r2%qtop:r2;const unsigned qm=tab[w],on=tab[L+w],pm=tab[2*L+w];unsigned va,vb;\n"
                 "    if(pat==0){va=vb=qm;}else if(pat==1){va=vb=on;}else if(pat==2){va=vb=pm;}else if(pat==3){va=ra;vb=rb;}\n"
-                "    else{const unsigned k=unsigned(co%3ull);va=k==0?qm:(k==1?pm:ra);vb=k==0?pm:(k==1?qm:on);}\n"
+                "    else if(pat==5){va=qm;vb=pm;}else{const unsigned k=unsigned(co%3ull);va=k==0?qm:(k==1?pm:ra);vb=k==0?pm:(k==1?qm:on);}\n"
                 "    a[i]=va;b[i]=vb;}}\n";
             nvrtcProgram pg=nullptr;const char* opt[]={"--gpu-architecture=compute_80"};CUmodule m=nullptr;
             if(d.nvrtcCreateProgram(&pg,src,"pd.cu",0,nullptr,nullptr)==NVRTC_SUCCESS){
                 if(d.nvrtcCompileProgram(pg,1,opt)==NVRTC_SUCCESS){size_t sz=0;d.nvrtcGetPTXSize(pg,&sz);std::vector<char> ptx(sz);d.nvrtcGetPTX(pg,ptx.data());
                     if(d.cuModuleLoadData(&m,ptx.data())==CUDA_SUCCESS){if(d.cuModuleGetFunction(&ffill,m,"pd_fill")!=CUDA_SUCCESS)ffill=nullptr;}}
                 d.nvrtcDestroyProgram(&pg);}}
-        if(!ffill){std::printf("{\"diag\":\"rb\",\"err\":\"jit\"}\n");return;}
+        if(!ffill){std::printf("{\"diag\":\"%s\",\"err\":\"jit\"}\n",dn);return;}
         int sms=1;{CUdevice dev=0;d.cuDeviceGet(&dev,0);auto attr=D.get<decltype(&::cuDeviceGetAttribute)>("cuDeviceGetAttribute");attr(&sms,CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,dev);}
         std::vector<uint32_t> ha,hb;ha.reserve(count);hb.reserve(count);set_size_no_init(ha,count);set_size_no_init(hb,count);
         d.check(d.cuCtxSynchronize());d.check(d.cuMemcpyDtoH(ha.data(),a_all,bytes));d.check(d.cuMemcpyDtoH(hb.data(),b_all,bytes));
@@ -1848,12 +1560,12 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             d.check(d.cuLaunchKernel(d.bpo_pdl_cmp,unsigned(sms)*4,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));unsigned b=1;d.check(d.cuMemcpyDtoH(&b,bad,4));return b==0u;};
         struct Ln{const char* nm;CUgraphExec g;bool chk;std::vector<double> t;int ex=1;std::string pat;};
         std::vector<Ln> L;std::vector<CUgraphExec> own;
-        auto add=[&](const char* nm,bool r2,bool r3){const char* w="";CUgraphExec g=rb_cap(r2,r3,w);
-            if(g){own.push_back(g);L.push_back({nm,g,true,{},1,""});}else std::printf("{\"diag\":\"rb\",\"v\":\"%s\",\"err\":\"%s\"}\n",nm,(w&&*w)?w:"capture");};
+        auto add=[&](const char* nm,bool r2,bool r3,u32 cm){const char* w="";CUgraphExec g=rb_cap(r2,r3,w,cm);
+            if(g){own.push_back(g);L.push_back({nm,g,true,{},1,""});}else std::printf("{\"diag\":\"%s\",\"v\":\"%s\",\"err\":\"%s\"}\n",dn,nm,(w&&*w)?w:"capture");};
         L.push_back({"ctrl",graph_execs[6],false,{},1,"ref"});
-        add("rb2",true,false);add("rb3",false,true);
+        if(cl){add("fr",rb2_on,rb3_on,1u);add("st",rb2_on,rb3_on,2u);}else{add("rb2",true,false,0xffffffffu);add("rb3",false,true,0xffffffffu);}
         L.push_back({"ctrl_mid",graph_execs[6],false,{},1,"-"});
-        add("rb_both",true,true);add("recap",false,false);
+        if(cl){add("bq",rb2_on,rb3_on,4u);add("all",rb2_on,rb3_on,7u);}else{add("rb_both",true,true,0xffffffffu);add("recap",false,false,0xffffffffu);}
         L.push_back({"ctrl_end",graph_execs[6],false,{},1,"-"});
         // exactness: ctrl output per pattern = reference, every other line compared bit for bit
         auto run1=[&](CUgraphExec g){d.check(glaunch(g,graph_stream));d.check(ss(graph_stream));};
@@ -1867,7 +1579,16 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
          CUdeviceptr dt=d.alloc(tab.size()*4);d.check(d.cuMemcpyHtoD(dt,tab.data(),tab.size()*4));
          const char tags[5]={'q','1','P','n','m'};
          for(u32 pt=0;pt<5;++pt){unsigned L_=l;unsigned long long cn=count;unsigned pp=pt,qt=qtop;void* a[]={&a_all,&b_all,&dt,&L_,&cn,&pp,&qt};
-             d.check(d.cuLaunchKernel(ffill,unsigned(sms)*8,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));check(tags[pt]);}}
+             d.check(d.cuLaunchKernel(ffill,unsigned(sms)*8,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));check(tags[pt]);}
+         if(cl){   // bound-reaching balanced-digit points: AA in the q-1 slot, AB in the P-1 slot
+          std::vector<u32> t2(size_t(3)*l,0u);const u32 J=8;
+          for(u32 j=0;j<J;++j){const u32 p0=(w*j+J-1)/J,bw=(j+1<J?(w*(j+1)+J-1)/J:w)-p0;   // ceil(w j / 8): the digit layout
+            for(u32 x=0;x<2;++x){u32* v=t2.data()+(x?2*l:0);const bool lowmax=(j%2==0)==(x==0);   // AA: even digits 2^(b-1)-1, odd 2^(b-1); AB the reverse
+              if(lowmax){for(u32 bt=p0;bt<p0+bw-1;++bt)v[bt/32]|=1u<<(bt%32);}else{const u32 bt=p0+bw-1;v[bt/32]|=1u<<(bt%32);}}}
+          CUdeviceptr d2=d.alloc(t2.size()*4);d.check(d.cuMemcpyHtoD(d2,t2.data(),t2.size()*4));
+          const u32 bp[3]={0u,2u,5u};const char bt_[3]={'A','B','X'};
+          for(u32 z=0;z<3;++z){unsigned L_=l;unsigned long long cn=count;unsigned pp=bp[z],qt=qtop;void* a[]={&a_all,&b_all,&d2,&L_,&cn,&pp,&qt};
+             d.check(d.cuLaunchKernel(ffill,unsigned(sms)*8,1,1,256,1,1,0,graph_stream,a,nullptr));d.check(ss(graph_stream));check(bt_[z]);}}}
         d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));d.check(d.cuCtxSynchronize());
         // ld9 trials
         auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
@@ -1887,10 +1608,10 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         ka_wl=kw_load;
         auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
         const double m0=med(L[0].t);double c3=0;int nc=0;for(auto& x:L)if(x.g==graph_execs[6]&&!x.t.empty()){c3+=med(x.t);++nc;}c3=nc?c3/nc:-1.0;
-        std::printf("{\"diag\":\"rb\",\"k\":\"info\",\"warm\":%d,\"warm_s\":%.2f,\"R\":%d,\"rounds\":%d,\"B\":%u,\"twins\":\"%d%d\",\"prod_lzm\":%d,\"prod_rb2\":%d,\"prod_rb3\":%d,\"ctrl3\":%.3f,\"pats\":\"r q-1 1 P-1 rnd mix\",\"s\":%.1f}\n",
-            int(warm),WARM,R,rounds,bcount,int(d.bpo_middle_r16zb!=nullptr),int(d.bpo_last_cm3tb!=nullptr),int((lz_var[6]&4u)!=0),int((lz_var[6]&8u)!=0),int((lz_var[6]&16u)!=0),c3,el());
+        std::printf("{\"diag\":\"%s\",\"k\":\"info\",\"warm\":%d,\"warm_s\":%.2f,\"R\":%d,\"rounds\":%d,\"B\":%u,\"twins\":\"%d%d\",\"prod_lzm\":%d,\"prod_rb2\":%d,\"prod_rb3\":%d,\"ctrl3\":%.3f,\"crtl\":%u,\"pdl\":%u,\"pats\":\"%s\",\"s\":%.1f}\n",dn,
+            int(warm),WARM,R,rounds,bcount,int(d.bpo_middle_r16zb!=nullptr),int(d.bpo_last_cm3tb!=nullptr),int((lz_var[6]&4u)!=0),int((lz_var[6]&8u)!=0),int((lz_var[6]&16u)!=0),c3,crtl_m,pdl_env(),cl?"r q-1 1 P-1 rnd mix AA AB AAxAB":"r q-1 1 P-1 rnd mix",el());
         for(auto& x:L){const double mx=med(x.t);
-            std::printf("{\"diag\":\"rb\",\"v\":\"%s\",\"n\":%zu,\"med\":%.3f,\"min\":%.3f,\"r\":%.4f,\"r3\":%.4f,\"ex\":%d,\"exact\":\"%s\"}\n",x.nm,x.t.size(),mx,
+            std::printf("{\"diag\":\"%s\",\"v\":\"%s\",\"n\":%zu,\"med\":%.3f,\"min\":%.3f,\"r\":%.4f,\"r3\":%.4f,\"ex\":%d,\"exact\":\"%s\"}\n",dn,x.nm,x.t.size(),mx,
                 x.t.empty()?-1.0:*std::min_element(x.t.begin(),x.t.end()),m0>0?mx/m0:-1.0,c3>0?mx/c3:-1.0,x.ex,x.pat.c_str());}
         std::fflush(stdout);
         for(auto g:own)ged(g);}
@@ -1902,13 +1623,7 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         d.kp.collect();  // previous call not yet read (no d2h in between)
         if(graph_exec&&!std::getenv("FHERMA_NO_GRAPH")){
             static auto glaunch=d.driver.get<decltype(&::cuGraphLaunch)>("cuGraphLaunch");
-            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;run_v=v;d.kp.run_begin(graph_stream,v);
-            static auto sper=d.driver.get<decltype(&::cuEventRecord)>("cuEventRecord");const bool spe=sp_ok&&cs_n<CS_MAX&&sper;auto ta=std::chrono::steady_clock::now();   // body split
-            if(spe){d.check(sper(sp_ev[cs_n][0],graph_stream));}
-            r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();
-            if(spe){d.check(sper(sp_ev[cs_n][1],graph_stream));cs_rec[cs_n]=float(std::chrono::duration<double,std::micro>(r1-ta).count());cs_rec1[cs_n]=float(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-r2).count());}
-            if(spe&&cs_n<CS_MAX)sp_ta[cs_n]=ta;
-            d.kp.run_launched(graph_stream);
+            int v=want_po();if(v==4&&graph_execs[6]&&!std::getenv("FHERMA_L2OFF"))v=6;if(v==6&&graph_execs[7]&&std::getenv("FHERMA_P1X"))v=7;if(!graph_execs[v])v=graph_exec==graph_execs[0]?0:graph_exec==graph_execs[4]?4:6;run_v=v;d.kp.run_begin(graph_stream,v);r1=std::chrono::steady_clock::now();d.check(glaunch(graph_execs[v]?graph_execs[v]:graph_exec,graph_stream));r2=std::chrono::steady_clock::now();d.kp.run_launched(graph_stream);
         }else for(u32 i=0;i<bcount;++i){po=po_available()?std::min(want_po(),2):0;compute_one(a_all+i*stride,b_all+i*stride,out_all+i*stride);if(prof){d.check(d.cuCtxSynchronize());prof_collect();}}
         if(prof)pcalls+=0;
         fherma::Outputs result;result.c.shape={int64_t(bcount),int64_t(n),int64_t(l)};
@@ -1927,7 +1642,7 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         d.kp.run_end();
         {auto us=[](std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();};
          const double x[5]={us(r0,r1),us(r1,r2),us(r2,r3),us(r3,r4),us(r0,r4)};ht_run.add(x,5);
-         if(cs_n<CS_MAX){cs_launch[cs_n]=float(x[1]);cs_r14[cs_n]=float(sp_ok?us(sp_ta[cs_n],r4):us(r1,r4));cs_cpu[cs_n]=sched_getcpu();cs_body[cs_n]=float(x[4]);cs_nv[cs_n]=nv_mhz.load(std::memory_order_relaxed);cs_w[cs_n]=nv_mw.load(std::memory_order_relaxed);cs_kaw[cs_n]=float(ka_wlast);}++cs_n;}
+         if(cs_n<CS_MAX){cs_body[cs_n]=float(x[4]);cs_nv[cs_n]=nv_mhz.load(std::memory_order_relaxed);cs_w[cs_n]=nv_mw.load(std::memory_order_relaxed);cs_kaw[cs_n]=float(ka_wlast);}++cs_n;}
         if(ka_r)ka_resume();
         return result;
     }
