@@ -997,7 +997,7 @@ struct State {
     static constexpr u32 PDL_DEFAULT=0;      // programmatic graph edges (variant 6): 1 P3->CRT, 2 CRT->next same-chain P1, 3 both; FHERMA_PDL=m overrides; tabs "pdl" = edges applied
     static constexpr int LZMONT_DEFAULT=1;   // lazy Montgomery P2-H pointwise output (kernel bpo_middle_r16zm); FHERMA_LZMONT=0/1 overrides; tabs "lzm"
     static constexpr int RB2_DEFAULT=0;      // P2 pipe rebalance (kernel bpo_middle_r16zb = r16zm with DIF16 #2 / DIT16 sums as IMAD on the FMA pipe; includes lzmont); FHERMA_RB2=0/1; tabs "rb2"
-    static constexpr int RB3_DEFAULT=0;      // P3 pipe rebalance (kernel bpo_last_cm3tb = cm3t with J-DIT / R-DIT sums as IMAD); FHERMA_RB3=0/1; tabs "rb3"
+    static constexpr int RB3_DEFAULT=1;      // P3 pipe rebalance (kernel bpo_last_cm3tb = cm3t with J-DIT / R-DIT sums as IMAD); FHERMA_RB3=0/1; tabs "rb3"
     static constexpr int SGN_DEFAULT=1;      // candidate 15: balanced digits, 15 primes < 2^30 + one 31-bit (FHERMA_SGN=0: candidate 14 prime set); tabs "sgn"
     static constexpr bool RBDIAG_DEFAULT=false;   // rb exit diag (FHERMA_RBDIAG=0/1 overrides)
     static constexpr u32 BIG_CHAINS=2,BIG_GROUP=8,BIG_GFLAGS=1|4|128;   // 128 (default, pv61 whole-batch p3el 0.986 / combo2 p3el+pf3q 0.979 on target): group-0 P3 residue stores evict_last (the CRT reads group 0 from L2; adds BPO_P3EL to the module); FHERMA_NO_P3EL=1 off   // 4: group-0 input loads keep L2 normal priority (re-read by group 1)
