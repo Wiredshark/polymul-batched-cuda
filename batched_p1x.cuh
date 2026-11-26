@@ -920,6 +920,13 @@ __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u
             __syncthreads();
             if(ca){
                 const u32* const rpt=X+(8*warp+gid)*XRS+xoff+tig;
+#ifdef BPO_SGN   // top bit of every digit (bit POS[j+1]-1) of the lane's two rows: carry words of the balanced digits
+                u32 tb[2]={0u,0u};{const u32* const rb0=X+(8*warp+gid)*XRS+xoff;
+                    #pragma unroll
+                    for(u32 hx=0;hx<2;++hx)
+                        #pragma unroll
+                        for(u32 jj=0;jj<8;++jj)tb[hx]|=((rb0[64*hx*XRS+(POS[jj+1]-1)/32]>>((POS[jj+1]-1)%32))&1u)<<jj;}
+#endif
                 #pragma unroll
                 for(u32 j=0;j<8;++j){
                     const u32 wb=POS[j]/32,sh=POS[j]%32;
@@ -930,9 +937,19 @@ __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u
                         const u32 v=__funnelshift_r(rp[0],rp[1],sh);
                         if(D-32*(3+4*int(x>>1))>=32)af[j][mt][x]=v;
                         else af[j][mt][x]=v&mk[j][x>>1];
+#ifdef BPO_SGN   // word 7 (k = 28..31) is always zero (digits <= 219 bits): byte 28 = carry in, byte 29 = own top bit
+                        if((x>>1)&&tig==3u){const u32 t=tb[x&1];af[j][mt][x]=((j?(t>>(j-1)):(t>>7))&1u)|(((t>>j)&1u)<<8);}
+#endif
                     }
                 }
-            }else
+            }else{
+#ifdef BPO_SGN
+            u32 tb[2]={0u,0u};
+            #pragma unroll
+            for(u32 hx=0;hx<2;++hx)
+                #pragma unroll
+                for(u32 jj=0;jj<8;++jj)tb[hx]|=((X[(64*hx+8*warp+gid)*L+(POS[jj+1]-1)/32]>>((POS[jj+1]-1)%32))&1u)<<jj;
+#endif
             #pragma unroll
             for(u32 j=0;j<8;++j){
                 const u32 wb=POS[j]/32,sh=POS[j]%32;
@@ -944,8 +961,11 @@ __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u
                     const u32 v=__funnelshift_r(rp[min(w0,L-1)],rp[w1],sh);
                     const int width=int(POS[j+1])-int(POS[j]+32*t);
                     af[j][mt][x]=width>=32?v:(width<=0?0u:(v&((1u<<width)-1)));
+#ifdef BPO_SGN
+                    if((x>>1)&&tig==3u){const u32 tt=tb[x&1];af[j][mt][x]=((j?(tt>>(j-1)):(tt>>7))&1u)|(((tt>>j)&1u)<<8);}
+#endif
                 }
-            }
+            }}
         }
     }
     if(pfstep&&h<256u&&id+pfstep<512u){
