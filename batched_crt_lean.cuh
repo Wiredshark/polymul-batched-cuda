@@ -98,7 +98,7 @@ template<u32 T> __device__ __forceinline__ void swc_tile(const u32 (&a)[2][2][4]
 }
 extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
-    if(pfitems&&!ABX(1)){
+    if(pfitems){
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
             const u32 it=t>>8,hh=t&255u;const u32* ps=(it>=256u?pfb:pfa)+u64(it&255u)*BCRT_L+u64(hh*256u)*BCRT_L;
@@ -120,10 +120,10 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
     auto prefetch=[&](u32 j){
         #pragma unroll
         for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
-            if(!ABX(512))swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
         swc_commit();};
     prefetch(0);
-    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=ABX(1024)?x:bfrag[x];
+    for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
     __syncthreads();
     u32 acc[NW+2];   // [64..65]: scratch of the digit chains
     #pragma unroll
@@ -175,10 +175,10 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         u32* const ob=output+u64(h0*256u+cc_)*L+lane;
         if(dfl&2){
             #pragma unroll
-            for(u32 rr=0;rr<32;++rr)if(!ABX(2048)){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}
+            for(u32 rr=0;rr<32;++rr){__stcs(ob+rr*256u*L,st[rr*L+lane]);if(lane<L-32)__stcs(ob+rr*256u*L+32,st[rr*L+32+lane]);}
         }else{
             #pragma unroll
-            for(u32 rr=0;rr<32;++rr)if(!ABX(2048)){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
+            for(u32 rr=0;rr<32;++rr){ob[rr*256u*L]=st[rr*L+lane];if(lane<L-32)ob[rr*256u*L+32]=st[rr*L+32+lane];}
         }
     }
 }
