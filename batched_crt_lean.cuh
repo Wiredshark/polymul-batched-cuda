@@ -182,9 +182,11 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_lean(const u32* __re
         }
     }
 }
-// hot diag twin (host: hot diag captures only): bpo_crt_lean reading D coefficients i0&8191 (not exact)
-extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanh(const u32* __restrict__ residues,u32* __restrict__ output,
+// pdl twin (host: FHERMA_PDL / PDL_DEFAULT): bpo_crt_lean with launch_dependents at block start and griddepcontrol.wait
+// before the first D read (only the B fragments and the next-input L2 prefetch run before it). Same output.
+extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanp(const u32* __restrict__ residues,u32* __restrict__ output,
  const u32* __restrict__ bfrag,u32 N,u32 d,const u32* pfa,const u32* pfb,u32 pfitems,u32 dfl){
+    asm volatile("griddepcontrol.launch_dependents;":::"memory");   // pdl: the next same-chain P1 may launch
     if(pfitems){
         const u32 total=gridDim.x*blockDim.x;
         for(u32 t=blockIdx.x*blockDim.x+threadIdx.x;t<pfitems*256u;t+=total){
@@ -207,10 +209,11 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanh(const u32* __r
     auto prefetch=[&](u32 j){
         #pragma unroll
         for(u32 k=0;k<4;++k){const u32 q=lane+32*k,r=q>>3,ch=q&7;
-            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+(i0&8191u)+4*ch);}
+            swc_cpa16(u32(__cvta_generic_to_shared(pbuf+r*32+((4*ch)^(8*(r&3))))),residues+(u64(r)*8+j)*N+i0+4*ch);}
         swc_commit();};
-    prefetch(0);
     for(u32 x=threadIdx.x;x<NT*2*32*2;x+=128)bsh[x]=bfrag[x];
+    asm volatile("griddepcontrol.wait;":::"memory");   // pdl: P3 complete (D written and visible) before the first D read
+    prefetch(0);
     __syncthreads();
     u32 acc[NW+2];   // [64..65]: scratch of the digit chains
     #pragma unroll
@@ -252,7 +255,7 @@ extern "C" __global__ void __launch_bounds__(128,3) bpo_crt_leanh(const u32* __r
         swc_addx(acc,br?(0u-d):((hi||!lt)?d:0u),br);
         acc[WO]&=(1u<<WS)-1;
     }
-    if((dfl&1)&&i0>=8192u)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
+    if(dfl&1)for(u32 x=lane;x<K*8u;x+=32u)bpo_discard(residues+u64(x)*N+i0);
     const u32 cc_=i0>>8,h0=i0&255u;
     {   // coefficient rr: words 0..31 by lanes 0..31, words 32..54 by lanes 0..22 ([base+imm] addresses, no index math)
         __syncwarp();

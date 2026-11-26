@@ -717,7 +717,7 @@ template<u32 F,bool LZ>__device__ __forceinline__ void zjdif(u32 (&x8)[8],const 
     zbft<LZ,T>(x8[0],x8[1],w0,p,p2);zbft<LZ,T>(x8[2],x8[3],w0,p,p2);zbft<LZ,T>(x8[4],x8[5],w0,p,p2);zbft<LZ,T>(x8[6],x8[7],w0,p,p2);
 }
 // xrdif6q with LZ (same layout, twiddles and TMA burst; arithmetic per Z1-Z6)
-template<u32 F,bool LZ>
+template<u32 F,bool LZ,bool PW=false>   // PW: pdl twin (bpo_first_xzp)
 __device__ __forceinline__ void zrdif6q(u32* const base0,const u32 so,const u64* st,const u64* ct,const u32 p,u32 lane,const XTMap* tm,u32 c,const u32 plane0,u32 stm,const u32 p2){
     constexpr bool T=(F&1)!=0;
     constexpr u32 XD=320u;
@@ -803,6 +803,7 @@ __device__ __forceinline__ void zrdif6q(u32* const base0,const u32 so,const u64*
     asm volatile("fence.proxy.async.shared::cta;":::"memory");
     __syncwarp();
     if(lane==0){
+        if(PW)asm volatile("griddepcontrol.wait;":::"memory");   // pdl: predecessor grids (CRT) complete before any A/B store
         u64 pol=0;const bool hint=(F&2048)&&stm!=1u;
         if(hint){if(stm==2u)asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;":"=l"(pol));else asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;":"=l"(pol));}
         #pragma unroll
@@ -813,7 +814,7 @@ __device__ __forceinline__ void zrdif6q(u32* const base0,const u32 so,const u64*
 #endif
 }
 // one prime quad of bpo_first_xbz (phase A + phase B), LZ per Z1-Z6
-template<u32 F,bool LZ>
+template<u32 F,bool LZ,bool PW=false>
 __device__ __forceinline__ void xz_quad(const u32 u,const u32 (&af)[8][2][4],u32* const X,const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,
     const u64* ctab,const XTMap* tmA,const XTMap* tmB,const u32 c,const u32 op,const u32 lane,const u32 warp,const u32 gid,const u32 tig,const u32 stm){
     constexpr u32 MT=2,XD=320u,XS=8*320;
@@ -866,14 +867,14 @@ __device__ __forceinline__ void xz_quad(const u32 u,const u32 (&af)[8][2][4],u32
         __syncthreads();
         {const u32 q=warp>>1,r=4*u+q,p=bpr_pr[r];
             const u64* const st=stage_tw+size_t(r)*256;const u64* const ct=ctab+(size_t(r)*256u+c)*256u;
-            zrdif6q<F,LZ>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);}
+            zrdif6q<F,LZ,PW>(X+q*XS+4*(warp&1u)*XD,8*q,st,ct,p,lane,op?tmB:tmA,c,r*8+4*(warp&1u),stm,bpr_p2.v[r]);}
 #if BPO_X_HAS_TMA
         if(lane==0)asm volatile("cp.async.bulk.wait_group.read 0;":::"memory");   // X reusable
 #endif
 }
 // bpo_first_xb restricted to the production flag set (S6, flags 256/512/4096/8192/131072, p1tw, p1rev), loop body per quad
 // instantiated twice (LZ for quads of primes < 2^30, canonical otherwise).
-template<u32 F>
+template<u32 F,bool PW=false>
 __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u32* B,
     const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
     const XTMap* tmA,const XTMap* tmB,u32* X){
@@ -956,10 +957,10 @@ __device__ __forceinline__ void bpo_first_xbz(const u32* a,const u32* b,u32* A,u
     #pragma unroll 1
     for(u32 uu=r0/4;uu<r1/4;++uu){const u32 u=r1/4-1u-(uu-r0/4);   // p1rev: quads in reverse order
 #ifdef BPO_P1LZ_ALL   // census-only build (JIT_DEFS): every quad on the lazy body, so the function holds one quad body
-        if(true)xz_quad<F,true>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);else
+        if(true)xz_quad<F,true,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);else
 #endif
-        if(4u*u+3u<u32(BPO_NH30))xz_quad<F,true>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);
-        else xz_quad<F,false>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);}
+        if(4u*u+3u<u32(BPO_NH30))xz_quad<F,true,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);
+        else xz_quad<F,false,PW>(u,af,X,twist,stage_tw,bpt,ctab,tmA,tmB,c,op,lane,warp,gid,tig,stm);}
 #if BPO_X_HAS_TMA
     if(lane==0)asm volatile("cp.async.bulk.wait_group 0;":::"memory");
 #endif
@@ -970,6 +971,15 @@ extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo
     const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
     __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
     bpo_first_xbz<BPO_XF|0x400000u|0x800000u>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
+}
+// pdl twin (host: FHERMA_PDL bit 2 / PDL_DEFAULT): bpo_first_xz whose TMA-issuing lanes execute griddepcontrol.wait before
+// each A/B store. Before the first store a block only reads its input, the tables and its own smem, so with a programmatic
+// edge from CRT(i) it overlaps CRT(i)'s tail without touching the A region CRT(i) reads. Same values as bpo_first_xz.
+extern "C" __global__ void __launch_bounds__((BPO_XF&8)?512:256,BPO_TC_MINB) bpo_first_xzp(const u32* a,const u32* b,u32* A,u32* B,
+    const u64* twist,const u64* stage_tw,const u32* __restrict__ bpt,u32 N,u32 logR,u32 r0,u32 r1,u32 pfstep,const u64* ctab,
+    const __grid_constant__ XTMap tmA,const __grid_constant__ XTMap tmB){
+    __shared__ __align__(128) u32 X[BPO_X_SMEM(BPO_XF)/4];
+    bpo_first_xbz<BPO_XF|0x400000u|0x800000u,true>(a,b,A,B,twist,stage_tw,bpt,N,r0,r1,pfstep,ctab,&tmA,&tmB,X);
 }
 #endif
 // T1 init (once): out[((u*2+hh)*256 + x)*4 + tg] = twist[(4u+tg)*641 + 129 + 2x + hh], grid K/4, 512 threads (hh, x)
@@ -990,6 +1000,6 @@ extern "C" __global__ void __launch_bounds__((BPO_XV&8)?512:256,BPO_TC_MINB) bpo
 #endif // bpo_first_xv
 #endif
 
-// hot diag (host: exit-time diag only): on-device exact compare
-extern "C" __global__ void bpo_hot_cmp(const unsigned* a,const unsigned* b,unsigned long long n,unsigned* bad){
+// pdl diag (host: exit-time diag only): on-device exact compare
+extern "C" __global__ void bpo_pdl_cmp(const unsigned* a,const unsigned* b,unsigned long long n,unsigned* bad){
     for(unsigned long long i=blockIdx.x*(unsigned long long)blockDim.x+threadIdx.x;i<n;i+=(unsigned long long)gridDim.x*blockDim.x)if(a[i]!=b[i]){*bad=1u;return;}}
