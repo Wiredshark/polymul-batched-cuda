@@ -27,7 +27,10 @@
 // The idle of 4 / 5 is a wait on the stop condition, so a stop request ends it at once (the stop wait stays bounded by the
 // item running). 7 / 8 / 9 duty 90 / 80 / 70 % (host idle KW_IDLE7, KW_IDLE8, 3/7 of a graph time after each graph); 12 device-paced
 // duty: each dummy graph is followed on the stream by pause kernels (one 32-thread block sleeping on the global timer, <= 500 us
-// each) for KW_PAUSE12 graph times, two items in flight as load 1; 10 enter-then-hold:
+// each) for KW_PAUSE12 graph times, two items in flight as load 1; 13 load 1 with every dummy buffer (inputs, workspaces,
+// output, both chains) a view of one KW13_MB physical chunk: one cuMemCreate handle mapped at every KW13_MB step of one
+// reserved VA range of the full dummy size, so the kernels, grids and occupancy are the production ones while the whole
+// load stays resident in L2 (racing writes between the chains are fine: private, discarded). Failure -> load 1 ("kw:alias"); 10 enter-then-hold:
 // load 1 for the first 2 s after every (re)start, then 4; 11 periodic: load 1 for 1 s of every 3 s, 4 in between.
 // The lifecycle above is the same for every load. Level (KA_DEFAULT below, FHERMA_KA=<0..3> overrides; same lifecycle at every
 // level): 0 off, 1 one 32-thread block, 2 one 32-thread block per SM, 3 four 256-thread blocks per SM. Any failure
@@ -69,13 +72,17 @@
 #define KA_DEFAULT 3
 #endif
 #ifndef KW_LOAD
-#define KW_LOAD 8   // production warm load from the end of fherma_init (1 = candidate 15; 7 duty90, 8 duty80, 12 device-paced duty)
+#define KW_LOAD 13   // production warm load from the end of fherma_init (1 = candidate 15; 7 duty90, 8 duty80, 12 device-paced duty,
+                     // 13 = load 1 resident in L2: every dummy buffer aliased onto one KW13_MB physical chunk)
 #endif
 #ifndef KW_IDLE7
 #define KW_IDLE7 (1.0/9.0)   // load 7: host idle after each dummy graph, in graph times (one line)
 #endif
 #ifndef KW_IDLE8
 #define KW_IDLE8 0.25         // load 8: the same
+#endif
+#ifndef KW13_MB
+#define KW13_MB 8   // load 13: physical footprint of the whole dummy pipeline in MB (rounded to the VMM granularity)
 #endif
 #ifndef KW_PAUSE12
 #define KW_PAUSE12 0.5        // load 12: device-side pause after each dummy graph, in graph times (pause kernels <= 500 us queued
@@ -1183,9 +1190,32 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             idle();}
         idle();}
     // the private dummy batch and its pipeline graph (warm loads 1-3): built at the end of build_graph (fherma_init)
+    // load 13: one physical chunk (kw13_p bytes, >= one VMM granule) mapped at every kw13_p step of one reserved VA range
+    CUdeviceptr kw13_va=0;size_t kw13_va_sz=0,kw13_p=0;CUmemGenericAllocationHandle kw13_h=0;size_t kw13_maps=0;
+    CUdeviceptr kw13_map(size_t total){
+        auto& d=*cuda;auto& D=d.driver;
+        auto gran=D.get<decltype(&::cuMemGetAllocationGranularity)>("cuMemGetAllocationGranularity");auto mc=D.get<decltype(&::cuMemCreate)>("cuMemCreate");
+        auto ar=D.get<decltype(&::cuMemAddressReserve)>("cuMemAddressReserve");auto mm=D.get<decltype(&::cuMemMap)>("cuMemMap");
+        auto sa=D.get<decltype(&::cuMemSetAccess)>("cuMemSetAccess");
+        if(!gran||!mc||!ar||!mm||!sa)throw std::runtime_error("kw13:vmm");
+        CUdevice dev=0;d.check(d.cuDeviceGet(&dev,0));
+        CUmemAllocationProp pr{};pr.type=CU_MEM_ALLOCATION_TYPE_PINNED;pr.location.type=CU_MEM_LOCATION_TYPE_DEVICE;pr.location.id=int(dev);
+        size_t g=0;d.check(gran(&g,&pr,CU_MEM_ALLOC_GRANULARITY_MINIMUM));if(!g)throw std::runtime_error("kw13:gran");
+        double mb=KW13_MB;if(const char* e=std::getenv("FHERMA_KW13_MB")){const double v=std::atof(e);if(v>0)mb=v;}
+        size_t P=size_t(mb*1048576.0)/g*g;if(P<g)P=g;if(l2_bytes&&P>size_t(l2_bytes)/2)P=std::max(g,size_t(l2_bytes)/2/g*g);
+        const size_t T=(total+P-1)/P*P;
+        d.check(mc(&kw13_h,P,&pr,0));kw13_p=P;
+        d.check(ar(&kw13_va,T,g,0,0));kw13_va_sz=T;
+        for(size_t o=0;o<T;o+=P){d.check(mm(kw13_va+o,P,0,kw13_h,0));++kw13_maps;}
+        CUmemAccessDesc ad{};ad.location=pr.location;ad.flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE;d.check(sa(kw13_va,T,&ad,1));
+        return kw13_va;}
+    void kw13_free(){auto& D=cuda->driver;auto um=D.get<decltype(&::cuMemUnmap)>("cuMemUnmap");auto af=D.get<decltype(&::cuMemAddressFree)>("cuMemAddressFree");
+        auto rl=D.get<decltype(&::cuMemRelease)>("cuMemRelease");
+        if(kw13_va&&um)for(size_t i=0;i<kw13_maps;++i)um(kw13_va+i*kw13_p,kw13_p);
+        if(kw13_va&&af)af(kw13_va,kw13_va_sz);if(kw13_h&&rl)rl(kw13_h);kw13_va=0;kw13_va_sz=0;kw13_p=0;kw13_h=0;kw13_maps=0;}
     void kw_build(){
         int ld=KW_LOAD;
-        if(const char* e=std::getenv("FHERMA_KW")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>12)pin_why("kw:env");else ld=int(v);}
+        if(const char* e=std::getenv("FHERMA_KW")){char* x=nullptr;const long v=std::strtol(e,&x,10);if(x==e||*x||v<0||v>13)pin_why("kw:env");else ld=int(v);}
         kw_load=0;ka_wl=0;if(ld==0)return;
         auto& d=*cuda;auto& D=d.driver;
         auto begin=D.get<decltype(&::cuStreamBeginCapture)>("cuStreamBeginCapture_v2");auto endc=D.get<decltype(&::cuStreamEndCapture)>("cuStreamEndCapture");
@@ -1197,17 +1227,23 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         auto restore=[&]{A=oA;B=oB;C=oC;for(int c=0;c<4;++c){wsA[c]=owA[c];wsB[c]=owB[c];wsC[c]=owC[c];wsG[c]=owG[c];wsG2[c]=owG2[c];wsT[c]=owT[c];}
             d.stream=graph_stream;cur_ws=0;next_a=next_b=0;pin_cur=-1;cuda->pre_launch=nullptr;cuda->post_launch=nullptr;
             l2on=false;p23db_now=false;po=0;pox=false;p1x=0;xoff=0;};
-        bool capt=false;
+        for(;;){
+        bool capt=false;const bool al13=ld==13;CUdeviceptr vb=0;size_t vo=0;
         try{
             {const char* fe=std::getenv("FHERMA_TABS_FAIL");if(fe&&(std::strtoul(fe,nullptr,0)&4096ul))throw std::runtime_error("forced");}   // bit 4096: forced dummy-graph failure
+            if(al13&&std::getenv("FHERMA_KW13_FAIL"))throw std::runtime_error("forced13");   // forced load-13 failure (test of the load-1 fallback)
             const u32 DN=std::min(8u,bcount)&~1u;const u32 S=2;
             if(DN<2||!graph_execs[6]||!graph_stream||!chain_streams[1]||!begin||!endc||!inst||!glc||!ss)throw std::runtime_error("kw");
             const size_t stride=size_t(n)*l*4,wsb=size_t(k)*8*n*4,gb=size_t(l2g)*8*n*4;
-            const CUdeviceptr pa=d.alloc(DN*stride),pb=d.alloc(DN*stride),po_=d.alloc(DN*stride);kw_bytes=3*DN*stride;
+            auto rd=[](size_t z){return (z+4095)&~size_t(4095);};
+            if(al13){size_t tot=3*rd(DN*stride);for(u32 c=0;c<S;++c)tot+=3*rd(wsb)+(owG[c]&&gb?rd(gb):0);vb=kw13_map(tot);}
+            auto al=[&](size_t z)->CUdeviceptr{if(!al13)return d.alloc(z);const CUdeviceptr p=vb+vo;vo+=rd(z);if(vo>kw13_va_sz)throw std::runtime_error("kw13");return p;};
+            const CUdeviceptr pa=al(DN*stride),pb=al(DN*stride),po_=al(DN*stride);kw_bytes=3*DN*stride;
             CUdeviceptr pA[2],pB[2],pC[2],pG[2]{};
-            for(u32 c=0;c<S;++c){pA[c]=d.alloc(wsb);pB[c]=d.alloc(wsb);pC[c]=d.alloc(wsb);kw_bytes+=3*wsb;if(owG[c]&&gb){pG[c]=d.alloc(gb);kw_bytes+=gb;}}
-            for(CUdeviceptr x:{pa,pb,po_})d.check(mset(x,0,DN*stride));
-            for(u32 c=0;c<S;++c){d.check(mset(pA[c],0,wsb));d.check(mset(pB[c],0,wsb));d.check(mset(pC[c],0,wsb));if(pG[c])d.check(mset(pG[c],0,gb));}
+            for(u32 c=0;c<S;++c){pA[c]=al(wsb);pB[c]=al(wsb);pC[c]=al(wsb);kw_bytes+=3*wsb;if(owG[c]&&gb){pG[c]=al(gb);kw_bytes+=gb;}}
+            if(al13){d.check(mset(vb,0,kw13_p));kw_bytes=kw13_p;}   // the whole VA range is views of this one chunk
+            else{for(CUdeviceptr x:{pa,pb,po_})d.check(mset(x,0,DN*stride));
+            for(u32 c=0;c<S;++c){d.check(mset(pA[c],0,wsb));d.check(mset(pB[c],0,wsb));d.check(mset(pC[c],0,wsb));if(pG[c])d.check(mset(pG[c],0,gb));}}
             d.check(d.cuCtxSynchronize());
             A=pA[0];B=pB[0];C=pC[0];wsA[1]=pA[1];wsB[1]=pB[1];wsC[1]=pC[1];for(int c=0;c<4;++c){wsG[c]=c<2?pG[c]:0;wsG2[c]=0;wsT[c]=0;}
             l2on=l2g!=0;p23db_now=false;p1x=p1x_default();po=2;pox=true;xoff=0;   // as graph variant 6
@@ -1224,10 +1260,12 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
             restore();
             for(int r=0;r<3;++r){const auto t=std::chrono::steady_clock::now();d.check(glc(kw_g,graph_stream));d.check(ss(graph_stream));
                 const double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t).count();kw_g_us=r?std::min(kw_g_us,us):us;}   // min of 3
-            kw_n=DN;kw_load=ld;ka_wl=ld;
+            kw_n=DN;kw_load=ld;ka_wl=ld;return;
         }catch(...){
             if(capt){CUgraph g=nullptr;endc(graph_stream,&g);if(g)gdestroy(g);}
-            restore();kw_g=nullptr;kw_load=0;ka_wl=0;pin_why("kw:graph");}}
+            restore();kw_g=nullptr;kw_load=0;ka_wl=0;
+            if(al13){d.cuCtxSynchronize();kw13_free();pin_why("kw:alias");ld=1;continue;}   // load 13 failed: load 1, never off
+            pin_why("kw:graph");return;}}}
     void ka_start(int lv){if(lv<=0||!ka_fn||ka_th.joinable())return;ka_quit=false;ka_err=false;ka_idle=true;ka_want=false;
         try{ka_th=std::thread([this,lv]{ka_loop(lv);});ka_level=lv;}catch(...){ka_level=0;pin_why("ka:thread");}}
     // stop and wait (bounded): first statement of fherma_h2d (rec = true: counts toward "kaw"); fherma_run entry path
@@ -1512,36 +1550,39 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
             else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
         nv_ext_open();nv_ext=true;kd_n=0;kd_busy=0;kd_idle=0;kd_cyc=0;
-        CUevent e0=nullptr,e1=nullptr;d.check(ec(&e0,0));d.check(ec(&e1,0));
+        CUevent e0=nullptr,e1=nullptr,e2=nullptr;d.check(ec(&e0,0));d.check(ec(&e1,0));d.check(ec(&e2,0));
         auto envd=[](const char* nm,double def){const char* e=std::getenv(nm);return e?std::atof(e):def;};
-        const double WS=envd("FHERMA_SP_W",3.0);const int NT=std::max(5,int(envd("FHERMA_SP_N",65))),NAB=int(envd("FHERMA_SP_AB",0));
+        const double WS=envd("FHERMA_SP_W",3.0);const int NT=std::max(5,int(envd("FHERMA_SP_N",60))),NAB=int(envd("FHERMA_SP_AB",0));const int NQ=int(envd("FHERMA_SP_Q",5));const double QS=envd("FHERMA_SP_QS",3.0);
         auto cpufreq=[](int c)->int{char p[96];std::snprintf(p,96,"/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",c);FILE* f=std::fopen(p,"r");if(!f)return -1;int v=-1;if(std::fscanf(f,"%d",&v)!=1)v=-1;std::fclose(f);return v;};
         const int SPL=int(envd("FHERMA_SP_LOAD",kw_load));   // the production warm load (never kw1 unless it is the production load)
         auto warm=[&]{ka_wl=SPL;ka_resume();std::this_thread::sleep_for(std::chrono::microseconds(long(WS*1e6)));ka_pause(false);};
         auto prep=[&]{h2d_staged();d.check(d.cuCtxSynchronize());d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());};
         long long spin_cyc=8000000ll;
-        std::printf("{\"diag\":\"sp\",\"k\":\"info\",\"load\":%d,\"pause12\":%.3f,\"idle7\":%.3f,\"idle8\":%.3f,\"N\":%d,\"W_s\":%.1f,\"ctx_flags\":\"0x%x\",\"sched\":\"%s\",\"spin_cyc\":%lld,\"kwg_us\":%.0f}\n",SPL,double(KW_PAUSE12),double(KW_IDLE7),double(KW_IDLE8),NT,WS,cf,
+        std::printf("{\"diag\":\"sp\",\"k\":\"info\",\"load\":%d,\"kw13_mb\":%.1f,\"kw13_maps\":%zu,\"kw_mb\":%.1f,\"NQ\":%d,\"QS\":%.1f,\"pause12\":%.3f,\"idle7\":%.3f,\"idle8\":%.3f,\"N\":%d,\"W_s\":%.1f,\"ctx_flags\":\"0x%x\",\"sched\":\"%s\",\"spin_cyc\":%lld,\"kwg_us\":%.0f}\n",SPL,kw13_p/1048576.0,kw13_maps,kw_bytes/1048576.0,NQ,QS,double(KW_PAUSE12),double(KW_IDLE7),double(KW_IDLE8),NT,WS,cf,
             cf==0xffffffffu?"?":(cf&7u)==0?"auto":(cf&7u)==1?"spin":(cf&7u)==2?"yield":(cf&7u)==4?"blocking":"?",spin_cyc,kw_g_us);std::fflush(stdout);
-        std::vector<double> H,LA,DV,TL,QD,R0;std::vector<int> MH,MW,TP,MT,UG,UM,CPU,CF;unsigned long long thr_or=0;int ex=1,blk=0;
+        std::vector<double> H,LA,DV,TL,QD,R0,EM;std::vector<int> MH,MW,TP,MT,UG,UM,CPU,CF,RH,RM;unsigned long long thr_or=0;int ex=1,blk=0;
         auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
         auto imean=[](const std::vector<int>& v){double s=0;int c=0;for(int x:v)if(x>=0){s+=x;++c;}return c?s/c:-1.0;};
-        for(int t=0;t<NT;++t){
-            warm();MH.push_back(nv_mhz.load());MW.push_back(nv_mw.load());TP.push_back(nv_temp.load());MT.push_back(nv_mtemp.load());UG.push_back(nv_ugpu.load());UM.push_back(nv_umem.load());
+        for(int t=0;t<NT+NQ;++t){
+            const bool quiet=t>=NT;   // quiet block: no load at all for QS s before the rep (no SM work, no DRAM traffic)
+            if(quiet){std::this_thread::sleep_for(std::chrono::microseconds(long(QS*1e6)));nv_sample();}else warm();MH.push_back(nv_mhz.load());MW.push_back(nv_mw.load());TP.push_back(nv_temp.load());MT.push_back(nv_mtemp.load());UG.push_back(nv_ugpu.load());UM.push_back(nv_umem.load());
             {const long long th=nv_thr.load();if(th>0)thr_or|=(unsigned long long)th;}
             prep();
             const auto ra=clk::now();d.check(er(e0,graph_stream));const auto r1=clk::now();d.check(glaunch(graph_execs[6],graph_stream));const auto r2=clk::now();d.check(er(e1,graph_stream));d.check(ss(graph_stream));const auto r4=clk::now();
             float ms=0;d.check(eel(&ms,e0,e1));const int cpu=sched_getcpu();
+            nv_sample();RH.push_back(nv_mhz.load());RM.push_back(nv_mem.load());   // SM / memory clock right after the rep
             H.push_back(us(ra,r4));LA.push_back(us(r1,r2));DV.push_back(ms*1000.0);TL.push_back(us(ra,r4)-ms*1000.0);R0.push_back(us(ra,r1));if(cmp()==0)ex=0;
             CPU.push_back(cpu);CF.push_back(cpufreq(cpu));
             d.check(mset(out_all,0,bytes));d.check(d.cuCtxSynchronize());
-            {void* a[]={&spin_cyc};d.check(d.cuLaunchKernel(ka_fn,1,1,1,32,1,1,0,graph_stream,a,nullptr));}
+            d.check(er(e2,graph_stream));{void* a[]={&spin_cyc};d.check(d.cuLaunchKernel(ka_fn,1,1,1,32,1,1,0,graph_stream,a,nullptr));}
             d.check(er(e0,graph_stream));d.check(glaunch(graph_execs[6],graph_stream));d.check(er(e1,graph_stream));d.check(ss(graph_stream));
             d.check(eel(&ms,e0,e1));QD.push_back(ms*1000.0);if(cmp()==0)ex=0;
+            {float sm=0;d.check(eel(&sm,e2,e0));EM.push_back(sm>0?spin_cyc/(sm*1000.0):-1.0);}   // effective SM MHz: spin_cyc clock64 cycles / spin time
             if(H.size()==5){
-                std::printf("{\"diag\":\"sp\",\"b\":%d,\"t\":%.0f,\"hs_us\":%.1f,\"launch_us\":%.1f,\"dev_us\":%.1f,\"tail_us\":%.1f,\"rec0_us\":%.1f,\"qdev_us\":%.1f,\"mhz\":%.0f,\"W\":%.1f,\"temp\":%.0f,\"mtemp\":%.0f,\"ug\":%.0f,\"um\":%.0f,\"mem\":%d,\"thr_or\":\"0x%llx\",\"cpu\":%d,\"cpukhz\":%.0f,\"kd_busy_us\":%.0f,\"kd_idle_us\":%.0f,\"kd_cyc_us\":%.0f,\"kd_duty\":%.3f,\"ex\":%d}\n",
+                std::printf("{\"diag\":\"sp\",\"b\":%d,\"t\":%.0f,\"hs_us\":%.1f,\"launch_us\":%.1f,\"dev_us\":%.1f,\"tail_us\":%.1f,\"rec0_us\":%.1f,\"qdev_us\":%.1f,\"mhz\":%.0f,\"W\":%.1f,\"temp\":%.0f,\"mtemp\":%.0f,\"ug\":%.0f,\"um\":%.0f,\"mem\":%d,\"thr_or\":\"0x%llx\",\"cpu\":%d,\"cpukhz\":%.0f,\"kd_busy_us\":%.0f,\"kd_idle_us\":%.0f,\"kd_cyc_us\":%.0f,\"kd_duty\":%.3f,\"mhz_r\":%.0f,\"mem_r\":%.0f,\"eff_mhz\":%.0f,\"quiet\":%d,\"ex\":%d}\n",
                     blk++,el(),med(H),med(LA),med(DV),med(TL),med(R0),med(QD),imean(MH),imean(MW)/1000.0,imean(TP),imean(MT),imean(UG),imean(UM),nv_mem.load(),thr_or,CPU.back(),imean(CF),kd_n.load()?double(kd_busy.load())/kd_n.load():-1.0,kd_n.load()?double(kd_idle.load())/kd_n.load():-1.0,
-                    kd_n.load()?double(kd_cyc.load())/kd_n.load():-1.0,kd_cyc.load()?double(kd_busy.load())/double(kd_cyc.load()):-1.0,ex);std::fflush(stdout);kd_n=0;kd_busy=0;kd_idle=0;kd_cyc=0;
-                H.clear();R0.clear();LA.clear();DV.clear();TL.clear();QD.clear();MH.clear();MW.clear();TP.clear();MT.clear();UG.clear();UM.clear();CPU.clear();CF.clear();thr_or=0;}}
+                    kd_n.load()?double(kd_cyc.load())/kd_n.load():-1.0,kd_cyc.load()?double(kd_busy.load())/double(kd_cyc.load()):-1.0,imean(RH),imean(RM),med(EM),int(quiet),ex);std::fflush(stdout);kd_n=0;kd_busy=0;kd_idle=0;kd_cyc=0;
+                H.clear();R0.clear();EM.clear();RH.clear();RM.clear();LA.clear();DV.clear();TL.clear();QD.clear();MH.clear();MW.clear();TP.clear();MT.clear();UG.clear();UM.clear();CPU.clear();CF.clear();thr_or=0;}}
         // event cost: pairs of trials without / with the two events (host span of the launch + sync only)
         std::vector<double> A0,A1;
         for(int t=0;t<2*NAB;++t){warm();prep();const bool evs=t&1;
