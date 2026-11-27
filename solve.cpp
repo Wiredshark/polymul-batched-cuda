@@ -1527,26 +1527,29 @@ CUstream ka_s=nullptr;CUevent ka_ev[2]{};CUmodule ka_mod=nullptr;CUfunction ka_f
         auto h2d_staged=[&]{if(stg.ok){stage_up(a_all,reinterpret_cast<const char*>(ha.data()),bytes);stage_up(b_all,reinterpret_cast<const char*>(hb.data()),bytes);d.check(stg.ssync(stg.s));}
             else{d.check(d.cuMemcpyHtoD(a_all,ha.data(),bytes));d.check(d.cuMemcpyHtoD(b_all,hb.data(),bytes));}};
         auto envd=[](const char* nm,double def){const char* e=std::getenv(nm);return e?std::atof(e):def;};
-        const int NT=std::max(5,int(envd("FHERMA_LT_N",65)));const double WS=envd("FHERMA_LT_W",3.0);
+        // lt2 phases: name:reps:warm_s:idle_s (idle = no load after the previous d2h, then the warm load, then the rep)
+        struct Ph{char nm;int reps;double warm,idle;};std::vector<Ph> P;
+        {const char* e=std::getenv("FHERMA_LT2");std::string sp=e?e:"A:9:13:0,B:10:3:0,C:4:13:0,D:6:3:10,E:2:3:40,E:3:3:0";
+         size_t i=0;while(i<sp.size()){size_t j=sp.find(',',i);if(j==std::string::npos)j=sp.size();const std::string t=sp.substr(i,j-i);
+            Ph x{'?',0,0,0};char nm=0;if(std::sscanf(t.c_str(),"%c:%d:%lf:%lf",&nm,&x.reps,&x.warm,&x.idle)==4&&x.reps>0&&x.reps<=40){x.nm=nm;P.push_back(x);}i=j+1;}}
         auto ts=[&]{return ka_t0_set?std::chrono::duration<double>(clk::now()-ka_t0).count():-1.0;};
-        std::printf("{\"diag\":\"lt\",\"k\":\"info\",\"N\":%d,\"W_s\":%.1f,\"warm\":%d,\"kw\":%d,\"ts0\":%.1f,\"B\":%u}\n",NT,WS,int(warm),kw_load,ts(),bcount);std::fflush(stdout);
-        std::vector<double> BD;std::vector<int> NV,PW,TC;double kawm=0;int ex=1,blk=0;nv_thr_or.store(0);
-        auto med=[](std::vector<double> v){if(v.empty())return -1.0;std::sort(v.begin(),v.end());return v[v.size()/2];};
-        auto imean=[](const std::vector<int>& v){double s_=0;int c=0;for(int x:v)if(x>=0){s_+=x;++c;}return c?s_/c:-1.0;};
-        for(int t=0;t<NT;++t){
+        int nrep=0;for(auto& x:P)nrep+=x.reps;
+        std::printf("{\"diag\":\"lt2\",\"k\":\"info\",\"phases\":%zu,\"reps\":%d,\"warm\":%d,\"kw\":%d,\"ts0\":%.1f,\"B\":%u}\n",P.size(),nrep,int(warm),kw_load,ts(),bcount);std::fflush(stdout);
+        int ex=1;
+        for(auto& x:P)for(int r=0;r<x.reps;++r){
+            if(x.idle>0)std::this_thread::sleep_for(std::chrono::microseconds(long(x.idle*1e6)));   // no load (paused since the last rep)
             if(warm)ka_resume();
-            std::this_thread::sleep_for(std::chrono::microseconds(long(WS*1e6)));
-            PW.push_back(nv_mw.load());
-            ka_pause(true);kawm=std::max(kawm,ka_wlast);   // as fherma_h2d
+            std::this_thread::sleep_for(std::chrono::microseconds(long(x.warm*1e6)));
+            const int pw=nv_mw.load();nv_thr_or.store(0);
+            ka_pause(true);   // as fherma_h2d
             h2d_staged();
-            const auto r0=clk::now();d.check(glaunch(graph_execs[6],graph_stream));d.check(ss(graph_stream));BD.push_back(std::chrono::duration<double,std::micro>(clk::now()-r0).count());
-            nv_sample();NV.push_back(nv_mhz.load());TC.push_back(nv_tc.load());
+            const auto r0=clk::now();d.check(glaunch(graph_execs[6],graph_stream));d.check(ss(graph_stream));const double body=std::chrono::duration<double,std::micro>(clk::now()-r0).count();
+            nv_sample();const int nv=nv_mhz.load(),tc=nv_tc.load();const double tsr=ts();
             if(stg.ok)stage_down(reinterpret_cast<char*>(hc.data()),out_all,bytes);else d.check(d.cuMemcpyDtoH(hc.data(),out_all,bytes));   // as fherma_d2h
-            if(cmp()==0)ex=0;
-            if(BD.size()==5){
-                std::printf("{\"diag\":\"lt\",\"b\":%d,\"ts\":%.1f,\"body\":%.1f,\"bmin\":%.1f,\"nv\":%.0f,\"W\":%.1f,\"temp\":%.1f,\"thr\":\"0x%llx\",\"kaw\":%.0f,\"ex\":%d}\n",
-                    blk++,ts(),med(BD),*std::min_element(BD.begin(),BD.end()),imean(NV),imean(PW)/1000.0,imean(TC),nv_thr_or.exchange(0),kawm,ex);std::fflush(stdout);
-                BD.clear();NV.clear();PW.clear();TC.clear();kawm=0;}}
+            const int e1=cmp();if(e1==0)ex=0;
+            std::printf("{\"diag\":\"lt2\",\"ph\":\"%c\",\"r\":%d,\"ts\":%.1f,\"body\":%.0f,\"nv\":%d,\"W\":%.1f,\"t\":%d,\"thr\":\"0x%llx\",\"kaw\":%.0f,\"ex\":%d}\n",
+                x.nm,r,tsr,body,nv,pw/1000.0,tc,nv_thr_or.load(),ka_wlast,e1);std::fflush(stdout);}
+        (void)ex;
     }
     // ---- rb diag (exit time; RBDIAG_DEFAULT, FHERMA_RBDIAG=0/1): rb2 / rb3 / rb_both against production (cand14), with
     // ctrl three times in the line set (start, middle, end of each round; rounds rotate). Exactness of every line on six
